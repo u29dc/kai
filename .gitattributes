@@ -1,0 +1,12 @@
+Cargo.toml linguist-generated
+Cargo.lock linguist-generated
+crates/*/Cargo.toml linguist-generated
+
+package.json linguist-generated
+bun.lock linguist-generated
+bunfig.toml linguist-generated
+biome.json linguist-generated
+commitlint.config.js linguist-generated
+lint-staged.config.js linguist-generated
+.editorconfig linguist-generated
+.husky/** linguist-generated
