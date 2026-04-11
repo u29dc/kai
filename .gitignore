@@ -1,0 +1,16 @@
+node_modules/
+target/
+dist/
+build/
+.biome
+.DS_Store
+._*
+.vscode/
+.zed/
+.idea/
+*.log
+.tmp/
+.env
+.env.*
+!.env.example
+.husky/_/
