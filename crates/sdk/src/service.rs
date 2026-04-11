@@ -17,6 +17,7 @@ use crate::state::state_paths;
 
 #[cfg(target_os = "macos")]
 use crate::secrets::{
+    groq_api_key_keychain_service_name, groq_api_key_status, sync_groq_api_key_to_keychain,
     sync_telegram_token_to_keychain, telegram_token_keychain_service_name, telegram_token_status,
 };
 
@@ -265,6 +266,19 @@ pub fn service_start(config: &LoadedConfig) -> KaiResult<ServiceActionOutput> {
             .with_hint(
                 "export the bot token env var once, then run `kai service start` to seed the secure background token store",
             ));
+        }
+
+        if config
+            .values
+            .media
+            .transcription
+            .provider
+            .eq_ignore_ascii_case("groq")
+        {
+            let groq_status = groq_api_key_status(config)?;
+            if groq_status.env_available {
+                let _ = sync_groq_api_key_to_keychain(config)?;
+            }
         }
 
         let binary_path = runtime_binary_path(config);
@@ -690,25 +704,53 @@ fn render_macos_plist(config: &LoadedConfig, runner_path: &Path) -> String {
 #[cfg(target_os = "macos")]
 fn render_service_runner(config: &LoadedConfig, binary_path: &Path) -> String {
     let path = env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
-    let env_key = &config.values.channel.telegram.bot_token_env;
-    let service_name = telegram_token_keychain_service_name();
-
-    [
+    let telegram_env_key = &config.values.channel.telegram.bot_token_env;
+    let telegram_service_name = telegram_token_keychain_service_name();
+    let mut lines = vec![
         "#!/bin/zsh".to_string(),
         "set -euo pipefail".to_string(),
         "umask 077".to_string(),
-        format!("export HOME={}", shell_quote(&env::var("HOME").unwrap_or_default())),
-        format!("export KAI_HOME={}", shell_quote(&config.values.paths.root_app)),
+        format!(
+            "export HOME={}",
+            shell_quote(&env::var("HOME").unwrap_or_default())
+        ),
+        format!(
+            "export KAI_HOME={}",
+            shell_quote(&config.values.paths.root_app)
+        ),
         format!("export PATH={}", shell_quote(&path)),
         format!(
             "export {}=\"$('/usr/bin/security' find-generic-password -w -a \"$('/usr/bin/id' -un)\" -s {})\"",
-            env_key,
-            shell_quote(service_name)
+            telegram_env_key,
+            shell_quote(telegram_service_name)
         ),
-        format!("exec {} run", shell_quote(&binary_path.display().to_string())),
+    ];
+
+    if config
+        .values
+        .media
+        .transcription
+        .provider
+        .eq_ignore_ascii_case("groq")
+    {
+        let groq_env_key = &config.values.media.transcription.groq_api_key_env;
+        let groq_service_name = groq_api_key_keychain_service_name();
+        lines.push(format!(
+            "if KAI_GROQ_KEY=\"$('/usr/bin/security' find-generic-password -w -a \"$('/usr/bin/id' -un)\" -s {} 2>/dev/null)\"; then export {}=\"$KAI_GROQ_KEY\"; fi",
+            shell_quote(groq_service_name),
+            groq_env_key
+        ));
+    }
+
+    lines.extend([
+        format!(
+            "exec {} run",
+            shell_quote(&binary_path.display().to_string())
+        ),
         "".to_string(),
-    ]
-    .join("\n")
+    ]);
+
+    lines.join("\n")
 }
 
 #[cfg(target_os = "macos")]
@@ -773,7 +815,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig,
-        PathsConfig, RunnerConfig, TelegramConfig,
+        MediaConfig, PathsConfig, RunnerConfig, TelegramConfig, TranscriptionConfig,
     };
 
     fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
@@ -789,6 +831,14 @@ mod tests {
                         enabled: true,
                         bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
                         owner_user_id: None,
+                    },
+                },
+                media: MediaConfig {
+                    transcription: TranscriptionConfig {
+                        provider: "groq".to_string(),
+                        groq_api_key_env: "GROQ_API_KEY".to_string(),
+                        groq_model: "whisper-large-v3-turbo".to_string(),
+                        command: None,
                     },
                 },
                 paths: PathsConfig {

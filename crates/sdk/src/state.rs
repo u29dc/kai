@@ -31,6 +31,18 @@ pub struct StateStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AttachmentArtifact {
+    pub kind: String,
+    pub path: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    pub bytes: u64,
+    #[serde(default)]
+    pub checksum_blake3: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AttachmentInfo {
     pub kind: String,
     pub path: String,
@@ -38,6 +50,22 @@ pub struct AttachmentInfo {
     pub mime_type: Option<String>,
     pub bytes: u64,
     pub checksum_blake3: String,
+    #[serde(default)]
+    pub media_group_id: Option<String>,
+    #[serde(default)]
+    pub duration_secs: Option<u32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub transcript_text: Option<String>,
+    #[serde(default)]
+    pub transcript_segments: Vec<crate::media::TranscriptSegment>,
+    #[serde(default)]
+    pub artifacts: Vec<AttachmentArtifact>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +108,10 @@ pub struct ReplayAttachmentRef {
     pub path: String,
     pub original_name: Option<String>,
     pub bytes: u64,
+    #[serde(default)]
+    pub transcript_excerpt: Option<String>,
+    #[serde(default)]
+    pub artifact_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,7 +754,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig,
-        PathsConfig, RunnerConfig, TelegramConfig,
+        MediaConfig, PathsConfig, RunnerConfig, TelegramConfig, TranscriptionConfig,
     };
 
     fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
@@ -738,6 +770,14 @@ mod tests {
                         enabled: true,
                         bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
                         owner_user_id: None,
+                    },
+                },
+                media: MediaConfig {
+                    transcription: TranscriptionConfig {
+                        provider: "groq".to_string(),
+                        groq_api_key_env: "GROQ_API_KEY".to_string(),
+                        groq_model: "whisper-large-v3-turbo".to_string(),
+                        command: None,
                     },
                 },
                 paths: PathsConfig {

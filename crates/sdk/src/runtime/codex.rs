@@ -13,6 +13,7 @@ use crate::state::{
 
 const REPLAY_TURN_LIMIT: usize = 12;
 const REPLAY_ATTACHMENT_REF_LIMIT: usize = 8;
+const USE_SYSTEM_INSTRUCTION_PROMPT: bool = false;
 
 #[derive(Debug, Clone)]
 pub struct CodexTurnResult {
@@ -209,6 +210,10 @@ fn build_turn_prompt(
     attachments: &[AttachmentInfo],
     context: &[ContextSnapshot],
 ) -> String {
+    if !USE_SYSTEM_INSTRUCTION_PROMPT {
+        return build_passthrough_turn_prompt(config, channel, sender_id, user_text, attachments);
+    }
+
     let agents_path = Path::new(&config.values.paths.root_work).join("AGENTS.md");
     let mut sections = vec![
         "You are a private owner-only chat portal into a local AI operator running on the user's machine.".to_string(),
@@ -299,8 +304,58 @@ fn build_turn_prompt(
         sections.push("- attachments: none".to_string());
     } else {
         sections.push("- attachments:".to_string());
-        for attachment in attachments {
-            sections.push(format!("  - {} at {}", attachment.kind, attachment.path));
+        for (index, attachment) in attachments.iter().enumerate() {
+            sections.push(format!(
+                "  - [{}] {} at {} (mime={}, bytes={}, originalName={})",
+                index + 1,
+                attachment.kind,
+                attachment.path,
+                attachment.mime_type.as_deref().unwrap_or("unknown"),
+                attachment.bytes,
+                attachment.original_name.as_deref().unwrap_or("unknown")
+            ));
+            if let Some(duration_secs) = attachment.duration_secs {
+                sections.push(format!("    durationSecs: {duration_secs}"));
+            }
+            if let Some(media_group_id) = &attachment.media_group_id {
+                sections.push(format!("    mediaGroupId: {media_group_id}"));
+            }
+            if !attachment.artifacts.is_empty() {
+                sections.push("    artifacts:".to_string());
+                for artifact in &attachment.artifacts {
+                    sections.push(format!(
+                        "      - {} at {} (mime={}, bytes={})",
+                        artifact.kind,
+                        artifact.path,
+                        artifact.mime_type.as_deref().unwrap_or("unknown"),
+                        artifact.bytes
+                    ));
+                }
+            }
+            if !attachment.notes.is_empty() {
+                sections.push("    notes:".to_string());
+                for note in &attachment.notes {
+                    sections.push(format!("      - {note}"));
+                }
+            }
+        }
+
+        let transcript_sections = attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment.transcript_text.as_ref().map(|transcript| {
+                    format!(
+                        "<ATTACHMENT_TRANSCRIPT kind=\"{}\" path=\"{}\">\n{}\n</ATTACHMENT_TRANSCRIPT>",
+                        attachment.kind, attachment.path, transcript
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if !transcript_sections.is_empty() {
+            sections.push(String::new());
+            sections.push("Attachment transcripts:".to_string());
+            sections.extend(transcript_sections);
         }
     }
 
@@ -308,6 +363,87 @@ fn build_turn_prompt(
     sections.push("User message:".to_string());
     sections.push(user_text.to_string());
 
+    sections.join("\n")
+}
+
+fn build_passthrough_turn_prompt(
+    config: &LoadedConfig,
+    channel: &str,
+    sender_id: i64,
+    user_text: &str,
+    attachments: &[AttachmentInfo],
+) -> String {
+    let mut sections = vec![
+        "Turn envelope:".to_string(),
+        format!("- channel: {channel}"),
+        format!("- sender_id: {sender_id}"),
+        format!("- local_timezone: {}", config.values.agent.timezone),
+        format!("- root_work: {}", config.values.paths.root_work),
+        format!("- root_app: {}", config.values.paths.root_app),
+    ];
+
+    if attachments.is_empty() {
+        sections.push("- attachments: none".to_string());
+    } else {
+        sections.push("- attachments:".to_string());
+        for (index, attachment) in attachments.iter().enumerate() {
+            sections.push(format!(
+                "  - [{}] {} at {} (mime={}, bytes={}, originalName={})",
+                index + 1,
+                attachment.kind,
+                attachment.path,
+                attachment.mime_type.as_deref().unwrap_or("unknown"),
+                attachment.bytes,
+                attachment.original_name.as_deref().unwrap_or("unknown")
+            ));
+            if let Some(duration_secs) = attachment.duration_secs {
+                sections.push(format!("    durationSecs: {duration_secs}"));
+            }
+            if let Some(media_group_id) = &attachment.media_group_id {
+                sections.push(format!("    mediaGroupId: {media_group_id}"));
+            }
+            if !attachment.artifacts.is_empty() {
+                sections.push("    artifacts:".to_string());
+                for artifact in &attachment.artifacts {
+                    sections.push(format!(
+                        "      - {} at {} (mime={}, bytes={})",
+                        artifact.kind,
+                        artifact.path,
+                        artifact.mime_type.as_deref().unwrap_or("unknown"),
+                        artifact.bytes
+                    ));
+                }
+            }
+            if !attachment.notes.is_empty() {
+                sections.push("    notes:".to_string());
+                for note in &attachment.notes {
+                    sections.push(format!("      - {note}"));
+                }
+            }
+        }
+
+        let transcript_sections = attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment.transcript_text.as_ref().map(|transcript| {
+                    format!(
+                        "<ATTACHMENT_TRANSCRIPT kind=\"{}\" path=\"{}\">\n{}\n</ATTACHMENT_TRANSCRIPT>",
+                        attachment.kind, attachment.path, transcript
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if !transcript_sections.is_empty() {
+            sections.push(String::new());
+            sections.push("Attachment transcripts:".to_string());
+            sections.extend(transcript_sections);
+        }
+    }
+
+    sections.push(String::new());
+    sections.push("User message:".to_string());
+    sections.push(user_text.to_string());
     sections.join("\n")
 }
 
@@ -366,6 +502,12 @@ fn build_replay_prompt(
                         .unwrap_or_else(|| "unknown".to_string()),
                     attachment.bytes
                 ));
+                if let Some(transcript_excerpt) = attachment.transcript_excerpt {
+                    replay.push(format!("  transcript: {}", transcript_excerpt));
+                }
+                for artifact_path in attachment.artifact_paths {
+                    replay.push(format!("  artifact: {}", artifact_path));
+                }
             }
         }
 
@@ -389,7 +531,7 @@ fn build_replay_prompt(
             "[{}] {}: {}",
             turn.created_at,
             turn.role,
-            excerpt_text(&turn.text)
+            replay_turn_excerpt(turn)
         ));
     }
 
@@ -418,7 +560,7 @@ pub fn create_replay_package(
             id: turn.id,
             created_at: turn.created_at.clone(),
             role: turn.role.clone(),
-            text_excerpt: excerpt_text(&turn.text),
+            text_excerpt: replay_turn_excerpt(turn),
         })
         .collect::<Vec<_>>();
 
@@ -449,6 +591,32 @@ fn excerpt_text(input: &str) -> String {
     }
 }
 
+fn replay_turn_excerpt(turn: &TurnRecord) -> String {
+    if !turn.text.trim().is_empty() {
+        return excerpt_text(&turn.text);
+    }
+
+    let transcript = turn
+        .attachments
+        .iter()
+        .find_map(|attachment| attachment.transcript_text.as_deref());
+    if let Some(transcript) = transcript {
+        return format!("[attachment transcript] {}", excerpt_text(transcript));
+    }
+
+    if turn.attachments.is_empty() {
+        return String::new();
+    }
+
+    let labels = turn
+        .attachments
+        .iter()
+        .map(|attachment| attachment.kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[attachments] {labels}")
+}
+
 fn apply_codex_overrides(config: &LoadedConfig, command: &mut Command) {
     if let Some(override_config) = &config.values.runner.codex.override_config {
         if let Some(approval_policy) = &override_config.approval_policy {
@@ -463,12 +631,9 @@ fn apply_codex_overrides(config: &LoadedConfig, command: &mut Command) {
 }
 
 fn apply_image_args(command: &mut Command, attachments: &[AttachmentInfo]) {
-    for attachment in attachments
-        .iter()
-        .filter(|attachment| attachment.kind == "image")
-    {
+    for path in image_input_paths(attachments) {
         command.arg("-i");
-        command.arg(&attachment.path);
+        command.arg(path);
     }
 }
 
@@ -488,6 +653,11 @@ fn extra_access_paths(config: &LoadedConfig, attachments: &[AttachmentInfo]) -> 
     for attachment in attachments {
         if let Some(parent) = Path::new(&attachment.path).parent() {
             paths.push(parent.to_path_buf());
+        }
+        for artifact in &attachment.artifacts {
+            if let Some(parent) = Path::new(&artifact.path).parent() {
+                paths.push(parent.to_path_buf());
+            }
         }
     }
 
@@ -527,6 +697,15 @@ fn collect_replay_attachment_refs(source_turns: &[&TurnRecord]) -> Vec<ReplayAtt
                 path: attachment.path.clone(),
                 original_name: attachment.original_name.clone(),
                 bytes: attachment.bytes,
+                transcript_excerpt: attachment
+                    .transcript_text
+                    .as_ref()
+                    .map(|text| excerpt_text(text)),
+                artifact_paths: attachment
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.path.clone())
+                    .collect(),
             });
 
             if refs.len() >= REPLAY_ATTACHMENT_REF_LIMIT {
@@ -563,6 +742,28 @@ fn build_replay_summary(
     }
 
     lines.join("\n")
+}
+
+fn image_input_paths(attachments: &[AttachmentInfo]) -> Vec<&str> {
+    let mut paths = Vec::new();
+
+    for attachment in attachments {
+        if attachment.kind == "image" {
+            paths.push(attachment.path.as_str());
+        }
+
+        for artifact in attachment.artifacts.iter().filter(|artifact| {
+            artifact.kind == "image_frame"
+                || artifact
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("image/"))
+        }) {
+            paths.push(artifact.path.as_str());
+        }
+    }
+
+    paths
 }
 
 #[cfg(test)]
@@ -604,6 +805,14 @@ mod tests {
                     mime_type: Some("application/pdf".to_string()),
                     bytes: 42,
                     checksum_blake3: "abc".to_string(),
+                    media_group_id: None,
+                    duration_secs: None,
+                    width: None,
+                    height: None,
+                    transcript_text: None,
+                    transcript_segments: Vec::new(),
+                    artifacts: Vec::new(),
+                    notes: Vec::new(),
                 }],
             },
             TurnRecord {

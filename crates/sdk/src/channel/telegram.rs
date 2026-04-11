@@ -1,6 +1,7 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::time::Duration;
 use tokio::fs::File;
@@ -11,18 +12,17 @@ use uuid::Uuid;
 use crate::app::{handle_owner_prompt, mobile_help_text, mobile_status_text};
 use crate::config::LoadedConfig;
 use crate::error::{ErrorCode, KaiError, KaiResult};
+use crate::media::{
+    ATTACHMENT_CLEANUP_INTERVAL, ATTACHMENT_RETENTION, AttachmentKind, MAX_ATTACHMENTS_PER_TURN,
+    MAX_MEDIA_GROUP_ITEMS, MEDIA_GROUP_DEBOUNCE, attachment_byte_limit, classify_document_kind,
+    enrich_attachment,
+};
 use crate::secrets::resolve_telegram_token;
 use crate::state::{AttachmentInfo, StateStore};
 
 const TELEGRAM_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 const TELEGRAM_TYPING_REFRESH: Duration = Duration::from_secs(4);
-const ATTACHMENT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 30);
-const ATTACHMENT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60 * 6);
 const MAX_UPDATE_FAILURE_ATTEMPTS: u32 = 3;
-const MAX_ATTACHMENT_COUNT: usize = 3;
-const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
-const MAX_TEXT_BYTES: u64 = 1024 * 1024;
 
 pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> KaiResult<()> {
     if !config.values.channel.telegram.enabled {
@@ -41,9 +41,12 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
 
     let mut offset = state.get_update_offset()?;
     let mut next_cleanup_at = Instant::now();
+    let mut media_groups = HashMap::<String, BufferedMediaGroup>::new();
 
     loop {
-        if next_cleanup_at <= Instant::now() {
+        let now = Instant::now();
+
+        if next_cleanup_at <= now {
             if let Err(error) = run_attachment_cleanup(state) {
                 record_runtime_error(
                     state,
@@ -57,7 +60,10 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             next_cleanup_at = Instant::now() + ATTACHMENT_CLEANUP_INTERVAL;
         }
 
-        let updates = match get_updates(&client, &token, offset).await {
+        flush_ready_media_groups(&client, &token, config, state, &mut media_groups, None).await?;
+
+        let poll_timeout_seconds = if media_groups.is_empty() { 30 } else { 1 };
+        let updates = match get_updates(&client, &token, offset, poll_timeout_seconds).await {
             Ok(updates) => updates,
             Err(error) => {
                 record_runtime_error(state, "telegram.poll_failed", None, None, &error)?;
@@ -72,6 +78,29 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             let chat_id = update.message.as_ref().map(|message| message.chat.id);
 
             let outcome = if let Some(message) = update.message {
+                if let Some(media_group_id) = message.media_group_id.clone() {
+                    buffer_media_group(
+                        &mut media_groups,
+                        update.update_id,
+                        message,
+                        &media_group_id,
+                    );
+                    offset = next_offset;
+                    state.set_update_offset(offset)?;
+                    state.clear_update_failure(update.update_id)?;
+                    continue;
+                }
+
+                flush_ready_media_groups(
+                    &client,
+                    &token,
+                    config,
+                    state,
+                    &mut media_groups,
+                    Some(update.update_id),
+                )
+                .await?;
+
                 handle_message(&client, &token, config, state, update.update_id, message).await
             } else {
                 Ok(())
@@ -110,6 +139,8 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                 }
             }
         }
+
+        flush_ready_media_groups(&client, &token, config, state, &mut media_groups, None).await?;
     }
 }
 
@@ -136,13 +167,59 @@ async fn handle_message(
     update_id: i64,
     message: TelegramMessage,
 ) -> KaiResult<()> {
-    if message.chat.kind != "private" {
+    let Some(validated) = validate_inbound_message(client, token, config, state, &message).await?
+    else {
         return Ok(());
+    };
+
+    let attachments = download_message_attachments(client, token, config, state, &message).await?;
+    process_owner_turn(
+        client,
+        token,
+        config,
+        state,
+        OwnerTurnInput {
+            update_ids: &[update_id],
+            chat_id: validated.chat_id,
+            sender_id: validated.sender_id,
+            text: &validated.text,
+            attachments,
+        },
+    )
+    .await
+}
+
+#[derive(Debug)]
+struct ValidatedInbound {
+    chat_id: i64,
+    sender_id: i64,
+    text: String,
+}
+
+#[derive(Debug)]
+struct BufferedMediaGroup {
+    media_group_id: String,
+    chat_id: i64,
+    last_update_id: i64,
+    ready_at: Instant,
+    update_ids: Vec<i64>,
+    messages: Vec<TelegramMessage>,
+}
+
+async fn validate_inbound_message(
+    client: &Client,
+    token: &str,
+    config: &LoadedConfig,
+    state: &StateStore,
+    message: &TelegramMessage,
+) -> KaiResult<Option<ValidatedInbound>> {
+    if message.chat.kind != "private" {
+        return Ok(None);
     }
 
     let sender_id = match message.from.as_ref() {
         Some(user) => user.id,
-        None => return Ok(()),
+        None => return Ok(None),
     };
     let chat_id = message.chat.id;
 
@@ -163,20 +240,20 @@ async fn handle_message(
         .to_string();
 
     if owner_id.is_none() && try_pair(client, token, state, chat_id, sender_id, &text).await? {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(owner_id) = owner_id.or(state.get_owner_user_id()?) else {
-        return Ok(());
+        return Ok(None);
     };
 
     if sender_id != owner_id {
-        return Ok(());
+        return Ok(None);
     }
 
     if let Some(expected_chat_id) = owner_chat_id {
         if chat_id != expected_chat_id {
-            return Ok(());
+            return Ok(None);
         }
     } else {
         state.set_owner_chat_id(chat_id)?;
@@ -185,12 +262,12 @@ async fn handle_message(
     match text.as_str() {
         "/help" | "help" => {
             send_message(client, token, chat_id, &mobile_help_text()).await?;
-            return Ok(());
+            return Ok(None);
         }
         "/status" => {
             let status = mobile_status_text(config, state)?;
             send_message(client, token, chat_id, &status).await?;
-            return Ok(());
+            return Ok(None);
         }
         "/new" | "/reset" => {
             state.clear_active_session_id()?;
@@ -202,18 +279,35 @@ async fn handle_message(
                 "Cleared the active Codex session. The next message will start fresh.",
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
         _ => {}
     }
 
-    if let Some(processed) = state.get_processed_update(update_id)? {
-        send_message(client, token, chat_id, &processed.response_text).await?;
-        return Ok(());
+    Ok(Some(ValidatedInbound {
+        chat_id,
+        sender_id,
+        text,
+    }))
+}
+
+async fn process_owner_turn(
+    client: &Client,
+    token: &str,
+    config: &LoadedConfig,
+    state: &StateStore,
+    input: OwnerTurnInput<'_>,
+) -> KaiResult<()> {
+    for update_id in input.update_ids {
+        if let Some(processed) = state.get_processed_update(*update_id)? {
+            send_message(client, token, input.chat_id, &processed.response_text).await?;
+            return Ok(());
+        }
     }
 
     let typing_client = client.clone();
     let typing_token = token.to_string();
+    let chat_id = input.chat_id;
     let typing_handle = tokio::spawn(async move {
         loop {
             let _ = send_typing_indicator(&typing_client, &typing_token, chat_id).await;
@@ -222,20 +316,25 @@ async fn handle_message(
     });
 
     let result = async {
-        let attachments = download_attachments(client, token, state, &message).await?;
-        if text.is_empty() && attachments.is_empty() {
+        if input.text.is_empty() && input.attachments.is_empty() {
             send_message(
                 client,
                 token,
-                chat_id,
+                input.chat_id,
                 "I need text or a supported attachment to do anything useful.",
             )
             .await?;
             return Ok(None);
         }
 
-        let response =
-            handle_owner_prompt(config, state, "telegram", sender_id, &text, &attachments)?;
+        let response = handle_owner_prompt(
+            config,
+            state,
+            "telegram",
+            input.sender_id,
+            input.text,
+            &input.attachments,
+        )?;
         Ok(Some(response))
     }
     .await;
@@ -245,12 +344,196 @@ async fn handle_message(
         return Ok(());
     };
 
-    state.set_processed_update(
-        update_id,
-        &response,
-        state.get_active_session_id()?.as_deref(),
-    )?;
-    send_message(client, token, chat_id, &response).await
+    let session_id = state.get_active_session_id()?;
+    for update_id in input.update_ids {
+        state.set_processed_update(*update_id, &response, session_id.as_deref())?;
+    }
+    send_message(client, token, input.chat_id, &response).await
+}
+
+struct OwnerTurnInput<'a> {
+    update_ids: &'a [i64],
+    chat_id: i64,
+    sender_id: i64,
+    text: &'a str,
+    attachments: Vec<AttachmentInfo>,
+}
+
+fn buffer_media_group(
+    media_groups: &mut HashMap<String, BufferedMediaGroup>,
+    update_id: i64,
+    message: TelegramMessage,
+    media_group_id: &str,
+) {
+    let key = media_group_key(message.chat.id, media_group_id);
+    let entry = media_groups
+        .entry(key)
+        .or_insert_with(|| BufferedMediaGroup {
+            media_group_id: media_group_id.to_string(),
+            chat_id: message.chat.id,
+            last_update_id: update_id,
+            ready_at: Instant::now() + MEDIA_GROUP_DEBOUNCE,
+            update_ids: Vec::new(),
+            messages: Vec::new(),
+        });
+
+    entry.chat_id = message.chat.id;
+    entry.last_update_id = update_id;
+    entry.ready_at = Instant::now() + MEDIA_GROUP_DEBOUNCE;
+
+    if entry.update_ids.contains(&update_id) {
+        return;
+    }
+
+    if entry.messages.len() < MAX_MEDIA_GROUP_ITEMS {
+        entry.update_ids.push(update_id);
+        entry.messages.push(message);
+    }
+}
+
+async fn flush_ready_media_groups(
+    client: &Client,
+    token: &str,
+    config: &LoadedConfig,
+    state: &StateStore,
+    media_groups: &mut HashMap<String, BufferedMediaGroup>,
+    current_update_id: Option<i64>,
+) -> KaiResult<()> {
+    let now = Instant::now();
+    let ready_keys = media_groups
+        .iter()
+        .filter_map(|(key, entry)| {
+            let force_flush = current_update_id.is_some_and(|value| value > entry.last_update_id);
+            let due = now >= entry.ready_at
+                || force_flush
+                || entry.messages.len() >= MAX_MEDIA_GROUP_ITEMS;
+            due.then_some(key.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for key in ready_keys {
+        let Some(mut entry) = media_groups.remove(&key) else {
+            continue;
+        };
+
+        match process_buffered_media_group(client, token, config, state, &entry).await {
+            Ok(()) => {
+                state.clear_update_failure(entry.last_update_id)?;
+            }
+            Err(error) => match handle_update_failure(
+                client,
+                token,
+                state,
+                entry.last_update_id,
+                Some(entry.chat_id),
+                &error,
+            )
+            .await?
+            {
+                UpdateFailureDisposition::Advance => {
+                    continue;
+                }
+                UpdateFailureDisposition::Retry => {
+                    entry.ready_at = Instant::now() + TELEGRAM_RETRY_BACKOFF;
+                    media_groups.insert(key, entry);
+                }
+            },
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_buffered_media_group(
+    client: &Client,
+    token: &str,
+    config: &LoadedConfig,
+    state: &StateStore,
+    entry: &BufferedMediaGroup,
+) -> KaiResult<()> {
+    let first_message = entry.messages.first().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("empty media group buffer for {}", entry.media_group_id),
+        )
+    })?;
+
+    let validated = validate_inbound_message(client, token, config, state, first_message).await?;
+    let Some(validated) = validated else {
+        return Ok(());
+    };
+
+    for message in &entry.messages {
+        if message.chat.kind != "private" || message.chat.id != validated.chat_id {
+            return Err(KaiError::invalid_argument(
+                "media group contains messages from multiple chats",
+            ));
+        }
+
+        let sender_id =
+            message.from.as_ref().map(|user| user.id).ok_or_else(|| {
+                KaiError::invalid_argument("media group message is missing sender")
+            })?;
+        if sender_id != validated.sender_id {
+            return Err(KaiError::invalid_argument(
+                "media group contains messages from multiple senders",
+            ));
+        }
+    }
+
+    let text = merge_media_group_text(&entry.messages, &validated.text);
+    let mut attachments = Vec::new();
+    for message in &entry.messages {
+        attachments
+            .extend(download_message_attachments(client, token, config, state, message).await?);
+    }
+
+    if attachments.len() > MAX_ATTACHMENTS_PER_TURN {
+        return Err(KaiError::invalid_argument(format!(
+            "too many attachments in one message: max {MAX_ATTACHMENTS_PER_TURN}"
+        )));
+    }
+
+    process_owner_turn(
+        client,
+        token,
+        config,
+        state,
+        OwnerTurnInput {
+            update_ids: &entry.update_ids,
+            chat_id: validated.chat_id,
+            sender_id: validated.sender_id,
+            text: &text,
+            attachments,
+        },
+    )
+    .await
+}
+
+fn merge_media_group_text(messages: &[TelegramMessage], fallback_text: &str) -> String {
+    let mut texts = messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .caption
+                .as_deref()
+                .or(message.text.as_deref())
+                .map(str::trim)
+        })
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if texts.is_empty() && !fallback_text.trim().is_empty() {
+        texts.push(fallback_text.trim().to_string());
+    }
+
+    texts.dedup();
+    texts.join("\n\n")
+}
+
+fn media_group_key(chat_id: i64, media_group_id: &str) -> String {
+    format!("{chat_id}:{media_group_id}")
 }
 
 async fn try_pair(
@@ -332,12 +615,17 @@ fn telegram_token(config: &LoadedConfig) -> KaiResult<String> {
     resolve_telegram_token(config)
 }
 
-async fn get_updates(client: &Client, token: &str, offset: i64) -> KaiResult<Vec<TelegramUpdate>> {
+async fn get_updates(
+    client: &Client,
+    token: &str,
+    offset: i64,
+    timeout_seconds: u64,
+) -> KaiResult<Vec<TelegramUpdate>> {
     let response = client
         .get(format!("https://api.telegram.org/bot{token}/getUpdates"))
         .query(&[
             ("offset", offset.to_string()),
-            ("timeout", "30".to_string()),
+            ("timeout", timeout_seconds.to_string()),
             ("allowed_updates", "[\"message\"]".to_string()),
         ])
         .send()
@@ -449,76 +737,156 @@ async fn send_typing_indicator(client: &Client, token: &str, chat_id: i64) -> Ka
     ))
 }
 
-async fn download_attachments(
+async fn download_message_attachments(
     client: &Client,
     token: &str,
+    config: &LoadedConfig,
     state: &StateStore,
     message: &TelegramMessage,
 ) -> KaiResult<Vec<AttachmentInfo>> {
-    let mut attachments = Vec::new();
-
-    if let Some(document) = &message.document
-        && is_supported_document(document)
-    {
-        attachments.push(
-            download_file(
-                client,
-                token,
-                state,
-                DownloadRequest {
-                    file_id: document.file_id.as_str(),
-                    original_name: document.file_name.clone(),
-                    mime_type: document.mime_type.clone(),
-                    kind: determine_document_kind(document),
-                    declared_size: document.file_size,
-                },
-            )
-            .await?,
-        );
-    }
-
-    if let Some(photo) = &message.photo
-        && let Some(best) = photo.iter().max_by_key(|item| item.file_size.unwrap_or(0))
-    {
-        attachments.push(
-            download_file(
-                client,
-                token,
-                state,
-                DownloadRequest {
-                    file_id: best.file_id.as_str(),
-                    original_name: Some(format!("photo-{}.jpg", best.file_unique_id)),
-                    mime_type: Some("image/jpeg".to_string()),
-                    kind: "image".to_string(),
-                    declared_size: best.file_size,
-                },
-            )
-            .await?,
-        );
-    }
-
-    if attachments.len() > MAX_ATTACHMENT_COUNT {
+    let requests = collect_download_requests(message);
+    if requests.len() > MAX_ATTACHMENTS_PER_TURN {
         return Err(KaiError::invalid_argument(format!(
-            "too many attachments in one message: max {MAX_ATTACHMENT_COUNT}"
+            "too many attachments in one message: max {MAX_ATTACHMENTS_PER_TURN}"
         )));
+    }
+
+    let mut attachments = Vec::new();
+    for request in requests {
+        attachments.push(download_file(client, token, config, state, request).await?);
     }
 
     Ok(attachments)
 }
 
-struct DownloadRequest<'a> {
-    file_id: &'a str,
+struct DownloadRequest {
+    file_id: String,
     original_name: Option<String>,
     mime_type: Option<String>,
-    kind: String,
+    kind: AttachmentKind,
     declared_size: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_secs: Option<u32>,
+    media_group_id: Option<String>,
+}
+
+fn collect_download_requests(message: &TelegramMessage) -> Vec<DownloadRequest> {
+    let mut requests = Vec::new();
+    let media_group_id = message.media_group_id.clone();
+
+    if let Some(document) = &message.document {
+        requests.push(DownloadRequest {
+            file_id: document.file_id.clone(),
+            original_name: document.file_name.clone(),
+            mime_type: document.mime_type.clone(),
+            kind: classify_document_kind(
+                document.file_name.as_deref(),
+                document.mime_type.as_deref(),
+            ),
+            declared_size: document.file_size,
+            width: None,
+            height: None,
+            duration_secs: None,
+            media_group_id: media_group_id.clone(),
+        });
+    }
+
+    if let Some(photo) = &message.photo
+        && let Some(best) = photo.iter().max_by_key(|item| item.file_size.unwrap_or(0))
+    {
+        requests.push(DownloadRequest {
+            file_id: best.file_id.clone(),
+            original_name: Some(format!("photo-{}.jpg", best.file_unique_id)),
+            mime_type: Some("image/jpeg".to_string()),
+            kind: AttachmentKind::Image,
+            declared_size: best.file_size,
+            width: Some(best.width),
+            height: Some(best.height),
+            duration_secs: None,
+            media_group_id: media_group_id.clone(),
+        });
+    }
+
+    if let Some(audio) = &message.audio {
+        requests.push(DownloadRequest {
+            file_id: audio.file_id.clone(),
+            original_name: audio.file_name.clone(),
+            mime_type: audio.mime_type.clone(),
+            kind: AttachmentKind::Audio,
+            declared_size: audio.file_size,
+            width: None,
+            height: None,
+            duration_secs: audio.duration,
+            media_group_id: media_group_id.clone(),
+        });
+    }
+
+    if let Some(voice) = &message.voice {
+        requests.push(DownloadRequest {
+            file_id: voice.file_id.clone(),
+            original_name: Some(format!("voice-{}.ogg", voice.file_unique_id)),
+            mime_type: voice.mime_type.clone().or(Some("audio/ogg".to_string())),
+            kind: AttachmentKind::Voice,
+            declared_size: voice.file_size,
+            width: None,
+            height: None,
+            duration_secs: voice.duration,
+            media_group_id: media_group_id.clone(),
+        });
+    }
+
+    if let Some(video) = &message.video {
+        requests.push(DownloadRequest {
+            file_id: video.file_id.clone(),
+            original_name: video.file_name.clone(),
+            mime_type: video.mime_type.clone(),
+            kind: AttachmentKind::Video,
+            declared_size: video.file_size,
+            width: video.width,
+            height: video.height,
+            duration_secs: video.duration,
+            media_group_id: media_group_id.clone(),
+        });
+    }
+
+    if let Some(video_note) = &message.video_note {
+        requests.push(DownloadRequest {
+            file_id: video_note.file_id.clone(),
+            original_name: Some(format!("video-note-{}.mp4", video_note.file_unique_id)),
+            mime_type: Some("video/mp4".to_string()),
+            kind: AttachmentKind::Video,
+            declared_size: video_note.file_size,
+            width: video_note.width,
+            height: video_note.height,
+            duration_secs: video_note.duration,
+            media_group_id: media_group_id.clone(),
+        });
+    }
+
+    if let Some(animation) = &message.animation {
+        requests.push(DownloadRequest {
+            file_id: animation.file_id.clone(),
+            original_name: animation.file_name.clone(),
+            mime_type: animation.mime_type.clone(),
+            kind: AttachmentKind::Animation,
+            declared_size: animation.file_size,
+            width: animation.width,
+            height: animation.height,
+            duration_secs: animation.duration,
+            media_group_id,
+        });
+    }
+
+    requests
 }
 
 async fn download_file(
     client: &Client,
     token: &str,
+    config: &LoadedConfig,
     state: &StateStore,
-    request: DownloadRequest<'_>,
+    request: DownloadRequest,
 ) -> KaiResult<AttachmentInfo> {
     let DownloadRequest {
         file_id,
@@ -526,20 +894,25 @@ async fn download_file(
         mime_type,
         kind,
         declared_size,
+        width,
+        height,
+        duration_secs,
+        media_group_id,
     } = request;
 
-    let byte_limit = attachment_byte_limit(&kind);
+    let byte_limit = attachment_byte_limit(kind);
     if let Some(size) = declared_size
         && size > byte_limit
     {
         return Err(KaiError::invalid_argument(format!(
-            "{kind} attachment exceeds limit: {size} bytes > {byte_limit}"
+            "{} attachment exceeds limit: {size} bytes > {byte_limit}",
+            kind.as_str()
         )));
     }
 
     let response = client
         .get(format!("https://api.telegram.org/bot{token}/getFile"))
-        .query(&[("file_id", file_id)])
+        .query(&[("file_id", file_id.as_str())])
         .send()
         .await
         .map_err(http_error("request Telegram file metadata"))?;
@@ -562,7 +935,8 @@ async fn download_file(
         && size > byte_limit
     {
         return Err(KaiError::invalid_argument(format!(
-            "{kind} attachment exceeds limit: {size} bytes > {byte_limit}"
+            "{} attachment exceeds limit: {size} bytes > {byte_limit}",
+            kind.as_str()
         )));
     }
 
@@ -573,7 +947,7 @@ async fn download_file(
         )
     })?;
 
-    let safe_name = sanitize_filename(original_name.as_deref().unwrap_or(file_id));
+    let safe_name = sanitize_filename(original_name.as_deref().unwrap_or(&file_id));
     let storage_name = format!("{}-{}", Uuid::new_v4().simple(), safe_name);
     let local_path = state.paths().attachments_dir.join(storage_name);
     let partial_path = local_path.with_extension("part");
@@ -605,7 +979,8 @@ async fn download_file(
         if bytes > byte_limit {
             let _ = fs::remove_file(&partial_path);
             return Err(KaiError::invalid_argument(format!(
-                "{kind} attachment exceeds limit while downloading: {bytes} bytes > {byte_limit}"
+                "{} attachment exceeds limit while downloading: {bytes} bytes > {byte_limit}",
+                kind.as_str()
             )));
         }
 
@@ -635,45 +1010,25 @@ async fn download_file(
 
     let checksum_blake3 = hasher.finalize().to_hex().to_string();
 
-    Ok(AttachmentInfo {
-        kind,
+    let mut attachment = AttachmentInfo {
+        kind: kind.as_str().to_string(),
         path: local_path.display().to_string(),
         original_name,
         mime_type,
         bytes,
         checksum_blake3,
-    })
-}
+        media_group_id,
+        duration_secs,
+        width,
+        height,
+        transcript_text: None,
+        transcript_segments: Vec::new(),
+        artifacts: Vec::new(),
+        notes: Vec::new(),
+    };
+    enrich_attachment(config, &mut attachment).await?;
 
-fn is_supported_document(document: &TelegramDocument) -> bool {
-    matches!(determine_document_kind(document).as_str(), "pdf" | "text")
-}
-
-fn determine_document_kind(document: &TelegramDocument) -> String {
-    let file_name = document
-        .file_name
-        .as_deref()
-        .unwrap_or_default()
-        .to_lowercase();
-    let mime_type = document
-        .mime_type
-        .as_deref()
-        .unwrap_or_default()
-        .to_lowercase();
-
-    if mime_type == "application/pdf" || file_name.ends_with(".pdf") {
-        return "pdf".to_string();
-    }
-
-    if mime_type.starts_with("text/")
-        || file_name.ends_with(".md")
-        || file_name.ends_with(".txt")
-        || file_name.ends_with(".markdown")
-    {
-        return "text".to_string();
-    }
-
-    "unsupported".to_string()
+    Ok(attachment)
 }
 
 fn sanitize_filename(input: &str) -> String {
@@ -844,15 +1199,6 @@ fn http_error(action: &'static str) -> impl Fn(reqwest::Error) -> KaiError {
     }
 }
 
-fn attachment_byte_limit(kind: &str) -> u64 {
-    match kind {
-        "image" => MAX_IMAGE_BYTES,
-        "pdf" => MAX_PDF_BYTES,
-        "text" => MAX_TEXT_BYTES,
-        _ => MAX_TEXT_BYTES,
-    }
-}
-
 fn record_runtime_error(
     state: &StateStore,
     event: &str,
@@ -979,6 +1325,12 @@ struct TelegramMessage {
     caption: Option<String>,
     document: Option<TelegramDocument>,
     photo: Option<Vec<TelegramPhotoSize>>,
+    audio: Option<TelegramAudio>,
+    voice: Option<TelegramVoice>,
+    video: Option<TelegramVideo>,
+    video_note: Option<TelegramVideoNote>,
+    animation: Option<TelegramAnimation>,
+    media_group_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,7 +1357,59 @@ struct TelegramDocument {
 struct TelegramPhotoSize {
     file_id: String,
     file_unique_id: String,
+    width: u32,
+    height: u32,
     file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAudio {
+    file_id: String,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+    file_size: Option<u64>,
+    duration: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVoice {
+    file_id: String,
+    file_unique_id: String,
+    mime_type: Option<String>,
+    file_size: Option<u64>,
+    duration: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVideo {
+    file_id: String,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+    file_size: Option<u64>,
+    duration: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramVideoNote {
+    file_id: String,
+    file_unique_id: String,
+    file_size: Option<u64>,
+    duration: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramAnimation {
+    file_id: String,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+    file_size: Option<u64>,
+    duration: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

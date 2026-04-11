@@ -5,8 +5,9 @@ use crate::config::LoadedConfig;
 use crate::context::context_report;
 use crate::contract::{HealthCheck, HealthReport};
 use crate::error::{ErrorCode, KaiError, KaiResult};
+use crate::media::transcription_provider_status;
 use crate::runtime_fs::{octal_mode, read_unix_mode};
-use crate::secrets::telegram_token_status;
+use crate::secrets::{groq_api_key_status, telegram_token_status};
 use crate::state::{StateStore, state_paths};
 
 pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
@@ -59,6 +60,104 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
         } else {
             Some(
                 "export the Telegram bot token env var, then run `kai service restart` to sync the background secret store".to_string(),
+            )
+        },
+    });
+
+    let transcription_status = transcription_provider_status(config)?;
+    checks.push(HealthCheck {
+        name: "media.transcription.provider".to_string(),
+        ok: !matches!(
+            transcription_status,
+            crate::media::TranscriptionProviderStatus::Misconfigured { .. }
+        ),
+        detail: match &transcription_status {
+            crate::media::TranscriptionProviderStatus::Disabled => {
+                "transcription is disabled".to_string()
+            }
+            crate::media::TranscriptionProviderStatus::Ready { provider } => {
+                format!("transcription provider `{provider}` is ready")
+            }
+            crate::media::TranscriptionProviderStatus::Misconfigured { provider, detail } => {
+                format!("transcription provider `{provider}` is misconfigured: {detail}")
+            }
+        },
+        fix: match &transcription_status {
+            crate::media::TranscriptionProviderStatus::Disabled
+            | crate::media::TranscriptionProviderStatus::Ready { .. } => None,
+            crate::media::TranscriptionProviderStatus::Misconfigured { provider, .. }
+                if provider == "groq" =>
+            {
+                Some(
+                    "export the Groq API key once, then run `kai service restart` to sync the background secret store"
+                        .to_string(),
+                )
+            }
+            crate::media::TranscriptionProviderStatus::Misconfigured { provider, .. }
+                if provider == "command" =>
+            {
+                Some(
+                    "set `media.transcription.command` or switch providers in config".to_string(),
+                )
+            }
+            crate::media::TranscriptionProviderStatus::Misconfigured { .. } => {
+                Some("set a supported `media.transcription.provider` value".to_string())
+            }
+        },
+    });
+
+    if config
+        .values
+        .media
+        .transcription
+        .provider
+        .eq_ignore_ascii_case("groq")
+    {
+        let groq_status = groq_api_key_status(config)?;
+        let groq_ok = groq_status.env_available || groq_status.keychain_available;
+        let detail = match (groq_status.env_available, groq_status.keychain_available) {
+            (true, true) => format!(
+                "env `{}` is set and macOS Keychain service `{}` is available",
+                groq_status.env_key,
+                groq_status.keychain_service.as_deref().unwrap_or("unknown")
+            ),
+            (true, false) => format!("env `{}` is set", groq_status.env_key),
+            (false, true) => format!(
+                "macOS Keychain service `{}` is available",
+                groq_status.keychain_service.as_deref().unwrap_or("unknown")
+            ),
+            (false, false) => format!("env `{}` is missing", groq_status.env_key),
+        };
+        checks.push(HealthCheck {
+            name: "media.transcription.secret".to_string(),
+            ok: groq_ok,
+            detail,
+            fix: if groq_ok {
+                None
+            } else {
+                Some(
+                    "export the Groq API key once, then run `kai service restart` to seed the secure background secret store"
+                        .to_string(),
+                )
+            },
+        });
+    }
+
+    let ffmpeg_ok = find_binary("ffmpeg").is_some();
+    checks.push(HealthCheck {
+        name: "media.ffmpeg".to_string(),
+        ok: ffmpeg_ok,
+        detail: if ffmpeg_ok {
+            "found `ffmpeg` for video and animation preprocessing".to_string()
+        } else {
+            "`ffmpeg` is missing; video/animation understanding will be reduced".to_string()
+        },
+        fix: if ffmpeg_ok {
+            None
+        } else {
+            Some(
+                "install `ffmpeg` if you want preview frames and broader media preprocessing"
+                    .to_string(),
             )
         },
     });

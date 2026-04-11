@@ -21,6 +21,7 @@ pub struct LoadedConfig {
 pub struct Config {
     pub agent: AgentConfig,
     pub channel: ChannelConfig,
+    pub media: MediaConfig,
     pub paths: PathsConfig,
     pub runner: RunnerConfig,
     pub context_files: ContextFilesConfig,
@@ -47,6 +48,20 @@ pub struct TelegramConfig {
 pub struct PathsConfig {
     pub root_app: String,
     pub root_work: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaConfig {
+    pub transcription: TranscriptionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionConfig {
+    pub provider: String,
+    pub groq_api_key_env: String,
+    pub groq_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +93,7 @@ pub struct ContextFilesConfig {
 struct PartialConfig {
     agent: Option<PartialAgentConfig>,
     channel: Option<PartialChannelConfig>,
+    media: Option<PartialMediaConfig>,
     paths: Option<PartialPathsConfig>,
     runner: Option<PartialRunnerConfig>,
     context_files: Option<PartialContextFilesConfig>,
@@ -104,6 +120,19 @@ struct PartialTelegramConfig {
 struct PartialPathsConfig {
     root_app: Option<String>,
     root_work: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialMediaConfig {
+    transcription: Option<PartialTranscriptionConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialTranscriptionConfig {
+    provider: Option<String>,
+    groq_api_key_env: Option<String>,
+    groq_model: Option<String>,
+    command: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -209,6 +238,11 @@ pub fn build_default_config_file() -> String {
         "enabled = true",
         "bot_token_env = \"KAI_TELEGRAM_BOT_TOKEN\"",
         "",
+        "[media.transcription]",
+        "provider = \"groq\"",
+        "groq_api_key_env = \"GROQ_API_KEY\"",
+        "groq_model = \"whisper-large-v3-turbo\"",
+        "",
         "[paths]",
         "root_app = \"~/.tools/kai\"",
         "root_work = \"~/.tools/kai/work\"",
@@ -293,6 +327,14 @@ fn default_config(root_app: PathBuf) -> Config {
                 owner_user_id: None,
             },
         },
+        media: MediaConfig {
+            transcription: TranscriptionConfig {
+                provider: "groq".to_string(),
+                groq_api_key_env: "GROQ_API_KEY".to_string(),
+                groq_model: "whisper-large-v3-turbo".to_string(),
+                command: None,
+            },
+        },
         paths: PathsConfig {
             root_app: root_app.display().to_string(),
             root_work: root_work.display().to_string(),
@@ -349,6 +391,23 @@ fn apply_partial_config(config: &mut Config, partial: PartialConfig) {
         }
     }
 
+    if let Some(media) = partial.media
+        && let Some(transcription) = media.transcription
+    {
+        if let Some(provider) = transcription.provider {
+            config.media.transcription.provider = provider;
+        }
+        if let Some(groq_api_key_env) = transcription.groq_api_key_env {
+            config.media.transcription.groq_api_key_env = groq_api_key_env;
+        }
+        if let Some(groq_model) = transcription.groq_model {
+            config.media.transcription.groq_model = groq_model;
+        }
+        if transcription.command.is_some() {
+            config.media.transcription.command = transcription.command;
+        }
+    }
+
     if let Some(runner) = partial.runner
         && let Some(codex) = runner.codex
     {
@@ -388,6 +447,18 @@ fn apply_env_overrides(config: &mut Config) {
     }
     if let Ok(value) = env::var("KAI_CODEX_BINARY") {
         config.runner.codex.binary = value;
+    }
+    if let Ok(value) = env::var("KAI_TRANSCRIPTION_PROVIDER") {
+        config.media.transcription.provider = value;
+    }
+    if let Ok(value) = env::var("KAI_GROQ_API_KEY_ENV") {
+        config.media.transcription.groq_api_key_env = value;
+    }
+    if let Ok(value) = env::var("KAI_GROQ_MODEL") {
+        config.media.transcription.groq_model = value;
+    }
+    if let Ok(value) = env::var("KAI_TRANSCRIPTION_COMMAND") {
+        config.media.transcription.command = Some(value);
     }
     if let Ok(value) = env::var("KAI_TELEGRAM_BOT_TOKEN_ENV") {
         config.channel.telegram.bot_token_env = value;
