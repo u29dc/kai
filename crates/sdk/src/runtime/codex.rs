@@ -1,8 +1,10 @@
 use chrono::Utc;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 
 use serde_json::Value as JsonValue;
+use tokio::process::Command as TokioCommand;
 
 use crate::config::LoadedConfig;
 use crate::context::{ContextSnapshot, context_snapshots};
@@ -21,6 +23,36 @@ pub struct CodexTurnResult {
     pub response_text: String,
     pub resumed: bool,
     pub context_snapshots: Vec<ContextSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedCodexTurn {
+    pub channel: String,
+    pub sender_id: i64,
+    pub attachments: Vec<AttachmentInfo>,
+    pub context_snapshots: Vec<ContextSnapshot>,
+    pub prompt: String,
+    pub replay_prompt: String,
+    pub requested_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeFailure {
+    pub requested_session_id: String,
+    pub stale_session: bool,
+    pub error: KaiError,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsyncCodexTurnResult {
+    pub result: CodexTurnResult,
+    pub resume_failure: Option<ResumeFailure>,
+}
+
+#[derive(Debug)]
+pub struct RunningCodexTurn {
+    pub pid: u32,
+    receiver: Receiver<KaiResult<AsyncCodexTurnResult>>,
 }
 
 pub fn run_codex_turn(
@@ -86,10 +118,231 @@ pub fn run_codex_turn(
     })
 }
 
+pub fn prepare_codex_turn(
+    config: &LoadedConfig,
+    state: &StateStore,
+    channel: &str,
+    sender_id: i64,
+    user_text: &str,
+    attachments: &[AttachmentInfo],
+) -> KaiResult<PreparedCodexTurn> {
+    let context_snapshots = context_snapshots(config);
+    let prompt = build_turn_prompt(
+        config,
+        channel,
+        sender_id,
+        user_text,
+        attachments,
+        &context_snapshots,
+    );
+    let replay_prompt = build_replay_prompt(
+        &prompt,
+        state.get_replay_package()?,
+        &state.recent_turns(12)?,
+    );
+
+    Ok(PreparedCodexTurn {
+        channel: channel.to_string(),
+        sender_id,
+        attachments: attachments.to_vec(),
+        context_snapshots,
+        prompt,
+        replay_prompt,
+        requested_session_id: state.get_active_session_id()?,
+    })
+}
+
+pub async fn start_codex_turn(
+    config: LoadedConfig,
+    prepared: PreparedCodexTurn,
+) -> KaiResult<RunningCodexTurn> {
+    let (mut command, using_resume) = build_async_command(&config, &prepared)?;
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
+
+    let child = command.spawn().map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to launch Codex CLI: {error}"),
+        )
+    })?;
+    let pid = child.id().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI did not expose a process id",
+        )
+    })?;
+
+    let (sender, receiver) = mpsc::channel();
+    tokio::spawn(async move {
+        let result = wait_for_codex_turn(config, child, prepared, using_resume).await;
+        let _ = sender.send(result);
+    });
+
+    Ok(RunningCodexTurn { pid, receiver })
+}
+
+pub fn poll_running_codex_turn(
+    turn: &mut RunningCodexTurn,
+) -> Option<KaiResult<AsyncCodexTurnResult>> {
+    turn.receiver.try_recv().ok()
+}
+
+pub fn cancel_codex_turn(turn: &RunningCodexTurn) -> KaiResult<()> {
+    signal_process(turn.pid, "TERM")
+}
+
 #[derive(Debug)]
 struct RawCodexResult {
     session_id: String,
     response_text: String,
+}
+
+fn build_async_command(
+    config: &LoadedConfig,
+    prepared: &PreparedCodexTurn,
+) -> KaiResult<(TokioCommand, bool)> {
+    if let Some(session_id) = &prepared.requested_session_id {
+        let mut command = TokioCommand::new(&config.values.runner.codex.binary);
+        command.arg("exec");
+        command.arg("resume");
+        command.arg("--json");
+        command.arg("--skip-git-repo-check");
+        apply_codex_overrides_tokio(config, &mut command);
+        apply_image_args_tokio(&mut command, &prepared.attachments);
+        command.arg(session_id);
+        command.arg(&prepared.prompt);
+        return Ok((command, true));
+    }
+
+    let mut command = TokioCommand::new(&config.values.runner.codex.binary);
+    command.arg("exec");
+    command.arg("--json");
+    command.arg("--skip-git-repo-check");
+    command.arg("-C");
+    command.arg(&config.values.paths.root_work);
+
+    for path in extra_access_paths(config, &prepared.attachments) {
+        command.arg("--add-dir");
+        command.arg(path);
+    }
+
+    apply_codex_overrides_tokio(config, &mut command);
+    apply_image_args_tokio(&mut command, &prepared.attachments);
+    command.arg(&prepared.replay_prompt);
+    Ok((command, false))
+}
+
+async fn wait_for_codex_turn(
+    config: LoadedConfig,
+    child: tokio::process::Child,
+    prepared: PreparedCodexTurn,
+    using_resume: bool,
+) -> KaiResult<AsyncCodexTurnResult> {
+    let output = child.wait_with_output().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to wait for Codex CLI: {error}"),
+        )
+    })?;
+
+    let resume_failure = if output.status.success() {
+        None
+    } else if using_resume {
+        let error = codex_process_failure(&output);
+        if let Some(requested_session_id) = &prepared.requested_session_id
+            && is_stale_resume_error(&error)
+        {
+            let fallback = run_exec_async_fallback(&config, &prepared).await?;
+            return Ok(AsyncCodexTurnResult {
+                result: CodexTurnResult {
+                    session_id: fallback.session_id,
+                    response_text: fallback.response_text,
+                    resumed: false,
+                    context_snapshots: prepared.context_snapshots,
+                },
+                resume_failure: Some(ResumeFailure {
+                    requested_session_id: requested_session_id.clone(),
+                    stale_session: true,
+                    error,
+                }),
+            });
+        }
+
+        return Err(error);
+    } else {
+        return Err(codex_process_failure(&output));
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw = parse_jsonl_output(&stdout)?;
+    Ok(AsyncCodexTurnResult {
+        result: CodexTurnResult {
+            session_id: raw.session_id,
+            response_text: raw.response_text,
+            resumed: using_resume,
+            context_snapshots: prepared.context_snapshots,
+        },
+        resume_failure,
+    })
+}
+
+async fn run_exec_async_fallback(
+    config: &LoadedConfig,
+    prepared: &PreparedCodexTurn,
+) -> KaiResult<RawCodexResult> {
+    let mut command = TokioCommand::new(&config.values.runner.codex.binary);
+    command.arg("exec");
+    command.arg("--json");
+    command.arg("--skip-git-repo-check");
+    command.arg("-C");
+    command.arg(&config.values.paths.root_work);
+
+    for path in extra_access_paths(config, &prepared.attachments) {
+        command.arg("--add-dir");
+        command.arg(path);
+    }
+
+    apply_codex_overrides_tokio(config, &mut command);
+    apply_image_args_tokio(&mut command, &prepared.attachments);
+    command.arg(&prepared.replay_prompt);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
+
+    let output = command
+        .spawn()
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("failed to launch Codex CLI: {error}"),
+            )
+        })?
+        .wait_with_output()
+        .await
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("failed to wait for Codex CLI: {error}"),
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(codex_process_failure(&output));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_jsonl_output(&stdout)
+}
+
+fn codex_process_failure(output: &std::process::Output) -> KaiError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    KaiError::new(
+        ErrorCode::RuntimeError,
+        format!("Codex CLI exited with status {}", output.status),
+    )
+    .with_hint(stderr)
 }
 
 fn run_exec(
@@ -630,7 +883,27 @@ fn apply_codex_overrides(config: &LoadedConfig, command: &mut Command) {
     }
 }
 
+fn apply_codex_overrides_tokio(config: &LoadedConfig, command: &mut TokioCommand) {
+    if let Some(override_config) = &config.values.runner.codex.override_config {
+        if let Some(approval_policy) = &override_config.approval_policy {
+            command.arg("-c");
+            command.arg(format!("approval_policy=\"{approval_policy}\""));
+        }
+        if let Some(sandbox_mode) = &override_config.sandbox_mode {
+            command.arg("-s");
+            command.arg(sandbox_mode);
+        }
+    }
+}
+
 fn apply_image_args(command: &mut Command, attachments: &[AttachmentInfo]) {
+    for path in image_input_paths(attachments) {
+        command.arg("-i");
+        command.arg(path);
+    }
+}
+
+fn apply_image_args_tokio(command: &mut TokioCommand, attachments: &[AttachmentInfo]) {
     for path in image_input_paths(attachments) {
         command.arg("-i");
         command.arg(path);
@@ -764,6 +1037,28 @@ fn image_input_paths(attachments: &[AttachmentInfo]) -> Vec<&str> {
     }
 
     paths
+}
+
+fn signal_process(pid: u32, signal: &str) -> KaiResult<()> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("failed to signal Codex process {pid}: {error}"),
+            )
+        })?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(KaiError::new(
+        ErrorCode::RuntimeError,
+        format!("failed to signal Codex process {pid} with {signal}"),
+    ))
 }
 
 #[cfg(test)]

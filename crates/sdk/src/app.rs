@@ -62,6 +62,8 @@ pub fn mobile_help_text() -> String {
         "/status - show current pairing and session status",
         "/new - clear the current Codex session so the next message starts fresh",
         "/reset - same as /new",
+        "/cancel - stop the current running Codex turn",
+        "/send <path> - send a local file from root_work or root_app",
         "/pair <code> - recovery-only owner pairing when locally enabled",
     ]
     .join("\n")
@@ -96,6 +98,7 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
                 .unwrap_or_else(|| "unpaired".to_string())
         ),
         format!("update_offset: {}", session.update_offset),
+        format!("queued_turns: {}", state.pending_turn_queue_len()?),
     ];
 
     if let Some(pairing) = session.pending_pairing {

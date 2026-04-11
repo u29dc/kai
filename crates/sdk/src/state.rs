@@ -126,6 +126,19 @@ pub struct ReplayPackage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingTurn {
+    pub id: String,
+    pub enqueued_at: String,
+    pub channel: String,
+    pub update_ids: Vec<i64>,
+    pub chat_id: i64,
+    pub sender_id: i64,
+    pub text: String,
+    pub attachments: Vec<AttachmentInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessedUpdate {
     pub update_id: i64,
     pub created_at: String,
@@ -277,6 +290,53 @@ impl StateStore {
 
     pub fn clear_replay_package(&self) -> KaiResult<()> {
         self.delete_value("codex.replay_package")
+    }
+
+    pub fn pending_turn_queue(&self) -> KaiResult<Vec<PendingTurn>> {
+        Ok(self
+            .get_json_value::<Vec<PendingTurn>>("telegram.pending_turn_queue")?
+            .unwrap_or_default())
+    }
+
+    pub fn pending_turn_queue_len(&self) -> KaiResult<usize> {
+        Ok(self.pending_turn_queue()?.len())
+    }
+
+    pub fn enqueue_pending_turn(&self, turn: &PendingTurn) -> KaiResult<usize> {
+        let mut queue = self.pending_turn_queue()?;
+        queue.push(turn.clone());
+        self.set_json_value("telegram.pending_turn_queue", &queue)?;
+        Ok(queue.len())
+    }
+
+    pub fn prepend_pending_turn(&self, turn: &PendingTurn) -> KaiResult<usize> {
+        let mut queue = self.pending_turn_queue()?;
+        queue.insert(0, turn.clone());
+        self.set_json_value("telegram.pending_turn_queue", &queue)?;
+        Ok(queue.len())
+    }
+
+    pub fn pop_pending_turn(&self) -> KaiResult<Option<PendingTurn>> {
+        let mut queue = self.pending_turn_queue()?;
+        if queue.is_empty() {
+            return Ok(None);
+        }
+
+        let next = queue.remove(0);
+        self.set_json_value("telegram.pending_turn_queue", &queue)?;
+        Ok(Some(next))
+    }
+
+    pub fn clear_pending_turn_queue(&self) -> KaiResult<()> {
+        self.delete_value("telegram.pending_turn_queue")
+    }
+
+    pub fn get_command_menu_hash(&self, chat_id: i64) -> KaiResult<Option<String>> {
+        self.get_json_value(&format!("telegram.command_menu_hash.{chat_id}"))
+    }
+
+    pub fn set_command_menu_hash(&self, chat_id: i64, hash: &str) -> KaiResult<()> {
+        self.set_json_value(&format!("telegram.command_menu_hash.{chat_id}"), &hash)
     }
 
     pub fn get_processed_update(&self, update_id: i64) -> KaiResult<Option<ProcessedUpdate>> {
@@ -870,6 +930,54 @@ mod tests {
                 .expect("load failure")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pending_turn_queue_round_trips_and_preserves_order() {
+        let tempdir = tempdir().expect("tempdir");
+        let root_app = tempdir.path().join("kai-home");
+        let root_work = tempdir.path().join("work");
+        let config = test_config(&root_app, &root_work);
+
+        let store = StateStore::open(&config).expect("state store");
+        store
+            .enqueue_pending_turn(&PendingTurn {
+                id: "turn-1".to_string(),
+                enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+                channel: "telegram".to_string(),
+                update_ids: vec![1],
+                chat_id: 1,
+                sender_id: 7,
+                text: "first".to_string(),
+                attachments: Vec::new(),
+            })
+            .expect("enqueue first");
+        store
+            .enqueue_pending_turn(&PendingTurn {
+                id: "turn-2".to_string(),
+                enqueued_at: "2026-04-12T00:01:00Z".to_string(),
+                channel: "telegram".to_string(),
+                update_ids: vec![2],
+                chat_id: 1,
+                sender_id: 7,
+                text: "second".to_string(),
+                attachments: Vec::new(),
+            })
+            .expect("enqueue second");
+
+        assert_eq!(store.pending_turn_queue_len().expect("queue length"), 2);
+        let first = store
+            .pop_pending_turn()
+            .expect("pop first")
+            .expect("first turn");
+        let second = store
+            .pop_pending_turn()
+            .expect("pop second")
+            .expect("second turn");
+
+        assert_eq!(first.id, "turn-1");
+        assert_eq!(second.id, "turn-2");
+        assert!(store.pop_pending_turn().expect("pop empty").is_none());
     }
 
     #[test]
