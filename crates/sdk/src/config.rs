@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::error::{ErrorCode, KaiError, KaiResult};
+use crate::runtime_fs::{harden_private_file, write_private_file};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedConfig {
@@ -137,6 +138,7 @@ pub fn load_config() -> KaiResult<LoadedConfig> {
     let mut config = default_config(root_app);
 
     if config_exists {
+        harden_private_file(&config_path)?;
         let raw = fs::read_to_string(&config_path).map_err(|error| {
             KaiError::new(
                 ErrorCode::ConfigError,
@@ -237,12 +239,7 @@ pub fn ensure_config_file(path: &Path) -> KaiResult<()> {
         })?;
     }
 
-    fs::write(path, build_default_config_file()).map_err(|error| {
-        KaiError::new(
-            ErrorCode::IoError,
-            format!("failed to write config file: {error}"),
-        )
-    })?;
+    write_private_file(path, build_default_config_file().as_bytes())?;
 
     Ok(())
 }
@@ -270,7 +267,7 @@ pub fn set_config_value(key: &str, raw_value: &str) -> KaiResult<PathBuf> {
     let config_path = discover_config_path();
     let mut document = load_or_create_document(&config_path)?;
     set_document_value(&mut document, key, raw_value)?;
-    write_document(&config_path, &document)?;
+    write_document(&config_path, &mut document)?;
     Ok(config_path)
 }
 
@@ -278,7 +275,7 @@ pub fn unset_config_value(key: &str) -> KaiResult<PathBuf> {
     let config_path = discover_config_path();
     let mut document = load_or_create_document(&config_path)?;
     remove_document_value(&mut document, key)?;
-    write_document(&config_path, &document)?;
+    write_document(&config_path, &mut document)?;
     Ok(config_path)
 }
 
@@ -435,7 +432,9 @@ fn load_or_create_document(path: &Path) -> KaiResult<DocumentMut> {
     })
 }
 
-fn write_document(path: &Path, document: &DocumentMut) -> KaiResult<()> {
+fn write_document(path: &Path, document: &mut DocumentMut) -> KaiResult<()> {
+    prune_empty_tables(document.as_item_mut());
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             KaiError::new(
@@ -453,6 +452,34 @@ fn write_document(path: &Path, document: &DocumentMut) -> KaiResult<()> {
     })?;
 
     Ok(())
+}
+
+fn prune_empty_tables(item: &mut Item) -> bool {
+    let Some(table) = item.as_table_like_mut() else {
+        return false;
+    };
+
+    let keys = table
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .collect::<Vec<_>>();
+    let mut empty_keys = Vec::new();
+
+    for key in keys {
+        let Some(child) = table.get_mut(&key) else {
+            continue;
+        };
+
+        if prune_empty_tables(child) {
+            empty_keys.push(key);
+        }
+    }
+
+    for key in empty_keys {
+        table.remove(&key);
+    }
+
+    table.is_empty()
 }
 
 fn set_document_value(document: &mut DocumentMut, key: &str, raw_value: &str) -> KaiResult<()> {
@@ -476,28 +503,46 @@ fn set_document_value(document: &mut DocumentMut, key: &str, raw_value: &str) ->
 }
 
 fn remove_document_value(document: &mut DocumentMut, key: &str) -> KaiResult<()> {
-    let mut segments = key.split('.').collect::<Vec<_>>();
+    let segments = key.split('.').collect::<Vec<_>>();
     if segments.is_empty() {
         return Err(KaiError::invalid_argument("config key cannot be empty"));
     }
 
-    let leaf = segments.pop().unwrap_or_default();
-    let mut current = document.as_item_mut();
-    for segment in segments {
-        current = current.get_mut(segment).ok_or_else(|| {
-            KaiError::invalid_argument(format!("unknown config key: {key}"))
-                .with_hint("use `kai config show` to inspect available keys")
-        })?;
+    remove_item_value(document.as_item_mut(), &segments, key)?;
+    Ok(())
+}
+
+fn remove_item_value(item: &mut Item, segments: &[&str], full_key: &str) -> KaiResult<bool> {
+    if segments.is_empty() {
+        return Err(KaiError::invalid_argument("config key cannot be empty"));
     }
 
-    if let Some(table) = current.as_table_like_mut() {
-        table.remove(leaf);
-        return Ok(());
+    let segment = segments[0];
+    let Some(table) = item.as_table_like_mut() else {
+        return Err(KaiError::invalid_argument(format!(
+            "unknown config key: {full_key}"
+        )));
+    };
+
+    if segments.len() == 1 {
+        if table.remove(segment).is_none() {
+            return Err(
+                KaiError::invalid_argument(format!("unknown config key: {full_key}"))
+                    .with_hint("use `kai config show` to inspect available keys"),
+            );
+        }
+        return Ok(table.is_empty());
     }
 
-    Err(KaiError::invalid_argument(format!(
-        "unknown config key: {key}"
-    )))
+    let child = table.get_mut(segment).ok_or_else(|| {
+        KaiError::invalid_argument(format!("unknown config key: {full_key}"))
+            .with_hint("use `kai config show` to inspect available keys")
+    })?;
+    let child_empty = remove_item_value(child, &segments[1..], full_key)?;
+    if child_empty {
+        table.remove(segment);
+    }
+    Ok(table.is_empty())
 }
 
 fn ensure_table_item(item: &mut Item) -> Item {
@@ -539,5 +584,23 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME must be available in tests");
         let path = expand_home("~/tmp/kai-test");
         assert_eq!(path, PathBuf::from(home).join("tmp").join("kai-test"));
+    }
+
+    #[test]
+    fn remove_document_value_prunes_empty_parent_tables() {
+        let mut document = DocumentMut::from_str(
+            r#"
+[channel.telegram]
+owner_user_id = 123
+"#,
+        )
+        .expect("document");
+
+        remove_document_value(&mut document, "channel.telegram.owner_user_id")
+            .expect("remove value");
+
+        let rendered = document.to_string();
+        assert!(!rendered.contains("[channel]"));
+        assert!(!rendered.contains("[channel.telegram]"));
     }
 }

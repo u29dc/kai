@@ -6,7 +6,7 @@
 	"scripts": {
 		"prepare": "husky",
 		"dev": "cargo run -p kai-cli --",
-		"build": "cargo build --workspace --release && OUT_DIR=\"${KAI_HOME:-${TOOLS_HOME:-$HOME/.tools}/kai}\" && mkdir -p \"$OUT_DIR\" && cp target/release/kai \"$OUT_DIR/kai\"",
+		"build": "cargo build --workspace --release && OUT_DIR=\"${KAI_HOME:-${TOOLS_HOME:-$HOME/.tools}/kai}\" && mkdir -p \"$OUT_DIR\" && TMP_BIN=\"$OUT_DIR/kai.tmp.$$\" && cp target/release/kai \"$TMP_BIN\" && mv \"$TMP_BIN\" \"$OUT_DIR/kai\"",
 		"util:biome": "bunx @biomejs/biome check --write AGENTS.md package.json biome.json commitlint.config.js lint-staged.config.js",
 		"util:format": "cargo fmt --all",
 		"util:lint": "cargo clippy --workspace --all-targets --all-features -- -D warnings",

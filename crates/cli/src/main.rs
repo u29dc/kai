@@ -6,13 +6,18 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use clap::{Parser, Subcommand};
 use kai_sdk::{
     ConfigGetOutput, ConfigShowOutput, KaiError, KaiResult, SessionView, SetupCodexOutput,
-    SetupOutput, StateStore, config_value_at_key, context_report, ensure_config_file,
-    error_envelope, health_report, load_config, mobile_help_text, ok_envelope, run_telegram_loop,
-    set_config_value, tool_catalog, tool_spec, unset_config_value,
+    SetupOutput, StateStore, acquire_run_guard, config_value_at_key, context_report,
+    ensure_config_file, ensure_private_dir, error_envelope, health_report, load_config,
+    mobile_help_text, ok_envelope, resolve_telegram_token, run_telegram_loop, service_logs,
+    service_restart, service_start, service_status, service_stop, service_uninstall,
+    set_config_value, tool_catalog, tool_spec, unset_config_value, write_private_file,
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
+
+const PAIRING_TTL_MINUTES: i64 = 10;
+const PAIRING_MAX_ATTEMPTS: u8 = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "kai")]
@@ -44,6 +49,10 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     Run,
 }
 
@@ -57,7 +66,10 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum SetupCommand {
-    Telegram,
+    Telegram {
+        #[arg(long)]
+        recovery: bool,
+    },
     Codex,
 }
 
@@ -70,8 +82,22 @@ enum ContextCommand {
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     Show,
+    Set { session_id: String },
     New,
     Reset,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Status,
+    Logs {
+        #[arg(long, default_value_t = 50)]
+        tail: usize,
+    },
+    Start,
+    Stop,
+    Restart,
+    Uninstall,
 }
 
 #[tokio::main]
@@ -178,6 +204,7 @@ async fn dispatch(cli: Cli) -> KaiResult<Flow> {
             })
         }
         Command::Session { command } => handle_session_command(command),
+        Command::Service { command } => handle_service_command(command),
         Command::Run => {
             let config = load_config()?;
             if !config.values.channel.telegram.enabled {
@@ -185,24 +212,23 @@ async fn dispatch(cli: Cli) -> KaiResult<Flow> {
                     "telegram is disabled in config",
                 ));
             }
-            if std::env::var(&config.values.channel.telegram.bot_token_env).is_err() {
-                return Err(KaiError::blocked_prerequisite(format!(
-                    "telegram bot token env `{}` is not set",
-                    config.values.channel.telegram.bot_token_env
-                ))
-                .with_hint("export the bot token env var before running `kai run`"));
-            }
+            let _ = resolve_telegram_token(&config)?;
+            let run_guard = acquire_run_guard(&config)?;
             let state = StateStore::open(&config)?;
             let payload = json!({
                 "status": "starting",
                 "help": mobile_help_text(),
                 "rootApp": config.values.paths.root_app,
+                "mode": "foreground",
             });
 
             Ok(Flow::Streaming {
                 tool: "kai.run".to_string(),
                 payload,
-                future: Box::pin(async move { run_telegram_loop(&config, &state).await }),
+                future: Box::pin(async move {
+                    let _guard = run_guard;
+                    run_telegram_loop(&config, &state).await
+                }),
             })
         }
     }
@@ -291,7 +317,7 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
                 payload,
             })
         }
-        Some(SetupCommand::Telegram) => {
+        Some(SetupCommand::Telegram { recovery }) => {
             let config = load_config()?;
             ensure_config_file(&config.config_path)?;
             let config = load_config()?;
@@ -299,20 +325,31 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
             let created_paths = create_runtime_dirs(&config, &state)?;
             create_context_placeholders(&config)?;
 
-            let pair_code = Uuid::new_v4()
-                .simple()
-                .to_string()
-                .chars()
-                .take(8)
-                .collect::<String>()
-                .to_uppercase();
-            state.set_pending_pair_code(&pair_code)?;
+            if config.values.channel.telegram.owner_user_id.is_some() && !recovery {
+                state.clear_pending_pairing()?;
+                return Err(KaiError::blocked_prerequisite(
+                    "owner_user_id is already pinned in config; pairing is disabled by default",
+                )
+                .with_hint(
+                    "use `kai setup telegram --recovery` only when you explicitly need to re-pair",
+                ));
+            }
+
+            let pair_code = Uuid::new_v4().simple().to_string().to_uppercase();
+            state.set_pending_pairing(&kai_sdk::state::PendingPairing::issue(
+                &pair_code,
+                PAIRING_TTL_MINUTES,
+                PAIRING_MAX_ATTEMPTS,
+            ))?;
 
             let payload = json!({
                 "configPath": config.config_path.display().to_string(),
                 "pairCode": pair_code,
                 "botTokenEnv": config.values.channel.telegram.bot_token_env,
                 "createdPaths": created_paths,
+                "recovery": recovery,
+                "expiresInMinutes": PAIRING_TTL_MINUTES,
+                "remainingAttempts": PAIRING_MAX_ATTEMPTS,
                 "instruction": "Send `/pair <code>` to the bot from Telegram after starting `kai run`."
             });
 
@@ -356,22 +393,30 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
 fn handle_session_command(command: SessionCommand) -> KaiResult<Flow> {
     let config = load_config()?;
     let state = StateStore::open(&config)?;
+    let tool = match &command {
+        SessionCommand::Show => "kai.session.show",
+        SessionCommand::Set { .. } => "kai.session.set",
+        SessionCommand::New => "kai.session.new",
+        SessionCommand::Reset => "kai.session.reset",
+    };
 
     match command {
         SessionCommand::Show => {}
+        SessionCommand::Set { session_id } => {
+            if session_id.trim().is_empty() {
+                return Err(KaiError::invalid_argument("session id cannot be empty"));
+            }
+            state.set_active_session_id(session_id.trim())?;
+            state.clear_replay_package()?;
+        }
         SessionCommand::New | SessionCommand::Reset => {
             state.clear_active_session_id()?;
+            state.clear_replay_package()?;
         }
     }
 
     let payload = serde_json::to_value(session_view_with_override(&config, &state)?)
         .map_err(serialize_error("serialize session view"))?;
-
-    let tool = match command {
-        SessionCommand::Show => "kai.session.show",
-        SessionCommand::New => "kai.session.new",
-        SessionCommand::Reset => "kai.session.reset",
-    };
 
     Ok(Flow::Immediate {
         tool: tool.to_string(),
@@ -403,7 +448,7 @@ fn create_runtime_dirs(
         state.paths().logs_dir.clone(),
         state.paths().state_dir.clone(),
     ] {
-        fs::create_dir_all(&path).map_err(io_error("create runtime directory"))?;
+        ensure_private_dir(&path)?;
         created.push(path.display().to_string());
     }
 
@@ -427,8 +472,7 @@ fn create_context_placeholders(config: &kai_sdk::LoadedConfig) -> KaiResult<()> 
             fs::create_dir_all(parent).map_err(io_error("create context directory"))?;
         }
 
-        fs::write(file_path, format!("# {title}\n\n"))
-            .map_err(io_error("write context placeholder"))?;
+        write_private_file(file_path, format!("# {title}\n\n").as_bytes())?;
     }
 
     Ok(())
@@ -453,6 +497,47 @@ fn serialize_error(action: &'static str) -> impl Fn(serde_json::Error) -> KaiErr
             format!("failed to {action}: {error}"),
         )
     }
+}
+
+fn handle_service_command(command: ServiceCommand) -> KaiResult<Flow> {
+    let config = load_config()?;
+    let (tool, payload) = match command {
+        ServiceCommand::Status => (
+            "kai.service.status",
+            serde_json::to_value(service_status(&config)?)
+                .map_err(serialize_error("serialize service status"))?,
+        ),
+        ServiceCommand::Logs { tail } => (
+            "kai.service.logs",
+            serde_json::to_value(service_logs(&config, tail)?)
+                .map_err(serialize_error("serialize service logs"))?,
+        ),
+        ServiceCommand::Start => (
+            "kai.service.start",
+            serde_json::to_value(service_start(&config)?)
+                .map_err(serialize_error("serialize service start"))?,
+        ),
+        ServiceCommand::Stop => (
+            "kai.service.stop",
+            serde_json::to_value(service_stop(&config)?)
+                .map_err(serialize_error("serialize service stop"))?,
+        ),
+        ServiceCommand::Restart => (
+            "kai.service.restart",
+            serde_json::to_value(service_restart(&config)?)
+                .map_err(serialize_error("serialize service restart"))?,
+        ),
+        ServiceCommand::Uninstall => (
+            "kai.service.uninstall",
+            serde_json::to_value(service_uninstall(&config)?)
+                .map_err(serialize_error("serialize service uninstall"))?,
+        ),
+    };
+
+    Ok(Flow::Immediate {
+        tool: tool.to_string(),
+        payload,
+    })
 }
 
 fn io_error(action: &'static str) -> impl Fn(std::io::Error) -> KaiError {

@@ -1,10 +1,9 @@
-use std::fs;
+use std::fs::{self, File};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::LoadedConfig;
-use crate::error::{ErrorCode, KaiError, KaiResult};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,11 +21,14 @@ pub struct ContextReport {
     pub entries: Vec<ContextEntry>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ContextBlob {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSnapshot {
     pub role: String,
     pub path: String,
-    pub content: String,
+    pub exists: bool,
+    pub readable: bool,
+    pub bytes: Option<u64>,
 }
 
 pub fn context_report(config: &LoadedConfig) -> ContextReport {
@@ -42,7 +44,7 @@ pub fn context_report(config: &LoadedConfig) -> ContextReport {
             let file_path = Path::new(path);
             let metadata = fs::metadata(file_path).ok();
             let exists = metadata.is_some();
-            let readable = exists && fs::read_to_string(file_path).is_ok();
+            let readable = exists && File::open(file_path).is_ok();
 
             ContextEntry {
                 role: role.to_string(),
@@ -57,33 +59,16 @@ pub fn context_report(config: &LoadedConfig) -> ContextReport {
     ContextReport { entries }
 }
 
-pub fn load_context_blobs(config: &LoadedConfig) -> KaiResult<Vec<ContextBlob>> {
-    let entries = [
-        ("SOUL", config.values.context_files.soul.as_str()),
-        ("MEMORY", config.values.context_files.memory.as_str()),
-        ("TODO", config.values.context_files.todo.as_str()),
-    ];
-    let mut blobs = Vec::new();
-
-    for (role, path) in entries {
-        let file_path = Path::new(path);
-        if !file_path.is_file() {
-            continue;
-        }
-
-        let content = fs::read_to_string(file_path).map_err(|error| {
-            KaiError::new(
-                ErrorCode::IoError,
-                format!("failed to read context file `{role}`: {error}"),
-            )
-        })?;
-
-        blobs.push(ContextBlob {
-            role: role.to_string(),
-            path: path.to_string(),
-            content,
-        });
-    }
-
-    Ok(blobs)
+pub fn context_snapshots(config: &LoadedConfig) -> Vec<ContextSnapshot> {
+    context_report(config)
+        .entries
+        .into_iter()
+        .map(|entry| ContextSnapshot {
+            role: entry.role.to_uppercase(),
+            path: entry.path,
+            exists: entry.exists,
+            readable: entry.readable,
+            bytes: entry.bytes,
+        })
+        .collect()
 }

@@ -1,14 +1,17 @@
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::LoadedConfig;
+use crate::context::ContextSnapshot;
+use crate::contract::PendingPairingView;
 use crate::error::{ErrorCode, KaiError, KaiResult};
+use crate::runtime_fs::{ensure_private_dir, ensure_private_file};
 
 #[derive(Debug, Clone)]
 pub struct StatePaths {
@@ -60,6 +63,42 @@ pub struct NewTurn<'a> {
     pub attachments: &'a [AttachmentInfo],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayTurn {
+    pub id: i64,
+    pub created_at: String,
+    pub role: String,
+    pub text_excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayPackage {
+    pub updated_at: String,
+    pub summary: String,
+    pub context: Vec<ContextSnapshot>,
+    pub recent_turns: Vec<ReplayTurn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessedUpdate {
+    pub update_id: i64,
+    pub created_at: String,
+    pub response_text: String,
+    pub codex_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPairing {
+    pub code_hash_blake3: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub remaining_attempts: u8,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuditRecord<'a> {
@@ -76,12 +115,15 @@ struct AuditRecord<'a> {
 impl StateStore {
     pub fn open(config: &LoadedConfig) -> KaiResult<Self> {
         let paths = state_paths(config);
-        fs::create_dir_all(&paths.attachments_dir).map_err(io_state_error("attachments"))?;
-        fs::create_dir_all(&paths.logs_dir).map_err(io_state_error("logs"))?;
-        fs::create_dir_all(&paths.state_dir).map_err(io_state_error("state"))?;
+        ensure_private_dir(Path::new(&config.values.paths.root_app))?;
+        ensure_private_dir(&paths.attachments_dir)?;
+        ensure_private_dir(&paths.logs_dir)?;
+        ensure_private_dir(&paths.state_dir)?;
 
         let connection =
             Connection::open(&paths.db_path).map_err(sql_state_error("open database"))?;
+        ensure_private_file(&paths.db_path)?;
+        ensure_private_file(&paths.audit_path)?;
         initialize_schema(&connection)?;
 
         Ok(Self { connection, paths })
@@ -94,8 +136,9 @@ impl StateStore {
     pub fn session_view(&self) -> KaiResult<crate::contract::SessionView> {
         Ok(crate::contract::SessionView {
             owner_user_id: self.get_owner_user_id()?,
+            owner_chat_id: self.get_owner_chat_id()?,
             active_session_id: self.get_active_session_id()?,
-            pending_pair_code: self.get_pending_pair_code()?,
+            pending_pairing: self.pending_pairing_view()?,
             update_offset: self.get_update_offset()?,
         })
     }
@@ -108,16 +151,36 @@ impl StateStore {
         self.set_json_value("telegram.owner_user_id", &user_id)
     }
 
-    pub fn get_pending_pair_code(&self) -> KaiResult<Option<String>> {
-        self.get_json_value("telegram.pending_pair_code")
+    pub fn get_owner_chat_id(&self) -> KaiResult<Option<i64>> {
+        self.get_json_value("telegram.owner_chat_id")
     }
 
-    pub fn set_pending_pair_code(&self, code: &str) -> KaiResult<()> {
-        self.set_json_value("telegram.pending_pair_code", &code)
+    pub fn set_owner_chat_id(&self, chat_id: i64) -> KaiResult<()> {
+        self.set_json_value("telegram.owner_chat_id", &chat_id)
     }
 
-    pub fn clear_pending_pair_code(&self) -> KaiResult<()> {
+    pub fn get_pending_pairing(&self) -> KaiResult<Option<PendingPairing>> {
+        self.get_json_value("telegram.pending_pairing")
+    }
+
+    pub fn set_pending_pairing(&self, pairing: &PendingPairing) -> KaiResult<()> {
+        self.set_json_value("telegram.pending_pairing", pairing)?;
+        self.delete_value("telegram.pending_pair_code")?;
+        Ok(())
+    }
+
+    pub fn clear_pending_pairing(&self) -> KaiResult<()> {
+        self.delete_value("telegram.pending_pairing")?;
         self.delete_value("telegram.pending_pair_code")
+    }
+
+    pub fn pending_pairing_view(&self) -> KaiResult<Option<PendingPairingView>> {
+        Ok(self
+            .get_pending_pairing()?
+            .map(|pairing| PendingPairingView {
+                expires_at: pairing.expires_at,
+                remaining_attempts: pairing.remaining_attempts,
+            }))
     }
 
     pub fn get_active_session_id(&self) -> KaiResult<Option<String>> {
@@ -140,6 +203,60 @@ impl StateStore {
 
     pub fn set_update_offset(&self, offset: i64) -> KaiResult<()> {
         self.set_json_value("telegram.update_offset", &offset)
+    }
+
+    pub fn get_replay_package(&self) -> KaiResult<Option<ReplayPackage>> {
+        self.get_json_value("codex.replay_package")
+    }
+
+    pub fn set_replay_package(&self, replay_package: &ReplayPackage) -> KaiResult<()> {
+        self.set_json_value("codex.replay_package", replay_package)
+    }
+
+    pub fn clear_replay_package(&self) -> KaiResult<()> {
+        self.delete_value("codex.replay_package")
+    }
+
+    pub fn get_processed_update(&self, update_id: i64) -> KaiResult<Option<ProcessedUpdate>> {
+        self.connection
+            .query_row(
+                "SELECT update_id, created_at, response_text, codex_session_id
+                 FROM processed_updates
+                 WHERE update_id = ?1",
+                [update_id],
+                |row| {
+                    Ok(ProcessedUpdate {
+                        update_id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        response_text: row.get(2)?,
+                        codex_session_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_state_error("load processed update"))
+    }
+
+    pub fn set_processed_update(
+        &self,
+        update_id: i64,
+        response_text: &str,
+        codex_session_id: Option<&str>,
+    ) -> KaiResult<()> {
+        let created_at = Utc::now().to_rfc3339();
+        self.connection
+            .execute(
+                "INSERT INTO processed_updates (update_id, created_at, response_text, codex_session_id)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(update_id) DO UPDATE
+                 SET created_at = excluded.created_at,
+                     response_text = excluded.response_text,
+                     codex_session_id = excluded.codex_session_id",
+                params![update_id, created_at, response_text, codex_session_id],
+            )
+            .map_err(sql_state_error("write processed update"))?;
+
+        Ok(())
     }
 
     pub fn record_turn(&self, turn: NewTurn<'_>) -> KaiResult<TurnRecord> {
@@ -316,11 +433,40 @@ impl StateStore {
             .append(true)
             .open(&self.paths.audit_path)
             .map_err(io_state_error("audit log"))?;
+        ensure_private_file(&self.paths.audit_path)?;
 
         file.write_all(line.as_bytes())
             .map_err(io_state_error("audit log"))?;
         file.write_all(b"\n").map_err(io_state_error("audit log"))?;
         Ok(())
+    }
+}
+
+impl PendingPairing {
+    pub fn issue(code: &str, ttl_minutes: i64, max_attempts: u8) -> Self {
+        let created_at = Utc::now();
+        let expires_at = created_at + ChronoDuration::minutes(ttl_minutes);
+
+        Self {
+            code_hash_blake3: blake3::hash(code.as_bytes()).to_hex().to_string(),
+            created_at: created_at.to_rfc3339(),
+            expires_at: expires_at.to_rfc3339(),
+            remaining_attempts: max_attempts,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        chrono::DateTime::parse_from_rfc3339(&self.expires_at)
+            .map(|value| value.with_timezone(&Utc) <= Utc::now())
+            .unwrap_or(true)
+    }
+
+    pub fn verify(&self, code: &str) -> bool {
+        self.code_hash_blake3 == blake3::hash(code.as_bytes()).to_hex().to_string()
+    }
+
+    pub fn consume_failed_attempt(&mut self) {
+        self.remaining_attempts = self.remaining_attempts.saturating_sub(1);
     }
 }
 
@@ -347,18 +493,24 @@ fn initialize_schema(connection: &Connection) -> KaiResult<()> {
 				key TEXT PRIMARY KEY,
 				value TEXT NOT NULL
 			);
-			CREATE TABLE IF NOT EXISTS turns (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				created_at TEXT NOT NULL,
+				CREATE TABLE IF NOT EXISTS turns (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					created_at TEXT NOT NULL,
 				role TEXT NOT NULL,
 				channel TEXT NOT NULL,
 				sender_id INTEGER,
 				text TEXT NOT NULL,
 				codex_session_id TEXT,
-				outcome_status TEXT,
-				attachments_json TEXT NOT NULL DEFAULT '[]'
-			);
-			",
+					outcome_status TEXT,
+					attachments_json TEXT NOT NULL DEFAULT '[]'
+				);
+				CREATE TABLE IF NOT EXISTS processed_updates (
+					update_id INTEGER PRIMARY KEY,
+					created_at TEXT NOT NULL,
+					response_text TEXT NOT NULL,
+					codex_session_id TEXT
+				);
+				",
         )
         .map_err(sql_state_error("initialize schema"))?;
 
@@ -394,7 +546,7 @@ mod tests {
     };
 
     #[test]
-    fn state_round_trips_pair_code() {
+    fn state_round_trips_pending_pairing() {
         let tempdir = tempdir().expect("tempdir");
         let root_app = tempdir.path().join("kai-home");
         let root_work = tempdir.path().join("work");
@@ -433,12 +585,66 @@ mod tests {
 
         let store = StateStore::open(&config).expect("state store");
         store
-            .set_pending_pair_code("ABC12345")
-            .expect("set pair code");
+            .set_pending_pairing(&PendingPairing::issue("ABC12345", 10, 5))
+            .expect("set pending pairing");
 
-        assert_eq!(
-            store.get_pending_pair_code().expect("load pair code"),
-            Some("ABC12345".to_string())
-        );
+        let pairing = store
+            .get_pending_pairing()
+            .expect("load pending pairing")
+            .expect("pairing exists");
+        assert_eq!(pairing.remaining_attempts, 5);
+        assert!(pairing.verify("ABC12345"));
+    }
+
+    #[test]
+    fn processed_update_round_trips() {
+        let tempdir = tempdir().expect("tempdir");
+        let root_app = tempdir.path().join("kai-home");
+        let root_work = tempdir.path().join("work");
+
+        let config = LoadedConfig {
+            config_path: root_app.join("config.toml"),
+            config_exists: false,
+            values: Config {
+                agent: AgentConfig {
+                    timezone: "Europe/London".to_string(),
+                },
+                channel: ChannelConfig {
+                    telegram: TelegramConfig {
+                        enabled: true,
+                        bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
+                        owner_user_id: None,
+                    },
+                },
+                paths: PathsConfig {
+                    root_app: root_app.display().to_string(),
+                    root_work: root_work.display().to_string(),
+                },
+                runner: RunnerConfig {
+                    codex: CodexConfig {
+                        binary: "codex".to_string(),
+                        override_config: None,
+                    },
+                },
+                context_files: ContextFilesConfig {
+                    soul: root_app.join("SOUL.md").display().to_string(),
+                    memory: root_app.join("MEMORY.md").display().to_string(),
+                    todo: root_app.join("TODO.md").display().to_string(),
+                },
+            },
+        };
+
+        let store = StateStore::open(&config).expect("state store");
+        store
+            .set_processed_update(42, "cached reply", Some("session-1"))
+            .expect("set processed update");
+
+        let processed = store
+            .get_processed_update(42)
+            .expect("load processed update")
+            .expect("processed update must exist");
+        assert_eq!(processed.update_id, 42);
+        assert_eq!(processed.response_text, "cached reply");
+        assert_eq!(processed.codex_session_id.as_deref(), Some("session-1"));
     }
 }

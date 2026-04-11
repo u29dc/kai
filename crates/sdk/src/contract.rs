@@ -201,11 +201,23 @@ pub fn tool_catalog() -> ToolCatalog {
                     "setup.telegram",
                     "kai setup telegram",
                     "setup",
-                    "Generate a one-time Telegram pairing code.",
+                    "Open a short-lived Telegram recovery pairing window.",
                     "setupTelegramOutput",
                     "kai setup telegram",
                 )
-                .with_output_fields(["pairCode", "botTokenEnv"])
+                .with_parameters(vec![parameter(
+                    "recovery",
+                    "bool",
+                    false,
+                    "Explicitly allow owner recovery pairing even when owner_user_id is pinned.",
+                )])
+                .with_output_fields([
+                    "pairCode",
+                    "botTokenEnv",
+                    "expiresInMinutes",
+                    "remainingAttempts",
+                    "recovery",
+                ])
                 .with_idempotent(false),
             ),
             tool(
@@ -252,6 +264,7 @@ pub fn tool_catalog() -> ToolCatalog {
                 )
                 .with_output_fields([
                     "ownerUserId",
+                    "ownerChatId",
                     "activeSessionId",
                     "pendingPairCode",
                     "updateOffset",
@@ -271,6 +284,25 @@ pub fn tool_catalog() -> ToolCatalog {
             ),
             tool(
                 ToolSeed::new(
+                    "session.set",
+                    "kai session set <session-id>",
+                    "session",
+                    "Override the active Codex session id.",
+                    "sessionView",
+                    "kai session set 019d7c6a-2460-7e91-b6eb-8643f9f9930f",
+                )
+                .with_parameters(vec![parameter(
+                    "sessionId",
+                    "string",
+                    true,
+                    "Existing Codex session id to resume on the next turn.",
+                )])
+                .with_output_fields(["ownerUserId", "ownerChatId", "activeSessionId"])
+                .with_input_schema("sessionId")
+                .with_idempotent(false),
+            ),
+            tool(
+                ToolSeed::new(
                     "session.reset",
                     "kai session reset",
                     "session",
@@ -283,10 +315,100 @@ pub fn tool_catalog() -> ToolCatalog {
             ),
             tool(
                 ToolSeed::new(
+                    "service.status",
+                    "kai service status",
+                    "service",
+                    "Show background service and single-instance status.",
+                    "serviceStatus",
+                    "kai service status",
+                )
+                .with_output_fields([
+                    "platform",
+                    "installed",
+                    "loaded",
+                    "running",
+                    "pid",
+                    "activeMode",
+                    "lock",
+                ]),
+            ),
+            tool(
+                ToolSeed::new(
+                    "service.logs",
+                    "kai service logs [--tail <n>]",
+                    "service",
+                    "Show recent background service stdout and stderr lines.",
+                    "serviceLogsOutput",
+                    "kai service logs --tail 100",
+                )
+                .with_parameters(vec![parameter(
+                    "tail",
+                    "integer",
+                    false,
+                    "Maximum number of recent lines to include from each log file.",
+                )])
+                .with_output_fields([
+                    "status",
+                    "stdoutPath",
+                    "stderrPath",
+                    "stdoutTail",
+                    "stderrTail",
+                ]),
+            ),
+            tool(
+                ToolSeed::new(
+                    "service.start",
+                    "kai service start",
+                    "service",
+                    "Start the macOS background LaunchAgent.",
+                    "serviceActionOutput",
+                    "kai service start",
+                )
+                .with_output_fields(["action", "status"])
+                .with_idempotent(false),
+            ),
+            tool(
+                ToolSeed::new(
+                    "service.stop",
+                    "kai service stop",
+                    "service",
+                    "Stop the macOS background LaunchAgent.",
+                    "serviceActionOutput",
+                    "kai service stop",
+                )
+                .with_output_fields(["action", "status"])
+                .with_idempotent(false),
+            ),
+            tool(
+                ToolSeed::new(
+                    "service.restart",
+                    "kai service restart",
+                    "service",
+                    "Restart the macOS background LaunchAgent.",
+                    "serviceActionOutput",
+                    "kai service restart",
+                )
+                .with_output_fields(["action", "status"])
+                .with_idempotent(false),
+            ),
+            tool(
+                ToolSeed::new(
+                    "service.uninstall",
+                    "kai service uninstall",
+                    "service",
+                    "Remove the macOS background LaunchAgent.",
+                    "serviceActionOutput",
+                    "kai service uninstall",
+                )
+                .with_output_fields(["action", "status"])
+                .with_idempotent(false),
+            ),
+            tool(
+                ToolSeed::new(
                     "run",
                     "kai run",
                     "runtime",
-                    "Start the Telegram long-polling loop.",
+                    "Start the foreground Telegram long-polling loop.",
                     "runOutput",
                     "kai run",
                 )
@@ -356,11 +478,35 @@ pub struct SetupCodexOutput {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingPairingView {
+    pub expires_at: String,
+    pub remaining_attempts: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionView {
     pub owner_user_id: Option<i64>,
+    pub owner_chat_id: Option<i64>,
     pub active_session_id: Option<String>,
-    pub pending_pair_code: Option<String>,
+    pub pending_pairing: Option<PendingPairingView>,
     pub update_offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatusOutput {
+    pub platform: String,
+    pub label: String,
+    pub installed: bool,
+    pub loaded: bool,
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub active_mode: String,
+    pub plist_path: Option<String>,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub lock: serde_json::Value,
 }
 
 struct ToolSeed<'a> {

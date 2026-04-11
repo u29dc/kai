@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::config::LoadedConfig;
 use crate::context::context_report;
 use crate::error::KaiResult;
-use crate::runtime::codex::run_codex_turn;
+use crate::runtime::codex::{create_replay_package, run_codex_turn};
 use crate::state::{AttachmentInfo, NewTurn, StateStore};
 
 pub fn handle_owner_prompt(
@@ -38,6 +38,9 @@ pub fn handle_owner_prompt(
         attachments: &[],
     })?;
 
+    let replay_package = create_replay_package(&result.context_snapshots, &state.recent_turns(24)?);
+    state.set_replay_package(&replay_package)?;
+
     state.append_audit_json(&json!({
         "timestamp": Utc::now().to_rfc3339(),
         "event": "turn.completed",
@@ -59,13 +62,16 @@ pub fn mobile_help_text() -> String {
         "/status - show current pairing and session status",
         "/new - clear the current Codex session so the next message starts fresh",
         "/reset - same as /new",
-        "/pair <code> - claim owner access after local setup",
+        "/pair <code> - recovery-only owner pairing when locally enabled",
     ]
     .join("\n")
 }
 
 pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResult<String> {
-    let session = state.session_view()?;
+    let mut session = state.session_view()?;
+    if session.owner_user_id.is_none() {
+        session.owner_user_id = config.values.channel.telegram.owner_user_id;
+    }
     let context = context_report(config);
 
     let mut lines = vec![
@@ -82,8 +88,24 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
                 .active_session_id
                 .unwrap_or_else(|| "none".to_string())
         ),
+        format!(
+            "owner_chat: {}",
+            session
+                .owner_chat_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unpaired".to_string())
+        ),
         format!("update_offset: {}", session.update_offset),
     ];
+
+    if let Some(pairing) = session.pending_pairing {
+        lines.push(format!(
+            "recovery_pairing: open until {} ({} attempt(s) left)",
+            pairing.expires_at, pairing.remaining_attempts
+        ));
+    } else {
+        lines.push("recovery_pairing: closed".to_string());
+    }
 
     for entry in context.entries {
         let status = if entry.exists { "ok" } else { "missing" };
