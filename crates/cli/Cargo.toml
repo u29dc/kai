@@ -18,3 +18,5 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 kai-sdk = { path = "../sdk" }
+tokio.workspace = true
+uuid.workspace = true
