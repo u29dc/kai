@@ -1,6 +1,7 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -74,11 +75,21 @@ pub struct ReplayTurn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReplayAttachmentRef {
+    pub kind: String,
+    pub path: String,
+    pub original_name: Option<String>,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReplayPackage {
     pub updated_at: String,
     pub summary: String,
     pub context: Vec<ContextSnapshot>,
     pub recent_turns: Vec<ReplayTurn>,
+    pub attachment_refs: Vec<ReplayAttachmentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +108,25 @@ pub struct PendingPairing {
     pub created_at: String,
     pub expires_at: String,
     pub remaining_attempts: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateFailureState {
+    pub update_id: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub attempt_count: u32,
+    pub last_error_code: String,
+    pub last_message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentCleanupResult {
+    pub scanned_files: usize,
+    pub removed_partial_files: usize,
+    pub removed_stale_files: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +287,146 @@ impl StateStore {
             .map_err(sql_state_error("write processed update"))?;
 
         Ok(())
+    }
+
+    pub fn get_update_failure(&self, update_id: i64) -> KaiResult<Option<UpdateFailureState>> {
+        self.connection
+            .query_row(
+                "SELECT update_id, created_at, updated_at, attempt_count, last_error_code, last_message
+                 FROM update_failures
+                 WHERE update_id = ?1",
+                [update_id],
+                |row| {
+                    Ok(UpdateFailureState {
+                        update_id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        updated_at: row.get(2)?,
+                        attempt_count: row.get(3)?,
+                        last_error_code: row.get(4)?,
+                        last_message: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_state_error("load update failure"))
+    }
+
+    pub fn record_update_failure(
+        &self,
+        update_id: i64,
+        error: &KaiError,
+    ) -> KaiResult<UpdateFailureState> {
+        let now = Utc::now().to_rfc3339();
+        let prior = self.get_update_failure(update_id)?;
+        let attempt_count = prior
+            .as_ref()
+            .map(|failure| failure.attempt_count.saturating_add(1))
+            .unwrap_or(1);
+        let created_at = prior
+            .as_ref()
+            .map(|failure| failure.created_at.clone())
+            .unwrap_or_else(|| now.clone());
+        let last_error_code = serde_json::to_string(&error.code)
+            .unwrap_or_else(|_| "\"runtime_error\"".to_string())
+            .trim_matches('"')
+            .to_string();
+
+        self.connection
+            .execute(
+                "INSERT INTO update_failures (
+                    update_id, created_at, updated_at, attempt_count, last_error_code, last_message
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(update_id) DO UPDATE
+                 SET updated_at = excluded.updated_at,
+                     attempt_count = excluded.attempt_count,
+                     last_error_code = excluded.last_error_code,
+                     last_message = excluded.last_message",
+                params![
+                    update_id,
+                    created_at,
+                    now,
+                    attempt_count,
+                    last_error_code,
+                    error.message
+                ],
+            )
+            .map_err(sql_state_error("write update failure"))?;
+
+        self.get_update_failure(update_id)?.ok_or_else(|| {
+            KaiError::new(
+                ErrorCode::StateError,
+                format!("missing persisted update failure for update {update_id}"),
+            )
+        })
+    }
+
+    pub fn clear_update_failure(&self, update_id: i64) -> KaiResult<()> {
+        self.connection
+            .execute(
+                "DELETE FROM update_failures WHERE update_id = ?1",
+                [update_id],
+            )
+            .map_err(sql_state_error("delete update failure"))?;
+        Ok(())
+    }
+
+    pub fn cleanup_staged_attachments(
+        &self,
+        retention: Duration,
+    ) -> KaiResult<AttachmentCleanupResult> {
+        let mut scanned_files = 0_usize;
+        let mut removed_partial_files = 0_usize;
+        let mut removed_stale_files = 0_usize;
+
+        let entries = match fs::read_dir(&self.paths.attachments_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AttachmentCleanupResult {
+                    scanned_files,
+                    removed_partial_files,
+                    removed_stale_files,
+                });
+            }
+            Err(error) => {
+                return Err(KaiError::new(
+                    ErrorCode::IoError,
+                    format!("failed to read attachments directory: {error}"),
+                ));
+            }
+        };
+
+        let now = SystemTime::now();
+        for entry in entries {
+            let entry = entry.map_err(io_state_error("scan attachments directory"))?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            scanned_files += 1;
+
+            if path.extension().and_then(|value| value.to_str()) == Some("part") {
+                fs::remove_file(&path).map_err(io_state_error("remove partial attachment"))?;
+                removed_partial_files += 1;
+                continue;
+            }
+
+            let metadata = fs::metadata(&path).map_err(io_state_error("inspect attachment"))?;
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let age = now
+                .duration_since(modified)
+                .unwrap_or_else(|_| Duration::from_secs(0));
+
+            if age >= retention {
+                fs::remove_file(&path).map_err(io_state_error("remove stale attachment"))?;
+                removed_stale_files += 1;
+            }
+        }
+
+        Ok(AttachmentCleanupResult {
+            scanned_files,
+            removed_partial_files,
+            removed_stale_files,
+        })
     }
 
     pub fn record_turn(&self, turn: NewTurn<'_>) -> KaiResult<TurnRecord> {
@@ -510,6 +680,14 @@ fn initialize_schema(connection: &Connection) -> KaiResult<()> {
 					response_text TEXT NOT NULL,
 					codex_session_id TEXT
 				);
+                CREATE TABLE IF NOT EXISTS update_failures (
+                    update_id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    last_error_code TEXT NOT NULL,
+                    last_message TEXT NOT NULL
+                );
 				",
         )
         .map_err(sql_state_error("initialize schema"))?;
@@ -537,6 +715,8 @@ fn sql_state_error(action: &'static str) -> impl Fn(rusqlite::Error) -> KaiError
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -545,13 +725,8 @@ mod tests {
         PathsConfig, RunnerConfig, TelegramConfig,
     };
 
-    #[test]
-    fn state_round_trips_pending_pairing() {
-        let tempdir = tempdir().expect("tempdir");
-        let root_app = tempdir.path().join("kai-home");
-        let root_work = tempdir.path().join("work");
-
-        let config = LoadedConfig {
+    fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
+        LoadedConfig {
             config_path: root_app.join("config.toml"),
             config_exists: false,
             values: Config {
@@ -581,7 +756,15 @@ mod tests {
                     todo: root_app.join("TODO.md").display().to_string(),
                 },
             },
-        };
+        }
+    }
+
+    #[test]
+    fn state_round_trips_pending_pairing() {
+        let tempdir = tempdir().expect("tempdir");
+        let root_app = tempdir.path().join("kai-home");
+        let root_work = tempdir.path().join("work");
+        let config = test_config(&root_app, &root_work);
 
         let store = StateStore::open(&config).expect("state store");
         store
@@ -601,38 +784,7 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let root_app = tempdir.path().join("kai-home");
         let root_work = tempdir.path().join("work");
-
-        let config = LoadedConfig {
-            config_path: root_app.join("config.toml"),
-            config_exists: false,
-            values: Config {
-                agent: AgentConfig {
-                    timezone: "Europe/London".to_string(),
-                },
-                channel: ChannelConfig {
-                    telegram: TelegramConfig {
-                        enabled: true,
-                        bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
-                        owner_user_id: None,
-                    },
-                },
-                paths: PathsConfig {
-                    root_app: root_app.display().to_string(),
-                    root_work: root_work.display().to_string(),
-                },
-                runner: RunnerConfig {
-                    codex: CodexConfig {
-                        binary: "codex".to_string(),
-                        override_config: None,
-                    },
-                },
-                context_files: ContextFilesConfig {
-                    soul: root_app.join("SOUL.md").display().to_string(),
-                    memory: root_app.join("MEMORY.md").display().to_string(),
-                    todo: root_app.join("TODO.md").display().to_string(),
-                },
-            },
-        };
+        let config = test_config(&root_app, &root_work);
 
         let store = StateStore::open(&config).expect("state store");
         store
@@ -646,5 +798,66 @@ mod tests {
         assert_eq!(processed.update_id, 42);
         assert_eq!(processed.response_text, "cached reply");
         assert_eq!(processed.codex_session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn update_failure_round_trips_and_clears() {
+        let tempdir = tempdir().expect("tempdir");
+        let root_app = tempdir.path().join("kai-home");
+        let root_work = tempdir.path().join("work");
+        let config = test_config(&root_app, &root_work);
+
+        let store = StateStore::open(&config).expect("state store");
+        let first = store
+            .record_update_failure(77, &KaiError::invalid_argument("bad attachment"))
+            .expect("record first failure");
+        assert_eq!(first.attempt_count, 1);
+        assert_eq!(first.last_error_code, "invalid_argument");
+
+        let second = store
+            .record_update_failure(
+                77,
+                &KaiError::new(ErrorCode::RuntimeError, "temporary backend issue"),
+            )
+            .expect("record second failure");
+        assert_eq!(second.attempt_count, 2);
+        assert_eq!(second.last_error_code, "runtime_error");
+
+        store.clear_update_failure(77).expect("clear failure");
+        assert!(
+            store
+                .get_update_failure(77)
+                .expect("load failure")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cleanup_staged_attachments_removes_partial_and_stale_files() {
+        let tempdir = tempdir().expect("tempdir");
+        let root_app = tempdir.path().join("kai-home");
+        let root_work = tempdir.path().join("work");
+        let config = test_config(&root_app, &root_work);
+
+        let store = StateStore::open(&config).expect("state store");
+        let partial = store.paths().attachments_dir.join("dangling.bin.part");
+        let stale = store.paths().attachments_dir.join("stale.txt");
+        let fresh = store.paths().attachments_dir.join("fresh.txt");
+
+        fs::write(&partial, b"partial").expect("write partial");
+        fs::write(&stale, b"old").expect("write stale");
+        fs::write(&fresh, b"new").expect("write fresh");
+
+        let old_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&stale, old_time).expect("age stale file");
+
+        let result = store
+            .cleanup_staged_attachments(Duration::from_secs(60))
+            .expect("cleanup attachments");
+        assert_eq!(result.removed_partial_files, 1);
+        assert_eq!(result.removed_stale_files, 1);
+        assert!(!partial.exists());
+        assert!(!stale.exists());
+        assert!(fresh.exists());
     }
 }

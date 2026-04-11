@@ -7,7 +7,12 @@ use serde_json::Value as JsonValue;
 use crate::config::LoadedConfig;
 use crate::context::{ContextSnapshot, context_snapshots};
 use crate::error::{ErrorCode, KaiError, KaiResult};
-use crate::state::{AttachmentInfo, ReplayPackage, ReplayTurn, StateStore, TurnRecord};
+use crate::state::{
+    AttachmentInfo, ReplayAttachmentRef, ReplayPackage, ReplayTurn, StateStore, TurnRecord,
+};
+
+const REPLAY_TURN_LIMIT: usize = 12;
+const REPLAY_ATTACHMENT_REF_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct CodexTurnResult {
@@ -51,10 +56,15 @@ pub fn run_codex_turn(
                     "timestamp": Utc::now().to_rfc3339(),
                     "event": "codex.resume_failed",
                     "requestedSessionId": session_id,
+                    "staleSession": is_stale_resume_error(&error),
                     "message": error.message,
                     "hint": error.hint,
                 }))?;
-                state.clear_active_session_id()?;
+                if is_stale_resume_error(&error) {
+                    state.clear_active_session_id()?;
+                } else {
+                    return Err(error);
+                }
             }
         }
     }
@@ -343,6 +353,22 @@ fn build_replay_prompt(
             }
         }
 
+        if !replay_package.attachment_refs.is_empty() {
+            replay.push(String::new());
+            replay.push("Recent attachment references:".to_string());
+            for attachment in replay_package.attachment_refs {
+                replay.push(format!(
+                    "- {} at {} (originalName={}, bytes={})",
+                    attachment.kind,
+                    attachment.path,
+                    attachment
+                        .original_name
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    attachment.bytes
+                ));
+            }
+        }
+
         replay.push(String::new());
         replay.push("Current inbound turn:".to_string());
         replay.push(prompt.to_string());
@@ -377,13 +403,17 @@ pub fn create_replay_package(
     context: &[ContextSnapshot],
     recent_turns: &[TurnRecord],
 ) -> ReplayPackage {
-    let recent_turns = recent_turns
+    let selected_turns = recent_turns
         .iter()
         .rev()
-        .take(12)
+        .take(REPLAY_TURN_LIMIT)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
+        .collect::<Vec<_>>();
+
+    let replay_turns = selected_turns
+        .iter()
         .map(|turn| ReplayTurn {
             id: turn.id,
             created_at: turn.created_at.clone(),
@@ -392,26 +422,16 @@ pub fn create_replay_package(
         })
         .collect::<Vec<_>>();
 
-    let summary = if recent_turns.is_empty() {
-        "No prior turns recorded.".to_string()
-    } else {
-        recent_turns
-            .iter()
-            .map(|turn| {
-                format!(
-                    "- [{}] {}: {}",
-                    turn.created_at, turn.role, turn.text_excerpt
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let attachment_refs = collect_replay_attachment_refs(&selected_turns);
+
+    let summary = build_replay_summary(&replay_turns, &attachment_refs);
 
     ReplayPackage {
         updated_at: Utc::now().to_rfc3339(),
         summary,
         context: context.to_vec(),
-        recent_turns,
+        recent_turns: replay_turns,
+        attachment_refs,
     }
 }
 
@@ -474,4 +494,134 @@ fn extra_access_paths(config: &LoadedConfig, attachments: &[AttachmentInfo]) -> 
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn is_stale_resume_error(error: &KaiError) -> bool {
+    let mut text = error.message.to_ascii_lowercase();
+    if let Some(hint) = &error.hint {
+        text.push('\n');
+        text.push_str(&hint.to_ascii_lowercase());
+    }
+
+    text.contains("no rollout found for thread id")
+        || text.contains("thread not found")
+        || text.contains("unknown thread")
+        || text.contains("session not found")
+        || (text.contains("thread/resume failed") && text.contains("not found"))
+}
+
+fn collect_replay_attachment_refs(source_turns: &[&TurnRecord]) -> Vec<ReplayAttachmentRef> {
+    let mut refs = Vec::new();
+
+    for source_turn in source_turns {
+        for attachment in &source_turn.attachments {
+            if refs
+                .iter()
+                .any(|existing: &ReplayAttachmentRef| existing.path == attachment.path)
+            {
+                continue;
+            }
+
+            refs.push(ReplayAttachmentRef {
+                kind: attachment.kind.clone(),
+                path: attachment.path.clone(),
+                original_name: attachment.original_name.clone(),
+                bytes: attachment.bytes,
+            });
+
+            if refs.len() >= REPLAY_ATTACHMENT_REF_LIMIT {
+                return refs;
+            }
+        }
+    }
+
+    refs
+}
+
+fn build_replay_summary(
+    replay_turns: &[ReplayTurn],
+    attachment_refs: &[ReplayAttachmentRef],
+) -> String {
+    if replay_turns.is_empty() {
+        return "No prior turns recorded.".to_string();
+    }
+
+    let mut lines = vec![
+        format!("Turns captured: {}", replay_turns.len()),
+        "Latest conversation state:".to_string(),
+    ];
+
+    for turn in replay_turns.iter().rev().take(6).rev() {
+        lines.push(format!(
+            "- [{}] {}: {}",
+            turn.created_at, turn.role, turn.text_excerpt
+        ));
+    }
+
+    if !attachment_refs.is_empty() {
+        lines.push(format!("Recent attachment refs: {}", attachment_refs.len()));
+    }
+
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_resume_detection_matches_missing_rollout_errors() {
+        let error = KaiError::new(ErrorCode::RuntimeError, "Codex CLI exited with status 1")
+            .with_hint(
+                "Error: thread/resume: thread/resume failed: no rollout found for thread id 123",
+            );
+        assert!(is_stale_resume_error(&error));
+    }
+
+    #[test]
+    fn stale_resume_detection_does_not_match_generic_backend_errors() {
+        let error = KaiError::new(ErrorCode::RuntimeError, "Codex CLI exited with status 1")
+            .with_hint("temporary auth failure");
+        assert!(!is_stale_resume_error(&error));
+    }
+
+    #[test]
+    fn replay_package_includes_attachment_refs() {
+        let turns = vec![
+            TurnRecord {
+                id: 1,
+                created_at: "2026-04-11T20:00:00Z".to_string(),
+                role: "user".to_string(),
+                channel: "telegram".to_string(),
+                sender_id: Some(1),
+                text: "inspect this".to_string(),
+                codex_session_id: Some("session-1".to_string()),
+                outcome_status: Some("received".to_string()),
+                attachments: vec![AttachmentInfo {
+                    kind: "pdf".to_string(),
+                    path: "/tmp/report.pdf".to_string(),
+                    original_name: Some("report.pdf".to_string()),
+                    mime_type: Some("application/pdf".to_string()),
+                    bytes: 42,
+                    checksum_blake3: "abc".to_string(),
+                }],
+            },
+            TurnRecord {
+                id: 2,
+                created_at: "2026-04-11T20:01:00Z".to_string(),
+                role: "assistant".to_string(),
+                channel: "telegram".to_string(),
+                sender_id: None,
+                text: "done".to_string(),
+                codex_session_id: Some("session-1".to_string()),
+                outcome_status: Some("fresh".to_string()),
+                attachments: vec![],
+            },
+        ];
+
+        let replay = create_replay_package(&[], &turns);
+        assert_eq!(replay.attachment_refs.len(), 1);
+        assert_eq!(replay.attachment_refs[0].path, "/tmp/report.pdf");
+        assert!(replay.summary.contains("Recent attachment refs: 1"));
+    }
 }

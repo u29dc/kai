@@ -5,7 +5,7 @@ use std::fs;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::app::{handle_owner_prompt, mobile_help_text, mobile_status_text};
@@ -16,6 +16,9 @@ use crate::state::{AttachmentInfo, StateStore};
 
 const TELEGRAM_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 const TELEGRAM_TYPING_REFRESH: Duration = Duration::from_secs(4);
+const ATTACHMENT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 30);
+const ATTACHMENT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60 * 6);
+const MAX_UPDATE_FAILURE_ATTEMPTS: u32 = 3;
 const MAX_ATTACHMENT_COUNT: usize = 3;
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
@@ -37,8 +40,23 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
     })?;
 
     let mut offset = state.get_update_offset()?;
+    let mut next_cleanup_at = Instant::now();
 
     loop {
+        if next_cleanup_at <= Instant::now() {
+            if let Err(error) = run_attachment_cleanup(state) {
+                record_runtime_error(
+                    state,
+                    "telegram.attachment_cleanup_failed",
+                    None,
+                    None,
+                    &error,
+                )?;
+                eprintln!("kai attachment cleanup failed: {}", error.message);
+            }
+            next_cleanup_at = Instant::now() + ATTACHMENT_CLEANUP_INTERVAL;
+        }
+
         let updates = match get_updates(&client, &token, offset).await {
             Ok(updates) => updates,
             Err(error) => {
@@ -51,6 +69,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
 
         for update in updates {
             let next_offset = update.update_id + 1;
+            let chat_id = update.message.as_ref().map(|message| message.chat.id);
 
             let outcome = if let Some(message) = update.message {
                 handle_message(&client, &token, config, state, update.update_id, message).await
@@ -60,23 +79,34 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
 
             match outcome {
                 Ok(()) => {
+                    state.clear_update_failure(update.update_id)?;
                     offset = next_offset;
                     state.set_update_offset(offset)?;
                 }
                 Err(error) => {
-                    record_runtime_error(
+                    match handle_update_failure(
+                        &client,
+                        &token,
                         state,
-                        "telegram.update_failed",
-                        Some(update.update_id),
-                        None,
+                        update.update_id,
+                        chat_id,
                         &error,
-                    )?;
-                    eprintln!(
-                        "kai telegram update {} failed: {}",
-                        update.update_id, error.message
-                    );
-                    sleep(TELEGRAM_RETRY_BACKOFF).await;
-                    break;
+                    )
+                    .await?
+                    {
+                        UpdateFailureDisposition::Advance => {
+                            offset = next_offset;
+                            state.set_update_offset(offset)?;
+                        }
+                        UpdateFailureDisposition::Retry => {
+                            eprintln!(
+                                "kai telegram update {} failed: {}",
+                                update.update_id, error.message
+                            );
+                            sleep(TELEGRAM_RETRY_BACKOFF).await;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -841,6 +871,93 @@ fn record_runtime_error(
     }))
 }
 
+fn run_attachment_cleanup(state: &StateStore) -> KaiResult<()> {
+    let result = state.cleanup_staged_attachments(ATTACHMENT_RETENTION)?;
+    if result.removed_partial_files > 0 || result.removed_stale_files > 0 {
+        state.append_audit_json(&serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "event": "telegram.attachment_cleanup",
+            "scannedFiles": result.scanned_files,
+            "removedPartialFiles": result.removed_partial_files,
+            "removedStaleFiles": result.removed_stale_files,
+        }))?;
+    }
+    Ok(())
+}
+
+enum UpdateFailureDisposition {
+    Advance,
+    Retry,
+}
+
+async fn handle_update_failure(
+    client: &Client,
+    token: &str,
+    state: &StateStore,
+    update_id: i64,
+    chat_id: Option<i64>,
+    error: &KaiError,
+) -> KaiResult<UpdateFailureDisposition> {
+    let failure = state.record_update_failure(update_id, error)?;
+    let should_skip = should_skip_failed_update(error, failure.attempt_count);
+
+    state.append_audit_json(&serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "event": "telegram.update_failed",
+        "updateId": update_id,
+        "chatId": chat_id,
+        "errorCode": error.code,
+        "message": error.message,
+        "hint": error.hint,
+        "attemptCount": failure.attempt_count,
+        "skipUpdate": should_skip,
+    }))?;
+
+    if !should_skip {
+        return Ok(UpdateFailureDisposition::Retry);
+    }
+
+    if let Some(chat_id) = chat_id {
+        let notice = failure_notice_text(error, failure.attempt_count);
+        if let Err(notice_error) = send_message(client, token, chat_id, &notice).await {
+            record_runtime_error(
+                state,
+                "telegram.update_skip_notice_failed",
+                Some(update_id),
+                Some(chat_id),
+                &notice_error,
+            )?;
+        }
+    }
+
+    state.clear_update_failure(update_id)?;
+    Ok(UpdateFailureDisposition::Advance)
+}
+
+fn should_skip_failed_update(error: &KaiError, attempt_count: u32) -> bool {
+    is_terminal_update_error(error) || attempt_count >= MAX_UPDATE_FAILURE_ATTEMPTS
+}
+
+fn is_terminal_update_error(error: &KaiError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::InvalidArgument
+            | ErrorCode::BlockedPrerequisite
+            | ErrorCode::ConfigError
+            | ErrorCode::ToolNotFound
+    )
+}
+
+fn failure_notice_text(error: &KaiError, attempt_count: u32) -> String {
+    if matches!(error.code, ErrorCode::InvalidArgument) {
+        return format!("I couldn't handle that message: {}", error.message);
+    }
+
+    format!(
+        "I hit an internal error while handling that message after {attempt_count} attempt(s). I skipped it so later messages can continue."
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegramApiResponse<T> {
     ok: bool,
@@ -927,7 +1044,8 @@ impl ListKind {
 
 #[cfg(test)]
 mod tests {
-    use super::format_telegram_html;
+    use super::{failure_notice_text, format_telegram_html, should_skip_failed_update};
+    use crate::error::{ErrorCode, KaiError};
 
     #[test]
     fn format_telegram_html_renders_inline_code_and_bold() {
@@ -961,5 +1079,22 @@ mod tests {
             output,
             "• one\n• two\n\n<a href=\"https://example.com\">site</a>"
         );
+    }
+
+    #[test]
+    fn invalid_argument_updates_are_skipped_immediately() {
+        let error = KaiError::invalid_argument("too many attachments");
+        assert!(should_skip_failed_update(&error, 1));
+        assert_eq!(
+            failure_notice_text(&error, 1),
+            "I couldn't handle that message: too many attachments"
+        );
+    }
+
+    #[test]
+    fn retryable_errors_are_skipped_after_threshold() {
+        let error = KaiError::new(ErrorCode::RuntimeError, "temporary backend issue");
+        assert!(!should_skip_failed_update(&error, 1));
+        assert!(should_skip_failed_update(&error, 3));
     }
 }
