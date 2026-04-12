@@ -1,8 +1,8 @@
 # kai
 
-Status: draft  
-Date: 2026-04-11  
-Scope: spec only, no implementation commitments beyond repo bootstrap
+Status: implemented alpha, spec tracks shipped behavior plus near-term hardening  
+Date: 2026-04-12  
+Scope: owner-only Telegram-to-Codex portal on macOS, with current implementation and next hardening pass documented together
 
 ## 1. Purpose
 
@@ -92,7 +92,6 @@ These are explicitly out of scope for v1:
 - autonomous background work that runs without a user message
 - general shell execution outside Codex's own runtime
 - a second approval or policy engine layered on top of Codex
-- voice, video, and rich outbound media workflows
 - WhatsApp support in the first shipping cut
 
 If a feature pushes `kai` toward "agent platform" instead of "personal bridge", it should be rejected by default.
@@ -106,7 +105,9 @@ Borrow:
 - pragmatic setup-wizard thinking
 - Codex auth reuse pattern
 - persistent session handling
-- Telegram allowlist pattern
+- Telegram queueing and coalescing ideas
+- response chunking discipline
+- provider-backed transcription abstraction
 
 Reject or defer:
 
@@ -138,7 +139,10 @@ Interpretation: useful as a safety and config-language reference, not as a repo 
 Borrow:
 
 - strong channel policy patterns
-- pairing flow concepts
+- retry-aware Telegram delivery patterns
+- native Telegram command menu sync
+- long-text fragment and media-group handling
+- draft-stream transport patterns for future use
 - Telegram long-polling defaults
 - media staging and path-safety ideas
 - persisted resume identity handling
@@ -159,6 +163,7 @@ Borrow:
 - clear WhatsApp split between Cloud API and WhatsApp Web
 - session-summary persistence ideas
 - setup-wizard focus on practical onboarding
+- proof that voice and document handling are baseline user expectations
 
 Reject or defer:
 
@@ -176,6 +181,7 @@ Borrow:
 - seriousness about security documentation
 - explicit attachment caps and validation
 - conservative defaults around approval context
+- bounded queue and workspace-store thinking
 
 Reject or defer:
 
@@ -244,6 +250,7 @@ Reference projects support pairing, allowlists, and open/public modes. `kai` onl
 - only one Codex turn runs at a time
 - no concurrent turns into the same session
 - new messages received during an active turn are queued
+- mobile `/cancel` or `/interrupt` can stop the running turn
 
 This avoids race conditions, session corruption, and control-plane complexity.
 
@@ -363,6 +370,10 @@ Required persisted state:
 
 - owner identity
 - active Codex session id
+- durable pending-turn queue
+- recoverable in-flight turn state
+- buffered media-group and long-text fragment state until flushed
+- pending outbound reply deliveries
 - turn log
 - attachment metadata
 - configured context file metadata
@@ -417,11 +428,14 @@ This keeps the system close to raw Codex while still preserving the useful flavo
 
 ## 12. Message Passing Model
 
-`kai` should not forward raw channel text into Codex with no wrapper.
+`kai` should normalize each inbound turn into a stable execution envelope, but the prompt wrapper should stay minimal.
 
-Each inbound turn should be normalized into a stable envelope before execution.
+Current default behavior:
 
-The envelope should include:
+- a passthrough-style turn prompt is used by default
+- a heavier system-instruction wrapper remains available behind a code-level switch for experimentation
+
+The normalized turn envelope should include:
 
 - channel name
 - sender identity
@@ -430,7 +444,8 @@ The envelope should include:
 - attachment descriptors
 - explicit operating mode
 - configured context file references when present
-- concise response formatting instructions
+- attachment metadata and derived-artifact paths when present
+- concise response formatting guidance
 
 This follows the broader ecosystem pattern. The channel adapter handles transport concerns. The runner receives a normalized, channel-agnostic turn object.
 
@@ -448,19 +463,42 @@ Rules:
 - store metadata in state
 - pass local absolute paths to Codex
 - never rely on ephemeral remote URLs in the prompt
+- enrich media with derived artifacts when useful, such as transcripts or preview frames
 
-V1 supported attachment classes should be narrow:
+Current shipped attachment classes:
 
-- images
+- images sent as Telegram photos
+- images sent as Telegram documents
 - PDFs
-- plain text or markdown files
+- plain text and markdown files
+- audio files
+- voice notes
+- videos and video notes
+- animations
+- Telegram media groups up to the bounded per-turn limit
 
-V1 should reject or defer:
+Current media understanding behavior:
 
-- audio transcription
-- video
+- images are passed to Codex as image inputs where supported
+- documents are staged and exposed by absolute path
+- voice and audio are transcribed through a pluggable transcription layer
+- the default first provider is Groq STT using `whisper-large-v3-turbo`
+- a command-based transcription adapter exists for future local or alternative providers
+- video and animation can produce derived artifacts such as extracted audio or preview frames before Codex sees them
+
+Current outbound behavior:
+
+- text replies are chunked to fit Telegram limits
+- local files can be sent back explicitly with `/send <path>`
+- outbound media delivery is typed by attachment kind with Telegram-native method preference and document fallback
+- assistant prose should not be scraped heuristically for file paths and auto-sent
+
+Current rejected or deferred classes:
+
 - large archives
-- executable files
+- executables
+- unsupported Telegram media classes outside the bounded allowlist
+- true live draft streaming from Codex output, because the current Codex runtime path still consumes final completed messages
 
 The attachment directory is an intake surface, not the main vault. In v1 it should be derived from the main app root, not exposed as a separate required config root.
 
@@ -468,28 +506,24 @@ The attachment directory is an intake surface, not the main vault. In v1 it shou
 
 The setup experience should be much smaller than the large claw projects.
 
-Goal: one short local setup flow plus one owner pairing step.
+Goal: one short local setup flow plus one explicit owner lock.
 
 Recommended setup flow:
 
 1. `kai health` verifies local prerequisites and remediation hints.
 2. `kai setup` writes config and app-root scaffolding.
-3. `kai setup telegram` stores the bot token source and starts owner pairing.
+3. `kai setup telegram` opens a short-lived recovery pairing window when needed.
 4. `kai setup codex` verifies `codex exec`, `codex exec resume`, and auth presence.
 5. `kai health` confirms the full stack is healthy.
 
 The primary UX should be CLI subcommands, not manual TOML editing.
 
-Owner pairing should be simple but not open-ended.
+Current ownership model:
 
-Recommended v1 pairing model:
-
-- local setup generates a short pairing secret or one-time code
-- the owner sends the bot a pairing command containing that code
-- `kai` stores the sender as the owner
+- `channel.telegram.owner_user_id` may be pinned in config and should be treated as the normal trust root
+- recovery pairing is explicit, time-limited, and attempt-limited
+- normal operation does not depend on open-ended pairing state
 - later messages from any other sender are ignored
-
-This borrows the pairing idea from the claw projects while keeping the model owner-only.
 
 ## 15. Configuration Model
 
@@ -674,10 +708,17 @@ Operator commands should stay secondary and thin:
 - `kai setup`
 - `kai run`
 - `kai session show`
+- `kai session set`
 - `kai session new`
 - `kai session reset`
 - `kai context show`
 - `kai context check`
+- `kai service status`
+- `kai service logs`
+- `kai service start`
+- `kai service stop`
+- `kai service restart`
+- `kai service uninstall`
 
 `tools` metadata should come from one registry source in `sdk`, not duplicated across help text, docs, and tests.
 
@@ -740,6 +781,29 @@ Recommended persistence split:
 - SQLite for operational state
 - JSONL for append-only turn/audit logging
 
+Current SQLite-owned runtime state includes:
+
+- owner identity
+- active Codex session id
+- pending turn queue
+- processed update cache
+- update failure state
+- replay package
+- small runtime keys for command-menu sync and security state
+
+Current JSON or file-backed runtime state also includes:
+
+- staged attachments and derived artifacts under `root_app/attachments`
+- service stdout and stderr logs under `root_app/logs`
+- append-only audit events in `turns.jsonl`
+
+Operational durability requirements:
+
+- active turns must survive process restarts without silent loss
+- buffered media groups and long text fragments must survive restarts until flushed
+- completed assistant replies must be retryable if Telegram delivery fails after Codex already finished
+- housekeeping should prune stale attachments, stale update-failure rows, stale processed updates, and oversized audit logs
+
 Minimum audit fields:
 
 - timestamp
@@ -762,6 +826,12 @@ The runtime should stay boring.
 - one local daemon process
 - one serialized inbound queue
 - long-polling for Telegram
+- optional macOS LaunchAgent background service
+- typing indicator refresh while a turn is active
+- queued follow-up handling while a turn is busy
+- native Telegram command menu sync for the owner chat
+- chunked Telegram replies with HTML formatting fallback
+- durable pending-reply delivery retry when Telegram send fails after Codex already completed
 - no web server in v1
 - no background autonomous work
 - no periodic jobs beyond optional internal housekeeping
@@ -783,14 +853,23 @@ Required before calling v1 usable:
 - verified restart recovery
 - verified attachment rejection for invalid or oversized files
 - verified non-owner rejection
+- verified queued follow-ups during an active turn
+- verified `/cancel` behavior
+- verified long-reply chunking
+- verified background service restart behavior
+- verified media-group and long-text buffering behavior
+- verified media transcription provider readiness
 
 High-value integration tests:
 
 - owner pairing flow
+- owner-pinned mode with recovery pairing
 - resume success path
 - resume failure with replay fallback
 - queue serialization
+- active-turn crash recovery
 - attachment staging and cleanup
+- pending reply delivery retry after Telegram send failure
 - configured context-file loading
 - optional custom tool-path execution
 - full-access portal turn

@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
 use serde_json::Value as JsonValue;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
 
 use crate::config::LoadedConfig;
@@ -199,6 +200,12 @@ struct RawCodexResult {
     response_text: String,
 }
 
+#[derive(Debug, Default)]
+struct ParsedCodexOutput {
+    session_id: Option<String>,
+    response_text: Option<String>,
+}
+
 fn build_async_command(
     config: &LoadedConfig,
     prepared: &PreparedCodexTurn,
@@ -236,21 +243,49 @@ fn build_async_command(
 
 async fn wait_for_codex_turn(
     config: LoadedConfig,
-    child: tokio::process::Child,
+    mut child: tokio::process::Child,
     prepared: PreparedCodexTurn,
     using_resume: bool,
 ) -> KaiResult<AsyncCodexTurnResult> {
-    let output = child.wait_with_output().await.map_err(|error| {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI did not expose stdout for JSON parsing",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI did not expose stderr for diagnostics",
+        )
+    })?;
+
+    let stdout_task = tokio::spawn(async move { parse_jsonl_stream(stdout).await });
+    let stderr_task = tokio::spawn(async move { read_stream_to_string(stderr).await });
+
+    let status = child.wait().await.map_err(|error| {
         KaiError::new(
             ErrorCode::RuntimeError,
             format!("failed to wait for Codex CLI: {error}"),
         )
     })?;
+    let parsed = stdout_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex stdout parser: {error}"),
+        )
+    })??;
+    let stderr_text = stderr_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex stderr reader: {error}"),
+        )
+    })??;
 
-    let resume_failure = if output.status.success() {
+    let resume_failure = if status.success() {
         None
     } else if using_resume {
-        let error = codex_process_failure(&output);
+        let error = codex_process_failure_from_parts(&status, &stderr_text);
         if let Some(requested_session_id) = &prepared.requested_session_id
             && is_stale_resume_error(&error)
         {
@@ -272,11 +307,10 @@ async fn wait_for_codex_turn(
 
         return Err(error);
     } else {
-        return Err(codex_process_failure(&output));
+        return Err(codex_process_failure_from_parts(&status, &stderr_text));
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw = parse_jsonl_output(&stdout)?;
+    let raw = finalize_parsed_output(parsed)?;
     Ok(AsyncCodexTurnResult {
         result: CodexTurnResult {
             session_id: raw.session_id,
@@ -311,38 +345,59 @@ async fn run_exec_async_fallback(
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
 
-    let output = command
-        .spawn()
-        .map_err(|error| {
-            KaiError::new(
-                ErrorCode::RuntimeError,
-                format!("failed to launch Codex CLI: {error}"),
-            )
-        })?
-        .wait_with_output()
-        .await
-        .map_err(|error| {
-            KaiError::new(
-                ErrorCode::RuntimeError,
-                format!("failed to wait for Codex CLI: {error}"),
-            )
-        })?;
+    let mut child = command.spawn().map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to launch Codex CLI: {error}"),
+        )
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI fallback run did not expose stdout for JSON parsing",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI fallback run did not expose stderr for diagnostics",
+        )
+    })?;
+    let stdout_task = tokio::spawn(async move { parse_jsonl_stream(stdout).await });
+    let stderr_task = tokio::spawn(async move { read_stream_to_string(stderr).await });
 
-    if !output.status.success() {
-        return Err(codex_process_failure(&output));
+    let status = child.wait().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to wait for Codex CLI: {error}"),
+        )
+    })?;
+    let parsed = stdout_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex fallback stdout parser: {error}"),
+        )
+    })??;
+    let stderr_text = stderr_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex fallback stderr reader: {error}"),
+        )
+    })??;
+
+    if !status.success() {
+        return Err(codex_process_failure_from_parts(&status, &stderr_text));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_jsonl_output(&stdout)
+    finalize_parsed_output(parsed)
 }
 
-fn codex_process_failure(output: &std::process::Output) -> KaiError {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+fn codex_process_failure_from_parts(status: &std::process::ExitStatus, stderr: &str) -> KaiError {
     KaiError::new(
         ErrorCode::RuntimeError,
-        format!("Codex CLI exited with status {}", output.status),
+        format!("Codex CLI exited with status {status}"),
     )
-    .with_hint(stderr)
+    .with_hint(stderr.trim())
 }
 
 fn run_exec(
@@ -409,40 +464,77 @@ fn run_command(mut command: Command) -> KaiResult<RawCodexResult> {
     parse_jsonl_output(&stdout)
 }
 
-fn parse_jsonl_output(stdout: &str) -> KaiResult<RawCodexResult> {
-    let mut session_id: Option<String> = None;
-    let mut response_text: Option<String> = None;
+async fn parse_jsonl_stream<R>(reader: R) -> KaiResult<ParsedCodexOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut parsed = ParsedCodexOutput::default();
 
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        let value = match serde_json::from_str::<JsonValue>(line) {
+    while let Some(line) = lines.next_line().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to read Codex JSON stream: {error}"),
+        )
+    })? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let value = match serde_json::from_str::<JsonValue>(trimmed) {
             Ok(value) => value,
             Err(_) => continue,
         };
-
-        if value.get("type").and_then(JsonValue::as_str) == Some("thread.started")
-            && let Some(thread_id) = value.get("thread_id").and_then(JsonValue::as_str)
-        {
-            session_id = Some(thread_id.to_string());
-        }
-
-        if value.get("type").and_then(JsonValue::as_str) == Some("item.completed")
-            && let Some(item) = value.get("item")
-        {
-            let is_agent_message =
-                item.get("type").and_then(JsonValue::as_str) == Some("agent_message");
-            if is_agent_message && let Some(text) = item.get("text").and_then(JsonValue::as_str) {
-                response_text = Some(text.to_string());
-            }
-        }
+        apply_codex_json_value(&mut parsed, &value);
     }
 
-    let session_id = session_id.ok_or_else(|| {
+    Ok(parsed)
+}
+
+async fn read_stream_to_string<R>(reader: R) -> KaiResult<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut chunks = Vec::new();
+    while let Some(line) = lines.next_line().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to read Codex stderr stream: {error}"),
+        )
+    })? {
+        chunks.push(line);
+    }
+    Ok(chunks.join("\n"))
+}
+
+fn apply_codex_json_value(parsed: &mut ParsedCodexOutput, value: &JsonValue) {
+    if value.get("type").and_then(JsonValue::as_str) == Some("thread.started")
+        && let Some(thread_id) = value.get("thread_id").and_then(JsonValue::as_str)
+    {
+        parsed.session_id = Some(thread_id.to_string());
+    }
+
+    if value.get("type").and_then(JsonValue::as_str) == Some("item.completed")
+        && let Some(item) = value.get("item")
+    {
+        let is_agent_message =
+            item.get("type").and_then(JsonValue::as_str) == Some("agent_message");
+        if is_agent_message && let Some(text) = item.get("text").and_then(JsonValue::as_str) {
+            parsed.response_text = Some(text.to_string());
+        }
+    }
+}
+
+fn finalize_parsed_output(parsed: ParsedCodexOutput) -> KaiResult<RawCodexResult> {
+    let session_id = parsed.session_id.ok_or_else(|| {
         KaiError::new(
             ErrorCode::RuntimeError,
             "Codex did not emit a session id in JSON output",
         )
     })?;
-    let response_text = response_text.ok_or_else(|| {
+    let response_text = parsed.response_text.ok_or_else(|| {
         KaiError::new(
             ErrorCode::RuntimeError,
             "Codex did not emit a completed assistant message",
@@ -453,6 +545,20 @@ fn parse_jsonl_output(stdout: &str) -> KaiResult<RawCodexResult> {
         session_id,
         response_text,
     })
+}
+
+fn parse_jsonl_output(stdout: &str) -> KaiResult<RawCodexResult> {
+    let mut parsed = ParsedCodexOutput::default();
+
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let value = match serde_json::from_str::<JsonValue>(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        apply_codex_json_value(&mut parsed, &value);
+    }
+
+    finalize_parsed_output(parsed)
 }
 
 fn build_turn_prompt(

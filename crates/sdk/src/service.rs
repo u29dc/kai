@@ -2,7 +2,7 @@ use fs2::FileExt;
 use serde::Serialize;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -564,7 +564,35 @@ fn read_tail_lines(path: &Path, tail: usize) -> KaiResult<Vec<String>> {
         return Ok(Vec::new());
     }
 
-    let raw = fs::read_to_string(path).map_err(io_error("read service log"))?;
+    let mut file = File::open(path).map_err(io_error("open service log"))?;
+    let file_len = file
+        .metadata()
+        .map_err(io_error("inspect service log"))?
+        .len();
+    if file_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut chunk_size = 8192_u64;
+    let mut offset = file_len;
+    let mut buffer = Vec::new();
+    let mut newline_count = 0_usize;
+
+    while offset > 0 && newline_count <= tail {
+        let read_len = chunk_size.min(offset) as usize;
+        offset -= read_len as u64;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(io_error("seek service log"))?;
+        let mut chunk = vec![0_u8; read_len];
+        file.read_exact(&mut chunk)
+            .map_err(io_error("read service log chunk"))?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunk.extend(buffer);
+        buffer = chunk;
+        chunk_size = chunk_size.saturating_mul(2).min(file_len.max(8192));
+    }
+
+    let raw = String::from_utf8_lossy(&buffer);
     let mut lines = raw.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
     if lines.len() > tail {
         lines.drain(0..(lines.len() - tail));

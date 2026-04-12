@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Instant, sleep};
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::app::{mobile_help_text, mobile_status_text};
@@ -30,11 +31,21 @@ const TELEGRAM_TYPING_REFRESH: Duration = Duration::from_secs(4);
 const MAX_UPDATE_FAILURE_ATTEMPTS: u32 = 3;
 const TELEGRAM_TEXT_LIMIT: usize = 4096;
 const MAX_OUTBOUND_ATTACHMENTS_PER_REPLY: usize = 4;
+const TELEGRAM_SEND_RETRY_ATTEMPTS: u32 = 3;
+const TELEGRAM_SEND_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const TEXT_FRAGMENT_START_THRESHOLD_CHARS: usize = 3500;
 const TEXT_FRAGMENT_MAX_TOTAL_CHARS: usize = 24_000;
 const TEXT_FRAGMENT_MAX_PARTS: usize = 6;
 const TEXT_FRAGMENT_MAX_ID_GAP: i64 = 5;
 const TEXT_FRAGMENT_MAX_GAP: Duration = Duration::from_millis(1400);
+const ACTIVE_TURN_STATE_KEY: &str = "telegram.active_turn";
+const BUFFERED_MEDIA_GROUPS_STATE_KEY: &str = "telegram.buffered_media_groups";
+const BUFFERED_TEXT_FRAGMENTS_STATE_KEY: &str = "telegram.buffered_text_fragments";
+const PENDING_REPLY_DELIVERIES_STATE_KEY: &str = "telegram.pending_reply_deliveries";
+const PROCESSED_UPDATE_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 14);
+const UPDATE_FAILURE_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+const MAX_TURN_ROWS: usize = 5000;
+const MAX_AUDIT_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> KaiResult<()> {
     if !config.values.channel.telegram.enabled {
@@ -53,29 +64,37 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
 
     let mut offset = state.get_update_offset()?;
     let mut next_cleanup_at = Instant::now();
-    let mut media_groups = HashMap::<String, BufferedMediaGroup>::new();
-    let mut text_fragments = HashMap::<String, BufferedTextFragments>::new();
+    let mut media_groups = load_buffered_media_groups(state)?;
+    let mut text_fragments = load_buffered_text_fragments(state)?;
     let mut active_turn: Option<ActiveOwnerTurn> = None;
     let mut synced_menu_chat_id: Option<i64> = None;
+
+    recover_active_turn(state)?;
 
     loop {
         let now = Instant::now();
 
         if next_cleanup_at <= now {
-            if let Err(error) = run_attachment_cleanup(state) {
-                record_runtime_error(
-                    state,
-                    "telegram.attachment_cleanup_failed",
-                    None,
-                    None,
-                    &error,
-                )?;
-                eprintln!("kai attachment cleanup failed: {}", error.message);
+            if let Err(error) = run_housekeeping(state) {
+                record_runtime_error(state, "telegram.housekeeping_failed", None, None, &error)?;
+                eprintln!("kai housekeeping failed: {}", error.message);
             }
             next_cleanup_at = Instant::now() + ATTACHMENT_CLEANUP_INTERVAL;
         }
 
         let owner_chat_id = state.get_owner_chat_id()?;
+
+        if let Err(error) = flush_pending_reply_deliveries(&client, &token, state).await {
+            record_runtime_error(
+                state,
+                "telegram.pending_reply_delivery_failed",
+                None,
+                owner_chat_id,
+                &error,
+            )?;
+            eprintln!("kai pending reply delivery failed: {}", error.message);
+        }
+
         if owner_chat_id != synced_menu_chat_id {
             if let Some(chat_id) = owner_chat_id {
                 if let Err(error) =
@@ -160,6 +179,13 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             let chat_id = update.message.as_ref().map(|message| message.chat.id);
 
             let outcome = if let Some(message) = update.message {
+                if should_ignore_message_before_buffering(config, state, &message)? {
+                    offset = next_offset;
+                    state.set_update_offset(offset)?;
+                    state.clear_update_failure(update.update_id)?;
+                    continue;
+                }
+
                 if let Some(media_group_id) = message.media_group_id.clone() {
                     buffer_media_group(
                         &mut media_groups,
@@ -167,6 +193,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                         message,
                         &media_group_id,
                     );
+                    persist_media_groups(state, &media_groups)?;
                     offset = next_offset;
                     state.set_update_offset(offset)?;
                     state.clear_update_failure(update.update_id)?;
@@ -177,7 +204,8 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                     if let Some(flushed) =
                         buffer_text_fragments(&mut text_fragments, update.update_id, message)
                     {
-                        process_buffered_text_fragments(
+                        persist_text_fragments(state, &text_fragments)?;
+                        if let Err(error) = process_buffered_text_fragments(
                             &client,
                             &token,
                             config,
@@ -185,7 +213,40 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                             &mut active_turn,
                             &flushed,
                         )
-                        .await?;
+                        .await
+                        {
+                            let failure_update_id = flushed
+                                .update_ids
+                                .last()
+                                .copied()
+                                .unwrap_or(flushed.last_update_id);
+                            match handle_update_failure(
+                                &client,
+                                &token,
+                                state,
+                                failure_update_id,
+                                Some(flushed.chat_id),
+                                &error,
+                            )
+                            .await?
+                            {
+                                UpdateFailureDisposition::Advance => {}
+                                UpdateFailureDisposition::Retry => {
+                                    let mut retry_entry = flushed;
+                                    retry_entry.ready_at = Instant::now() + TELEGRAM_RETRY_BACKOFF;
+                                    text_fragments.insert(
+                                        format!(
+                                            "{}:{}",
+                                            retry_entry.chat_id, retry_entry.sender_id
+                                        ),
+                                        retry_entry,
+                                    );
+                                    persist_text_fragments(state, &text_fragments)?;
+                                }
+                            }
+                        }
+                    } else {
+                        persist_text_fragments(state, &text_fragments)?;
                     }
                     offset = next_offset;
                     state.set_update_offset(offset)?;
@@ -388,6 +449,238 @@ struct ActiveOwnerTurn {
     next_typing_at: Instant,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedBufferedMediaGroup {
+    media_group_id: String,
+    chat_id: i64,
+    last_update_id: i64,
+    update_ids: Vec<i64>,
+    messages: Vec<TelegramMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedBufferedTextFragments {
+    chat_id: i64,
+    sender_id: i64,
+    last_update_id: i64,
+    update_ids: Vec<i64>,
+    messages: Vec<TelegramMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingReplyDelivery {
+    delivery_id: String,
+    turn_id: String,
+    chat_id: i64,
+    response_text: String,
+    codex_session_id: String,
+    update_ids: Vec<i64>,
+    attempts: u32,
+    created_at: String,
+}
+
+fn load_buffered_media_groups(
+    state: &StateStore,
+) -> KaiResult<HashMap<String, BufferedMediaGroup>> {
+    let persisted = state
+        .load_json_state::<Vec<PersistedBufferedMediaGroup>>(BUFFERED_MEDIA_GROUPS_STATE_KEY)?
+        .unwrap_or_default();
+    let mut groups = HashMap::new();
+    for entry in persisted {
+        groups.insert(
+            media_group_key(entry.chat_id, &entry.media_group_id),
+            BufferedMediaGroup {
+                media_group_id: entry.media_group_id,
+                chat_id: entry.chat_id,
+                last_update_id: entry.last_update_id,
+                ready_at: Instant::now(),
+                update_ids: entry.update_ids,
+                messages: entry.messages,
+            },
+        );
+    }
+    Ok(groups)
+}
+
+fn persist_media_groups(
+    state: &StateStore,
+    media_groups: &HashMap<String, BufferedMediaGroup>,
+) -> KaiResult<()> {
+    if media_groups.is_empty() {
+        return state.remove_json_state(BUFFERED_MEDIA_GROUPS_STATE_KEY);
+    }
+
+    let persisted = media_groups
+        .values()
+        .map(|entry| PersistedBufferedMediaGroup {
+            media_group_id: entry.media_group_id.clone(),
+            chat_id: entry.chat_id,
+            last_update_id: entry.last_update_id,
+            update_ids: entry.update_ids.clone(),
+            messages: entry.messages.clone(),
+        })
+        .collect::<Vec<_>>();
+    state.store_json_state(BUFFERED_MEDIA_GROUPS_STATE_KEY, &persisted)
+}
+
+fn load_buffered_text_fragments(
+    state: &StateStore,
+) -> KaiResult<HashMap<String, BufferedTextFragments>> {
+    let persisted = state
+        .load_json_state::<Vec<PersistedBufferedTextFragments>>(BUFFERED_TEXT_FRAGMENTS_STATE_KEY)?
+        .unwrap_or_default();
+    let mut buffers = HashMap::new();
+    for entry in persisted {
+        buffers.insert(
+            format!("{}:{}", entry.chat_id, entry.sender_id),
+            BufferedTextFragments {
+                chat_id: entry.chat_id,
+                sender_id: entry.sender_id,
+                last_update_id: entry.last_update_id,
+                ready_at: Instant::now(),
+                update_ids: entry.update_ids,
+                messages: entry.messages,
+            },
+        );
+    }
+    Ok(buffers)
+}
+
+fn persist_text_fragments(
+    state: &StateStore,
+    buffers: &HashMap<String, BufferedTextFragments>,
+) -> KaiResult<()> {
+    if buffers.is_empty() {
+        return state.remove_json_state(BUFFERED_TEXT_FRAGMENTS_STATE_KEY);
+    }
+
+    let persisted = buffers
+        .values()
+        .map(|entry| PersistedBufferedTextFragments {
+            chat_id: entry.chat_id,
+            sender_id: entry.sender_id,
+            last_update_id: entry.last_update_id,
+            update_ids: entry.update_ids.clone(),
+            messages: entry.messages.clone(),
+        })
+        .collect::<Vec<_>>();
+    state.store_json_state(BUFFERED_TEXT_FRAGMENTS_STATE_KEY, &persisted)
+}
+
+fn recover_active_turn(state: &StateStore) -> KaiResult<()> {
+    let Some(active) = state.load_json_state::<PendingTurn>(ACTIVE_TURN_STATE_KEY)? else {
+        return Ok(());
+    };
+
+    if !state
+        .pending_turn_queue()?
+        .iter()
+        .any(|queued| queued.id == active.id)
+    {
+        state.prepend_pending_turn(&active)?;
+    }
+    state.remove_json_state(ACTIVE_TURN_STATE_KEY)
+}
+
+fn run_housekeeping(state: &StateStore) -> KaiResult<()> {
+    let attachment_result = state.cleanup_staged_attachments(ATTACHMENT_RETENTION)?;
+    let state_result = state.cleanup_runtime_state(
+        PROCESSED_UPDATE_RETENTION,
+        UPDATE_FAILURE_RETENTION,
+        MAX_TURN_ROWS,
+        MAX_AUDIT_LOG_BYTES,
+    )?;
+
+    state.append_audit_json(&serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "event": "telegram.housekeeping",
+        "attachments": attachment_result,
+        "state": state_result,
+    }))?;
+    Ok(())
+}
+
+fn pending_reply_deliveries(state: &StateStore) -> KaiResult<Vec<PendingReplyDelivery>> {
+    Ok(state
+        .load_json_state::<Vec<PendingReplyDelivery>>(PENDING_REPLY_DELIVERIES_STATE_KEY)?
+        .unwrap_or_default())
+}
+
+fn store_pending_reply_deliveries(
+    state: &StateStore,
+    deliveries: &[PendingReplyDelivery],
+) -> KaiResult<()> {
+    if deliveries.is_empty() {
+        return state.remove_json_state(PENDING_REPLY_DELIVERIES_STATE_KEY);
+    }
+    state.store_json_state(PENDING_REPLY_DELIVERIES_STATE_KEY, deliveries)
+}
+
+fn enqueue_pending_reply_delivery(
+    state: &StateStore,
+    delivery: PendingReplyDelivery,
+) -> KaiResult<()> {
+    let mut deliveries = pending_reply_deliveries(state)?;
+    deliveries.push(delivery);
+    store_pending_reply_deliveries(state, &deliveries)
+}
+
+async fn flush_pending_reply_deliveries(
+    client: &Client,
+    token: &str,
+    state: &StateStore,
+) -> KaiResult<()> {
+    let mut deliveries = pending_reply_deliveries(state)?;
+    if deliveries.is_empty() {
+        return Ok(());
+    }
+
+    let mut remaining = Vec::new();
+    for mut delivery in deliveries.drain(..) {
+        match send_message_with_retry(client, token, delivery.chat_id, &delivery.response_text)
+            .await
+        {
+            Ok(()) => {
+                for update_id in &delivery.update_ids {
+                    state.set_processed_update(
+                        *update_id,
+                        &delivery.response_text,
+                        Some(&delivery.codex_session_id),
+                    )?;
+                }
+                state.append_audit_json(&serde_json::json!({
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "event": "telegram.reply_delivered",
+                    "deliveryId": delivery.delivery_id,
+                    "turnId": delivery.turn_id,
+                    "chatId": delivery.chat_id,
+                    "attempts": delivery.attempts + 1,
+                    "updateIds": delivery.update_ids,
+                }))?;
+            }
+            Err(error) => {
+                delivery.attempts = delivery.attempts.saturating_add(1);
+                state.append_audit_json(&serde_json::json!({
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "event": "telegram.reply_delivery_retry",
+                    "deliveryId": delivery.delivery_id,
+                    "turnId": delivery.turn_id,
+                    "chatId": delivery.chat_id,
+                    "attempts": delivery.attempts,
+                    "message": error.message,
+                    "hint": error.hint,
+                }))?;
+                remaining.push(delivery);
+            }
+        }
+    }
+
+    store_pending_reply_deliveries(state, &remaining)
+}
+
 async fn validate_inbound_message(
     client: &Client,
     token: &str,
@@ -446,6 +739,41 @@ async fn validate_inbound_message(
         sender_id,
         text,
     }))
+}
+
+fn should_ignore_message_before_buffering(
+    config: &LoadedConfig,
+    state: &StateStore,
+    message: &TelegramMessage,
+) -> KaiResult<bool> {
+    if message.chat.kind != "private" {
+        return Ok(true);
+    }
+
+    let Some(sender_id) = message.from.as_ref().map(|user| user.id) else {
+        return Ok(true);
+    };
+
+    let owner_id = config
+        .values
+        .channel
+        .telegram
+        .owner_user_id
+        .or(state.get_owner_user_id()?);
+    let owner_chat_id = state.get_owner_chat_id()?;
+
+    if let Some(owner_id) = owner_id {
+        if sender_id != owner_id {
+            return Ok(true);
+        }
+        if let Some(expected_chat_id) = owner_chat_id
+            && message.chat.id != expected_chat_id
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -558,14 +886,23 @@ async fn enqueue_owner_turn(
         "attachmentCount": pending.attachments.len(),
     }))?;
 
-    if active_turn.is_some() || position > 1 {
-        send_message(
+    if (active_turn.is_some() || position > 1)
+        && let Err(error) = send_message(
             client,
             token,
             pending.chat_id,
             &format!("Queued. Position {}.", position),
         )
-        .await?;
+        .await
+    {
+        state.append_audit_json(&serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "event": "telegram.queue_notice_failed",
+            "turnId": pending.id,
+            "chatId": pending.chat_id,
+            "message": error.message,
+            "hint": error.hint,
+        }))?;
     }
 
     Ok(())
@@ -583,8 +920,10 @@ async fn maybe_start_next_pending_turn(
     let Some(pending) = state.pop_pending_turn()? else {
         return Ok(());
     };
+    state.store_json_state(ACTIVE_TURN_STATE_KEY, &pending)?;
 
     if pending.text.is_empty() && pending.attachments.is_empty() {
+        state.remove_json_state(ACTIVE_TURN_STATE_KEY)?;
         return Ok(());
     }
 
@@ -597,12 +936,14 @@ async fn maybe_start_next_pending_turn(
         &pending.attachments,
     )
     .inspect_err(|_| {
+        let _ = state.remove_json_state(ACTIVE_TURN_STATE_KEY);
         let _ = state.prepend_pending_turn(&pending);
     })?;
 
     let running = match start_codex_turn(config.clone(), prepared).await {
         Ok(running) => running,
         Err(error) => {
+            let _ = state.remove_json_state(ACTIVE_TURN_STATE_KEY);
             let _ = state.prepend_pending_turn(&pending);
             return Err(error);
         }
@@ -635,9 +976,12 @@ async fn finish_active_turn(
 ) -> KaiResult<()> {
     match result {
         Ok(async_result) => {
-            finalize_successful_turn(client, token, config, state, active_turn, async_result).await
+            finalize_successful_turn(client, token, config, state, active_turn, async_result)
+                .await?;
+            state.remove_json_state(ACTIVE_TURN_STATE_KEY)
         }
         Err(error) => {
+            state.remove_json_state(ACTIVE_TURN_STATE_KEY)?;
             if active_turn.cancel_requested {
                 state.append_audit_json(&serde_json::json!({
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -658,7 +1002,7 @@ async fn finish_active_turn(
                 Some(active_turn.pending.sender_id),
                 &error,
             )?;
-            send_message(
+            if let Err(notice_error) = send_message_with_retry(
                 client,
                 token,
                 active_turn.pending.chat_id,
@@ -668,6 +1012,17 @@ async fn finish_active_turn(
                 ),
             )
             .await
+            {
+                state.append_audit_json(&serde_json::json!({
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "event": "telegram.turn_failure_notice_failed",
+                    "turnId": active_turn.pending.id,
+                    "chatId": active_turn.pending.chat_id,
+                    "message": notice_error.message,
+                    "hint": notice_error.hint,
+                }))?;
+            }
+            Ok(())
         }
     }
 }
@@ -722,32 +1077,22 @@ async fn finalize_successful_turn(
         "attachmentCount": active_turn.pending.attachments.len(),
     }))?;
 
-    for update_id in &active_turn.pending.update_ids {
-        state.set_processed_update(*update_id, &result.response_text, Some(&result.session_id))?;
-    }
+    enqueue_pending_reply_delivery(
+        state,
+        PendingReplyDelivery {
+            delivery_id: Uuid::new_v4().to_string(),
+            turn_id: active_turn.pending.id.clone(),
+            chat_id: active_turn.pending.chat_id,
+            response_text: result.response_text.clone(),
+            codex_session_id: result.session_id.clone(),
+            update_ids: active_turn.pending.update_ids.clone(),
+            attempts: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )?;
 
-    send_message(
-        client,
-        token,
-        active_turn.pending.chat_id,
-        &result.response_text,
-    )
-    .await?;
-
-    let auto_paths = detect_sendable_response_paths(config, state, &result.response_text)?;
-    if !auto_paths.is_empty()
-        && let Err(error) =
-            send_local_paths(client, token, active_turn.pending.chat_id, &auto_paths).await
-    {
-        state.append_audit_json(&serde_json::json!({
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "event": "telegram.auto_send_failed",
-            "turnId": active_turn.pending.id,
-            "chatId": active_turn.pending.chat_id,
-            "message": error.message,
-            "hint": error.hint,
-        }))?;
-    }
+    let _ = config;
+    flush_pending_reply_deliveries(client, token, state).await?;
 
     Ok(())
 }
@@ -843,10 +1188,44 @@ async fn flush_ready_text_fragments(
         .collect::<Vec<_>>();
 
     for key in ready_keys {
-        let Some(entry) = buffers.remove(&key) else {
+        let Some(mut entry) = buffers.remove(&key) else {
             continue;
         };
-        process_buffered_text_fragments(client, token, config, state, active_turn, &entry).await?;
+        persist_text_fragments(state, buffers)?;
+        match process_buffered_text_fragments(client, token, config, state, active_turn, &entry)
+            .await
+        {
+            Ok(()) => {
+                if let Some(last_update_id) = entry.update_ids.last().copied() {
+                    state.clear_update_failure(last_update_id)?;
+                }
+            }
+            Err(error) => {
+                let chat_id = entry.messages.first().map(|message| message.chat.id);
+                let failure_update_id = entry
+                    .update_ids
+                    .last()
+                    .copied()
+                    .unwrap_or(entry.last_update_id);
+                match handle_update_failure(
+                    client,
+                    token,
+                    state,
+                    failure_update_id,
+                    chat_id,
+                    &error,
+                )
+                .await?
+                {
+                    UpdateFailureDisposition::Advance => {}
+                    UpdateFailureDisposition::Retry => {
+                        entry.ready_at = Instant::now() + TELEGRAM_RETRY_BACKOFF;
+                        buffers.insert(key, entry);
+                        persist_text_fragments(state, buffers)?;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -954,6 +1333,7 @@ async fn flush_ready_media_groups(
         let Some(mut entry) = media_groups.remove(&key) else {
             continue;
         };
+        persist_media_groups(state, media_groups)?;
 
         match process_buffered_media_group(client, token, config, state, active_turn, &entry).await
         {
@@ -976,6 +1356,7 @@ async fn flush_ready_media_groups(
                 UpdateFailureDisposition::Retry => {
                     entry.ready_at = Instant::now() + TELEGRAM_RETRY_BACKOFF;
                     media_groups.insert(key, entry);
+                    persist_media_groups(state, media_groups)?;
                 }
             },
         }
@@ -1194,12 +1575,40 @@ async fn get_updates(
 }
 
 async fn send_message(client: &Client, token: &str, chat_id: i64, text: &str) -> KaiResult<()> {
+    send_message_with_retry(client, token, chat_id, text).await
+}
+
+async fn send_message_with_retry(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> KaiResult<()> {
     if text.trim().is_empty() {
         return Ok(());
     }
 
     for chunk in split_response_text(text) {
-        send_message_chunk(client, token, chat_id, &chunk).await?;
+        let mut last_error: Option<KaiError> = None;
+        for attempt in 0..TELEGRAM_SEND_RETRY_ATTEMPTS {
+            match send_message_chunk(client, token, chat_id, &chunk).await {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) if should_retry_telegram_send(&error) => {
+                    last_error = Some(error);
+                    if attempt + 1 < TELEGRAM_SEND_RETRY_ATTEMPTS {
+                        sleep(TELEGRAM_SEND_RETRY_BACKOFF).await;
+                        continue;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error);
+        }
     }
 
     Ok(())
@@ -1212,6 +1621,10 @@ async fn send_message_chunk(
     text: &str,
 ) -> KaiResult<()> {
     let formatted = format_telegram_html(text);
+    if formatted.chars().count() > TELEGRAM_TEXT_LIMIT {
+        return send_plain_text_message_chunk(client, token, chat_id, text).await;
+    }
+
     let response = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
         .json(&SendMessageRequest {
@@ -1237,35 +1650,44 @@ async fn send_message_chunk(
         .unwrap_or_else(|| "Telegram sendMessage failed".to_string());
 
     if is_telegram_html_parse_error(&description) {
-        let plain_response = client
-            .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
-            .json(&SendMessageRequest {
-                chat_id,
-                text: text.to_string(),
-                parse_mode: None,
-            })
-            .send()
-            .await
-            .map_err(http_error("send Telegram plain-text fallback"))?;
-
-        let plain_payload = plain_response
-            .json::<TelegramApiResponse<serde_json::Value>>()
-            .await
-            .map_err(http_error("decode Telegram plain-text fallback response"))?;
-
-        if plain_payload.ok {
-            return Ok(());
-        }
-
-        return Err(KaiError::new(
-            ErrorCode::RuntimeError,
-            plain_payload
-                .description
-                .unwrap_or_else(|| "Telegram plain-text fallback failed".to_string()),
-        ));
+        return send_plain_text_message_chunk(client, token, chat_id, text).await;
     }
 
     Err(KaiError::new(ErrorCode::RuntimeError, description))
+}
+
+async fn send_plain_text_message_chunk(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> KaiResult<()> {
+    let response = client
+        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .json(&SendMessageRequest {
+            chat_id,
+            text: text.to_string(),
+            parse_mode: None,
+        })
+        .send()
+        .await
+        .map_err(http_error("send Telegram plain-text message"))?;
+
+    let payload = response
+        .json::<TelegramApiResponse<serde_json::Value>>()
+        .await
+        .map_err(http_error("decode Telegram plain-text response"))?;
+
+    if payload.ok {
+        return Ok(());
+    }
+
+    Err(KaiError::new(
+        ErrorCode::RuntimeError,
+        payload
+            .description
+            .unwrap_or_else(|| "Telegram plain-text sendMessage failed".to_string()),
+    ))
 }
 
 async fn send_local_paths(
@@ -1298,10 +1720,10 @@ async fn send_local_path(
     chat_id: i64,
     path: &Path,
 ) -> KaiResult<bool> {
-    let bytes = fs::read(path).map_err(|error| {
+    let metadata = fs::metadata(path).map_err(|error| {
         KaiError::new(
             ErrorCode::IoError,
-            format!("failed to read local file for Telegram delivery: {error}"),
+            format!("failed to inspect local file for Telegram delivery: {error}"),
         )
     })?;
     let name = path
@@ -1310,10 +1732,10 @@ async fn send_local_path(
         .unwrap_or("attachment");
     let kind = classify_document_kind(Some(name), None);
     let byte_limit = attachment_byte_limit(kind);
-    if bytes.len() as u64 > byte_limit {
+    if metadata.len() > byte_limit {
         return Err(KaiError::invalid_argument(format!(
             "outbound file exceeds Telegram limit: {} bytes > {}",
-            bytes.len(),
+            metadata.len(),
             byte_limit
         )));
     }
@@ -1329,7 +1751,8 @@ async fn send_local_path(
                     "sendAnimation",
                     "animation",
                     name,
-                    &bytes,
+                    path,
+                    metadata.len(),
                     mime_type.as_deref(),
                 ),
             )
@@ -1342,7 +1765,8 @@ async fn send_local_path(
                         "sendDocument",
                         "document",
                         name,
-                        &bytes,
+                        path,
+                        metadata.len(),
                         mime_type.as_deref(),
                     ),
                 )
@@ -1353,7 +1777,14 @@ async fn send_local_path(
                 client,
                 token,
                 chat_id,
-                OutboundUpload::new("sendPhoto", "photo", name, &bytes, mime_type.as_deref()),
+                OutboundUpload::new(
+                    "sendPhoto",
+                    "photo",
+                    name,
+                    path,
+                    metadata.len(),
+                    mime_type.as_deref(),
+                ),
             )
             .await?
                 || send_uploaded_file(
@@ -1364,7 +1795,8 @@ async fn send_local_path(
                         "sendDocument",
                         "document",
                         name,
-                        &bytes,
+                        path,
+                        metadata.len(),
                         mime_type.as_deref(),
                     ),
                 )
@@ -1375,7 +1807,14 @@ async fn send_local_path(
                 client,
                 token,
                 chat_id,
-                OutboundUpload::new("sendVideo", "video", name, &bytes, mime_type.as_deref()),
+                OutboundUpload::new(
+                    "sendVideo",
+                    "video",
+                    name,
+                    path,
+                    metadata.len(),
+                    mime_type.as_deref(),
+                ),
             )
             .await?
                 || send_uploaded_file(
@@ -1386,7 +1825,8 @@ async fn send_local_path(
                         "sendDocument",
                         "document",
                         name,
-                        &bytes,
+                        path,
+                        metadata.len(),
                         mime_type.as_deref(),
                     ),
                 )
@@ -1397,7 +1837,14 @@ async fn send_local_path(
                 client,
                 token,
                 chat_id,
-                OutboundUpload::new("sendVoice", "voice", name, &bytes, mime_type.as_deref()),
+                OutboundUpload::new(
+                    "sendVoice",
+                    "voice",
+                    name,
+                    path,
+                    metadata.len(),
+                    mime_type.as_deref(),
+                ),
             )
             .await?
                 || send_uploaded_file(
@@ -1408,7 +1855,8 @@ async fn send_local_path(
                         "sendDocument",
                         "document",
                         name,
-                        &bytes,
+                        path,
+                        metadata.len(),
                         mime_type.as_deref(),
                     ),
                 )
@@ -1419,7 +1867,14 @@ async fn send_local_path(
                 client,
                 token,
                 chat_id,
-                OutboundUpload::new("sendAudio", "audio", name, &bytes, mime_type.as_deref()),
+                OutboundUpload::new(
+                    "sendAudio",
+                    "audio",
+                    name,
+                    path,
+                    metadata.len(),
+                    mime_type.as_deref(),
+                ),
             )
             .await?
                 || send_uploaded_file(
@@ -1430,7 +1885,8 @@ async fn send_local_path(
                         "sendDocument",
                         "document",
                         name,
-                        &bytes,
+                        path,
+                        metadata.len(),
                         mime_type.as_deref(),
                     ),
                 )
@@ -1445,7 +1901,8 @@ async fn send_local_path(
                     "sendDocument",
                     "document",
                     name,
-                    &bytes,
+                    path,
+                    metadata.len(),
                     mime_type.as_deref(),
                 ),
             )
@@ -1462,18 +1919,7 @@ async fn send_uploaded_file(
     chat_id: i64,
     upload: OutboundUpload<'_>,
 ) -> KaiResult<bool> {
-    let part = match upload.mime_type {
-        Some(mime_type) => multipart::Part::bytes(upload.bytes.to_vec())
-            .file_name(upload.file_name.to_string())
-            .mime_str(mime_type)
-            .unwrap_or_else(|_| {
-                multipart::Part::bytes(upload.bytes.to_vec())
-                    .file_name(upload.file_name.to_string())
-            }),
-        None => {
-            multipart::Part::bytes(upload.bytes.to_vec()).file_name(upload.file_name.to_string())
-        }
-    };
+    let part = build_uploaded_part(&upload).await?;
 
     let form = multipart::Form::new()
         .text("chat_id", chat_id.to_string())
@@ -1501,11 +1947,39 @@ async fn send_uploaded_file(
     Ok(false)
 }
 
+async fn build_uploaded_part(upload: &OutboundUpload<'_>) -> KaiResult<multipart::Part> {
+    let open_body = || async {
+        File::open(upload.path).await.map_err(|error| {
+            KaiError::new(
+                ErrorCode::IoError,
+                format!("failed to open local file for Telegram delivery: {error}"),
+            )
+        })
+    };
+
+    let part = multipart::Part::stream_with_length(
+        reqwest::Body::wrap_stream(ReaderStream::new(open_body().await?)),
+        upload.bytes_len,
+    )
+    .file_name(upload.file_name.to_string());
+    match upload.mime_type {
+        Some(mime_type) => Ok(part.mime_str(mime_type).unwrap_or(
+            multipart::Part::stream_with_length(
+                reqwest::Body::wrap_stream(ReaderStream::new(open_body().await?)),
+                upload.bytes_len,
+            )
+            .file_name(upload.file_name.to_string()),
+        )),
+        None => Ok(part),
+    }
+}
+
 struct OutboundUpload<'a> {
     method: &'a str,
     field_name: &'a str,
     file_name: &'a str,
-    bytes: &'a [u8],
+    path: &'a Path,
+    bytes_len: u64,
     mime_type: Option<&'a str>,
 }
 
@@ -1514,14 +1988,16 @@ impl<'a> OutboundUpload<'a> {
         method: &'a str,
         field_name: &'a str,
         file_name: &'a str,
-        bytes: &'a [u8],
+        path: &'a Path,
+        bytes_len: u64,
         mime_type: Option<&'a str>,
     ) -> Self {
         Self {
             method,
             field_name,
             file_name,
-            bytes,
+            path,
+            bytes_len,
             mime_type,
         }
     }
@@ -1645,58 +2121,6 @@ fn floor_char_boundary(input: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
-}
-
-fn detect_sendable_response_paths(
-    config: &LoadedConfig,
-    _state: &StateStore,
-    text: &str,
-) -> KaiResult<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for candidate in extract_path_candidates(text) {
-        let Ok(path) = resolve_requested_path(config, &candidate) else {
-            continue;
-        };
-        if paths.iter().any(|existing: &PathBuf| existing == &path) {
-            continue;
-        }
-        paths.push(path);
-        if paths.len() >= MAX_OUTBOUND_ATTACHMENTS_PER_REPLY {
-            break;
-        }
-    }
-    Ok(paths)
-}
-
-fn extract_path_candidates(text: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-
-    for segment in text.split('`') {
-        let trimmed = segment.trim();
-        if looks_like_path_candidate(trimmed) {
-            candidates.push(trimmed.to_string());
-        }
-    }
-
-    for token in text.split_whitespace() {
-        let normalized = token
-            .trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '`' | '"' | '\'' | ',' | '.' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}'
-                )
-            })
-            .trim();
-        if looks_like_path_candidate(normalized) {
-            candidates.push(normalized.to_string());
-        }
-    }
-
-    candidates
-}
-
-fn looks_like_path_candidate(value: &str) -> bool {
-    (value.starts_with('/') || value.starts_with("~/")) && value.len() > 1
 }
 
 fn resolve_requested_path(config: &LoadedConfig, raw: &str) -> KaiResult<PathBuf> {
@@ -2143,6 +2567,28 @@ fn is_telegram_html_parse_error(description: &str) -> bool {
         || normalized.contains("can't find end tag")
 }
 
+fn should_retry_telegram_send(error: &KaiError) -> bool {
+    let mut haystacks = vec![error.message.to_ascii_lowercase()];
+    if let Some(hint) = &error.hint {
+        haystacks.push(hint.to_ascii_lowercase());
+    }
+
+    haystacks.iter().any(|value| {
+        value.contains("timeout")
+            || value.contains("timed out")
+            || value.contains("connection")
+            || value.contains("connect")
+            || value.contains("dns")
+            || value.contains("socket")
+            || value.contains("temporar")
+            || value.contains("too many requests")
+            || value.contains("429")
+            || value.contains("502")
+            || value.contains("503")
+            || value.contains("504")
+    })
+}
+
 fn format_telegram_html(input: &str) -> String {
     let mut output = String::new();
     let mut list_stack = Vec::new();
@@ -2301,20 +2747,6 @@ fn record_runtime_error(
     }))
 }
 
-fn run_attachment_cleanup(state: &StateStore) -> KaiResult<()> {
-    let result = state.cleanup_staged_attachments(ATTACHMENT_RETENTION)?;
-    if result.removed_partial_files > 0 || result.removed_stale_files > 0 {
-        state.append_audit_json(&serde_json::json!({
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "event": "telegram.attachment_cleanup",
-            "scannedFiles": result.scanned_files,
-            "removedPartialFiles": result.removed_partial_files,
-            "removedStaleFiles": result.removed_stale_files,
-        }))?;
-    }
-    Ok(())
-}
-
 enum UpdateFailureDisposition {
     Advance,
     Retry,
@@ -2395,13 +2827,13 @@ struct TelegramApiResponse<T> {
     description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramMessage {
     from: Option<TelegramUser>,
     chat: TelegramChat,
@@ -2417,19 +2849,19 @@ struct TelegramMessage {
     media_group_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramUser {
     id: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramChat {
     id: i64,
     #[serde(rename = "type")]
     kind: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramDocument {
     file_id: String,
     file_name: Option<String>,
@@ -2437,7 +2869,7 @@ struct TelegramDocument {
     file_size: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramPhotoSize {
     file_id: String,
     file_unique_id: String,
@@ -2446,7 +2878,7 @@ struct TelegramPhotoSize {
     file_size: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramAudio {
     file_id: String,
     file_name: Option<String>,
@@ -2455,7 +2887,7 @@ struct TelegramAudio {
     duration: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramVoice {
     file_id: String,
     file_unique_id: String,
@@ -2464,7 +2896,7 @@ struct TelegramVoice {
     duration: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramVideo {
     file_id: String,
     file_name: Option<String>,
@@ -2475,7 +2907,7 @@ struct TelegramVideo {
     height: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramVideoNote {
     file_id: String,
     file_unique_id: String,
@@ -2485,7 +2917,7 @@ struct TelegramVideoNote {
     height: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelegramAnimation {
     file_id: String,
     file_name: Option<String>,
@@ -2548,7 +2980,7 @@ impl ListKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        TELEGRAM_TEXT_LIMIT, extract_path_candidates, failure_notice_text, format_telegram_html,
+        TELEGRAM_TEXT_LIMIT, failure_notice_text, format_telegram_html, should_retry_telegram_send,
         should_skip_failed_update, split_response_text,
     };
     use crate::error::{ErrorCode, KaiError};
@@ -2618,15 +3050,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_path_candidates_prefers_absolute_and_home_paths() {
-        let input = "Created `/tmp/report.pdf` and ~/notes/todo.md but ignored relative/path.md";
-        let candidates = extract_path_candidates(input);
-        assert!(candidates.iter().any(|value| value == "/tmp/report.pdf"));
-        assert!(candidates.iter().any(|value| value == "~/notes/todo.md"));
-        assert!(!candidates.iter().any(|value| value == "relative/path.md"));
-    }
-
-    #[test]
     fn invalid_argument_updates_are_skipped_immediately() {
         let error = KaiError::invalid_argument("too many attachments");
         assert!(should_skip_failed_update(&error, 1));
@@ -2641,5 +3064,21 @@ mod tests {
         let error = KaiError::new(ErrorCode::RuntimeError, "temporary backend issue");
         assert!(!should_skip_failed_update(&error, 1));
         assert!(should_skip_failed_update(&error, 3));
+    }
+
+    #[test]
+    fn telegram_send_retry_classifier_matches_common_retryable_errors() {
+        let error = KaiError::new(
+            ErrorCode::RuntimeError,
+            "Telegram API returned 429 Too Many Requests",
+        );
+        assert!(should_retry_telegram_send(&error));
+        let error = KaiError::new(
+            ErrorCode::RuntimeError,
+            "failed to send Telegram message: connection reset by peer",
+        );
+        assert!(should_retry_telegram_send(&error));
+        let error = KaiError::new(ErrorCode::RuntimeError, "bot was blocked by the user");
+        assert!(!should_retry_telegram_send(&error));
     }
 }

@@ -174,6 +174,15 @@ pub struct AttachmentCleanupResult {
     pub removed_stale_files: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateCleanupResult {
+    pub removed_old_processed_updates: usize,
+    pub removed_old_update_failures: usize,
+    pub removed_old_turns: usize,
+    pub audit_compacted: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuditRecord<'a> {
@@ -200,6 +209,7 @@ impl StateStore {
         ensure_private_file(&paths.db_path)?;
         ensure_private_file(&paths.audit_path)?;
         initialize_schema(&connection)?;
+        migrate_pending_turn_queue_from_kv(&connection)?;
 
         Ok(Self { connection, paths })
     }
@@ -293,42 +303,125 @@ impl StateStore {
     }
 
     pub fn pending_turn_queue(&self) -> KaiResult<Vec<PendingTurn>> {
-        Ok(self
-            .get_json_value::<Vec<PendingTurn>>("telegram.pending_turn_queue")?
-            .unwrap_or_default())
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT payload_json
+                 FROM pending_turns
+                 ORDER BY sort_key ASC, rowid ASC",
+            )
+            .map_err(sql_state_error("prepare pending turn queue"))?;
+
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_state_error("query pending turn queue"))?;
+
+        let mut queue = Vec::new();
+        for row in rows {
+            let payload = row.map_err(sql_state_error("read pending turn queue row"))?;
+            let turn = serde_json::from_str::<PendingTurn>(&payload).map_err(|error| {
+                KaiError::new(
+                    ErrorCode::StateError,
+                    format!("failed to deserialize pending turn payload: {error}"),
+                )
+            })?;
+            queue.push(turn);
+        }
+        Ok(queue)
     }
 
     pub fn pending_turn_queue_len(&self) -> KaiResult<usize> {
-        Ok(self.pending_turn_queue()?.len())
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM pending_turns", [], |row| row.get(0))
+            .map_err(sql_state_error("count pending turns"))?;
+        Ok(count as usize)
     }
 
     pub fn enqueue_pending_turn(&self, turn: &PendingTurn) -> KaiResult<usize> {
-        let mut queue = self.pending_turn_queue()?;
-        queue.push(turn.clone());
-        self.set_json_value("telegram.pending_turn_queue", &queue)?;
-        Ok(queue.len())
+        let sort_key: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sort_key), 0) + 1 FROM pending_turns",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_state_error("compute pending turn enqueue key"))?;
+        self.insert_pending_turn(turn, sort_key)?;
+        self.pending_turn_queue_len()
     }
 
     pub fn prepend_pending_turn(&self, turn: &PendingTurn) -> KaiResult<usize> {
-        let mut queue = self.pending_turn_queue()?;
-        queue.insert(0, turn.clone());
-        self.set_json_value("telegram.pending_turn_queue", &queue)?;
-        Ok(queue.len())
+        let sort_key: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MIN(sort_key), 1) - 1 FROM pending_turns",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_state_error("compute pending turn prepend key"))?;
+        self.insert_pending_turn(turn, sort_key)?;
+        self.pending_turn_queue_len()
     }
 
     pub fn pop_pending_turn(&self) -> KaiResult<Option<PendingTurn>> {
-        let mut queue = self.pending_turn_queue()?;
-        if queue.is_empty() {
-            return Ok(None);
-        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT turn_id, payload_json
+                 FROM pending_turns
+                 ORDER BY sort_key ASC, rowid ASC
+                 LIMIT 1",
+            )
+            .map_err(sql_state_error("prepare pop pending turn"))?;
 
-        let next = queue.remove(0);
-        self.set_json_value("telegram.pending_turn_queue", &queue)?;
-        Ok(Some(next))
+        let next = statement
+            .query_row([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+            .map_err(sql_state_error("load next pending turn"))?;
+
+        let Some((turn_id, payload_json)) = next else {
+            return Ok(None);
+        };
+
+        self.connection
+            .execute("DELETE FROM pending_turns WHERE turn_id = ?1", [turn_id])
+            .map_err(sql_state_error("delete popped pending turn"))?;
+
+        let turn = serde_json::from_str::<PendingTurn>(&payload_json).map_err(|error| {
+            KaiError::new(
+                ErrorCode::StateError,
+                format!("failed to deserialize pending turn payload: {error}"),
+            )
+        })?;
+        Ok(Some(turn))
     }
 
     pub fn clear_pending_turn_queue(&self) -> KaiResult<()> {
+        self.connection
+            .execute("DELETE FROM pending_turns", [])
+            .map_err(sql_state_error("clear pending turn queue"))?;
         self.delete_value("telegram.pending_turn_queue")
+    }
+
+    pub fn load_json_state<T>(&self, key: &str) -> KaiResult<Option<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.get_json_value(key)
+    }
+
+    pub fn store_json_state<T>(&self, key: &str, value: &T) -> KaiResult<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        self.set_json_value(key, value)
+    }
+
+    pub fn remove_json_state(&self, key: &str) -> KaiResult<()> {
+        self.delete_value(key)
     }
 
     pub fn get_command_menu_hash(&self, chat_id: i64) -> KaiResult<Option<String>> {
@@ -521,6 +614,28 @@ impl StateStore {
         })
     }
 
+    pub fn cleanup_runtime_state(
+        &self,
+        processed_update_retention: Duration,
+        update_failure_retention: Duration,
+        max_turn_rows: usize,
+        max_audit_bytes: u64,
+    ) -> KaiResult<StateCleanupResult> {
+        let removed_old_processed_updates =
+            self.delete_old_processed_updates(processed_update_retention)?;
+        let removed_old_update_failures =
+            self.delete_old_update_failures(update_failure_retention)?;
+        let removed_old_turns = self.trim_turns(max_turn_rows)?;
+        let audit_compacted = self.compact_audit_log(max_audit_bytes)?;
+
+        Ok(StateCleanupResult {
+            removed_old_processed_updates,
+            removed_old_update_failures,
+            removed_old_turns,
+            audit_compacted,
+        })
+    }
+
     pub fn record_turn(&self, turn: NewTurn<'_>) -> KaiResult<TurnRecord> {
         let created_at = Utc::now().to_rfc3339();
         let attachments_json = serde_json::to_string(turn.attachments).map_err(|error| {
@@ -649,7 +764,7 @@ impl StateStore {
 
     fn set_json_value<T>(&self, key: &str, value: &T) -> KaiResult<()>
     where
-        T: Serialize,
+        T: Serialize + ?Sized,
     {
         let raw = serde_json::to_string(value).map_err(|error| {
             KaiError::new(
@@ -702,6 +817,118 @@ impl StateStore {
         file.write_all(b"\n").map_err(io_state_error("audit log"))?;
         Ok(())
     }
+
+    fn insert_pending_turn(&self, turn: &PendingTurn, sort_key: i64) -> KaiResult<()> {
+        let payload_json = serde_json::to_string(turn).map_err(|error| {
+            KaiError::new(
+                ErrorCode::StateError,
+                format!("failed to serialize pending turn payload: {error}"),
+            )
+        })?;
+        self.connection
+            .execute(
+                "INSERT INTO pending_turns (turn_id, sort_key, payload_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(turn_id) DO UPDATE
+                 SET sort_key = excluded.sort_key,
+                     payload_json = excluded.payload_json",
+                params![turn.id, sort_key, payload_json],
+            )
+            .map_err(sql_state_error("insert pending turn"))?;
+        Ok(())
+    }
+
+    fn delete_old_processed_updates(&self, retention: Duration) -> KaiResult<usize> {
+        let cutoff = (Utc::now()
+            - ChronoDuration::from_std(retention).map_err(|error| {
+                KaiError::new(
+                    ErrorCode::StateError,
+                    format!("failed to derive processed update retention cutoff: {error}"),
+                )
+            })?)
+        .to_rfc3339();
+
+        self.connection
+            .execute(
+                "DELETE FROM processed_updates WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(sql_state_error("delete old processed updates"))
+    }
+
+    fn delete_old_update_failures(&self, retention: Duration) -> KaiResult<usize> {
+        let cutoff = (Utc::now()
+            - ChronoDuration::from_std(retention).map_err(|error| {
+                KaiError::new(
+                    ErrorCode::StateError,
+                    format!("failed to derive update failure retention cutoff: {error}"),
+                )
+            })?)
+        .to_rfc3339();
+
+        self.connection
+            .execute(
+                "DELETE FROM update_failures WHERE updated_at < ?1",
+                params![cutoff],
+            )
+            .map_err(sql_state_error("delete old update failures"))
+    }
+
+    fn trim_turns(&self, max_rows: usize) -> KaiResult<usize> {
+        let total_rows: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM turns", [], |row| row.get(0))
+            .map_err(sql_state_error("count turns"))?;
+        if total_rows <= max_rows as i64 {
+            return Ok(0);
+        }
+
+        let overflow = total_rows - max_rows as i64;
+        self.connection
+            .execute(
+                "DELETE FROM turns
+                 WHERE id IN (
+                    SELECT id FROM turns
+                    ORDER BY id ASC
+                    LIMIT ?1
+                 )",
+                params![overflow],
+            )
+            .map_err(sql_state_error("trim old turns"))
+    }
+
+    fn compact_audit_log(&self, max_bytes: u64) -> KaiResult<bool> {
+        let path = &self.paths.audit_path;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_state_error("inspect audit log")(error)),
+        };
+
+        if metadata.len() <= max_bytes {
+            return Ok(false);
+        }
+
+        let raw = fs::read_to_string(path).map_err(io_state_error("read audit log"))?;
+        let mut bytes = 0_u64;
+        let mut kept = Vec::new();
+        for line in raw.lines().rev() {
+            let line_bytes = line.len() as u64 + 1;
+            if !kept.is_empty() && bytes + line_bytes > max_bytes {
+                break;
+            }
+            bytes += line_bytes;
+            kept.push(line.to_string());
+        }
+        kept.reverse();
+        let mut output = kept.join("\n");
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        fs::write(path, output).map_err(io_state_error("rewrite compacted audit log"))?;
+        ensure_private_file(path)?;
+        Ok(true)
+    }
 }
 
 impl PendingPairing {
@@ -751,13 +978,18 @@ fn initialize_schema(connection: &Connection) -> KaiResult<()> {
     connection
         .execute_batch(
             "
-			CREATE TABLE IF NOT EXISTS kv (
-				key TEXT PRIMARY KEY,
-				value TEXT NOT NULL
-			);
-				CREATE TABLE IF NOT EXISTS turns (
-					id INTEGER PRIMARY KEY AUTOINCREMENT,
-					created_at TEXT NOT NULL,
+				CREATE TABLE IF NOT EXISTS kv (
+					key TEXT PRIMARY KEY,
+					value TEXT NOT NULL
+				);
+				CREATE TABLE IF NOT EXISTS pending_turns (
+					turn_id TEXT PRIMARY KEY,
+					sort_key INTEGER NOT NULL,
+					payload_json TEXT NOT NULL
+				);
+					CREATE TABLE IF NOT EXISTS turns (
+						id INTEGER PRIMARY KEY AUTOINCREMENT,
+						created_at TEXT NOT NULL,
 				role TEXT NOT NULL,
 				channel TEXT NOT NULL,
 				sender_id INTEGER,
@@ -784,6 +1016,59 @@ fn initialize_schema(connection: &Connection) -> KaiResult<()> {
         )
         .map_err(sql_state_error("initialize schema"))?;
 
+    Ok(())
+}
+
+fn migrate_pending_turn_queue_from_kv(connection: &Connection) -> KaiResult<()> {
+    let existing_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pending_turns", [], |row| row.get(0))
+        .map_err(sql_state_error("count pending turns during migration"))?;
+    if existing_count > 0 {
+        return Ok(());
+    }
+
+    let legacy_queue = connection
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'telegram.pending_turn_queue'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_state_error("load legacy pending turn queue"))?;
+
+    let Some(raw_queue) = legacy_queue else {
+        return Ok(());
+    };
+
+    let queue = serde_json::from_str::<Vec<PendingTurn>>(&raw_queue).map_err(|error| {
+        KaiError::new(
+            ErrorCode::StateError,
+            format!("failed to deserialize legacy pending turn queue: {error}"),
+        )
+    })?;
+
+    for (index, turn) in queue.iter().enumerate() {
+        let payload_json = serde_json::to_string(turn).map_err(|error| {
+            KaiError::new(
+                ErrorCode::StateError,
+                format!("failed to serialize migrated pending turn payload: {error}"),
+            )
+        })?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO pending_turns (turn_id, sort_key, payload_json)
+                 VALUES (?1, ?2, ?3)",
+                params![turn.id, index as i64 + 1, payload_json],
+            )
+            .map_err(sql_state_error("migrate pending turn queue"))?;
+    }
+
+    connection
+        .execute(
+            "DELETE FROM kv WHERE key = 'telegram.pending_turn_queue'",
+            [],
+        )
+        .map_err(sql_state_error("delete legacy pending turn queue"))?;
     Ok(())
 }
 
@@ -1007,5 +1292,73 @@ mod tests {
         assert!(!partial.exists());
         assert!(!stale.exists());
         assert!(fresh.exists());
+    }
+
+    #[test]
+    fn cleanup_runtime_state_prunes_old_rows_and_compacts_audit() {
+        let tempdir = tempdir().expect("tempdir");
+        let root_app = tempdir.path().join("kai-home");
+        let root_work = tempdir.path().join("work");
+        let config = test_config(&root_app, &root_work);
+
+        let store = StateStore::open(&config).expect("state store");
+        store
+            .connection
+            .execute(
+                "INSERT INTO processed_updates (update_id, created_at, response_text, codex_session_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![1_i64, "2000-01-01T00:00:00Z", "old", Option::<String>::None],
+            )
+            .expect("insert old processed update");
+        store
+            .connection
+            .execute(
+                "INSERT INTO update_failures (update_id, created_at, updated_at, attempt_count, last_error_code, last_message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    7_i64,
+                    "2000-01-01T00:00:00Z",
+                    "2000-01-01T00:00:00Z",
+                    1_i64,
+                    "runtime_error",
+                    "old failure"
+                ],
+            )
+            .expect("insert old update failure");
+
+        for index in 0..4 {
+            store
+                .record_turn(NewTurn {
+                    role: "user",
+                    channel: "telegram",
+                    sender_id: Some(1),
+                    text: &format!("turn-{index}"),
+                    codex_session_id: None,
+                    outcome_status: Some("received"),
+                    attachments: &[],
+                })
+                .expect("record turn");
+        }
+
+        fs::write(
+            store.paths().audit_path.clone(),
+            "line-1\nline-2\nline-3\nline-4\nline-5\n",
+        )
+        .expect("write audit log");
+
+        let result = store
+            .cleanup_runtime_state(Duration::from_secs(1), Duration::from_secs(1), 2, 18)
+            .expect("cleanup runtime state");
+        assert_eq!(result.removed_old_processed_updates, 1);
+        assert_eq!(result.removed_old_update_failures, 1);
+        assert_eq!(result.removed_old_turns, 2);
+        assert!(result.audit_compacted);
+        assert!(
+            store
+                .get_processed_update(1)
+                .expect("processed update lookup")
+                .is_none()
+        );
+        assert!(store.recent_turns(10).expect("recent turns").len() <= 2);
     }
 }
