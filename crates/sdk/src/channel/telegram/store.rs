@@ -142,6 +142,7 @@ pub(super) fn enqueue_pending_reply_delivery(
     delivery: PendingReplyDelivery,
 ) -> KaiResult<()> {
     let mut deliveries = pending_reply_deliveries(state)?;
+    deliveries.retain(|existing| existing.turn_id != delivery.turn_id);
     deliveries.push(delivery);
     store_pending_reply_deliveries(state, &deliveries)
 }

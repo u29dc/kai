@@ -98,8 +98,17 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
                 .unwrap_or_else(|| "unpaired".to_string())
         ),
         format!("update_offset: {}", session.update_offset),
-        format!("queued_turns: {}", state.pending_turn_queue_len()?),
+        format!("queued_turns: {}", session.queued_turns),
+        format!("queue_limit: {}", session.queue_limit),
+        format!(
+            "pending_reply_deliveries: {}",
+            session.pending_reply_deliveries
+        ),
     ];
+
+    if let Some(active_turn) = session.active_turn {
+        lines.push(format!("active_turn: {}", active_turn.id));
+    }
 
     if let Some(pairing) = session.pending_pairing {
         lines.push(format!(

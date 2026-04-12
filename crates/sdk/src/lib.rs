@@ -6,6 +6,7 @@ pub mod contract;
 pub mod error;
 pub mod health;
 pub mod media;
+pub mod redaction;
 pub mod runtime;
 pub mod runtime_fs;
 pub mod secrets;
@@ -24,8 +25,8 @@ pub use context::{
 };
 pub use contract::{
     ConfigGetOutput, ConfigShowOutput, GlobalFlag, HealthCheck, HealthReport, Meta, OkEnvelope,
-    SessionView, SetupCodexOutput, SetupOutput, ToolCatalog, ToolParameter, ToolSpec,
-    error_envelope, ok_envelope, tool_catalog, tool_spec,
+    PendingTurnView, SessionView, SetupCodexOutput, SetupOutput, ToolCatalog, ToolParameter,
+    ToolSpec, error_envelope, ok_envelope, tool_catalog, tool_spec,
 };
 pub use error::{ErrorCode, KaiError, KaiResult};
 pub use health::health_report;
@@ -35,6 +36,7 @@ pub use media::{
     TranscriptSegment, TranscriptionProviderStatus, attachment_byte_limit, classify_document_kind,
     enrich_attachment, transcription_provider_status,
 };
+pub use redaction::{redact_json_value, redact_optional_text, redact_text};
 pub use runtime::codex::{CodexTurnResult, run_codex_turn};
 pub use runtime_fs::{
     ensure_private_dir, ensure_private_file, harden_private_executable, harden_private_file,
@@ -54,4 +56,4 @@ pub use service::{
     acquire_run_guard, run_lock_status, service_logs, service_restart, service_start,
     service_status, service_stop, service_uninstall,
 };
-pub use state::{AttachmentInfo, StatePaths, StateStore, TurnRecord};
+pub use state::{AttachmentInfo, MAX_PENDING_TURNS, StatePaths, StateStore, TurnRecord};

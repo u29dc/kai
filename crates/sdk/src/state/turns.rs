@@ -95,7 +95,9 @@ impl StateStore {
     }
 
     pub fn append_audit_json(&self, value: &JsonValue) -> KaiResult<()> {
-        let serialized = serde_json::to_string(value).map_err(|error| {
+        let mut redacted = value.clone();
+        redact_json_value(&mut redacted);
+        let serialized = serde_json::to_string(&redacted).map_err(|error| {
             KaiError::new(
                 ErrorCode::StateError,
                 format!("failed to serialize audit payload: {error}"),
@@ -108,7 +110,14 @@ impl StateStore {
     where
         T: Serialize,
     {
-        let serialized = serde_json::to_string(value).map_err(|error| {
+        let mut json = serde_json::to_value(value).map_err(|error| {
+            KaiError::new(
+                ErrorCode::StateError,
+                format!("failed to convert audit record to json: {error}"),
+            )
+        })?;
+        redact_json_value(&mut json);
+        let serialized = serde_json::to_string(&json).map_err(|error| {
             KaiError::new(
                 ErrorCode::StateError,
                 format!("failed to serialize audit record: {error}"),

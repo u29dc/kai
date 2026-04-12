@@ -55,19 +55,6 @@ pub(super) struct PersistedBufferedTextFragments {
     pub(super) messages: Vec<TelegramMessage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct PendingReplyDelivery {
-    pub(super) delivery_id: String,
-    pub(super) turn_id: String,
-    pub(super) chat_id: i64,
-    pub(super) response_text: String,
-    pub(super) codex_session_id: String,
-    pub(super) update_ids: Vec<i64>,
-    pub(super) attempts: u32,
-    pub(super) created_at: String,
-}
-
 #[derive(Debug)]
 pub(super) enum MobileCommand {
     Help,

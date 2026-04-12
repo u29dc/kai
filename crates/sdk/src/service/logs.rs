@@ -1,4 +1,5 @@
 use super::*;
+use crate::redaction::redact_text;
 
 pub fn service_logs(config: &LoadedConfig, tail: usize) -> KaiResult<ServiceLogsOutput> {
     let status = launchd::service_status(config)?;
@@ -52,5 +53,5 @@ fn read_tail_lines(path: &Path, tail: usize) -> KaiResult<Vec<String>> {
     if lines.len() > tail {
         lines.drain(0..(lines.len() - tail));
     }
-    Ok(lines)
+    Ok(lines.into_iter().map(|line| redact_text(&line)).collect())
 }

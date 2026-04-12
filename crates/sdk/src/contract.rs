@@ -159,12 +159,29 @@ pub struct PendingPairingView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingTurnView {
+    pub id: String,
+    pub enqueued_at: String,
+    pub chat_id: i64,
+    pub sender_id: i64,
+    pub update_count: usize,
+    pub attachment_count: usize,
+    pub text_excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionView {
     pub owner_user_id: Option<i64>,
     pub owner_chat_id: Option<i64>,
     pub active_session_id: Option<String>,
     pub pending_pairing: Option<PendingPairingView>,
     pub update_offset: i64,
+    pub queue_limit: usize,
+    pub queued_turns: usize,
+    pub queued_preview: Vec<PendingTurnView>,
+    pub active_turn: Option<PendingTurnView>,
+    pub pending_reply_deliveries: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

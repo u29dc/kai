@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn split_response_text(text: &str) -> Vec<String> {
-    if text.chars().count() <= TELEGRAM_TEXT_LIMIT {
+    if telegram_rendered_len(text) <= TELEGRAM_TEXT_LIMIT {
         return vec![text.to_string()];
     }
 
@@ -9,16 +9,12 @@ pub(super) fn split_response_text(text: &str) -> Vec<String> {
     let mut remaining = text.to_string();
 
     while !remaining.is_empty() {
-        if remaining.chars().count() <= TELEGRAM_TEXT_LIMIT {
+        if telegram_rendered_len(&remaining) <= TELEGRAM_TEXT_LIMIT {
             chunks.push(remaining);
             break;
         }
 
-        let boundary = floor_char_boundary(&remaining, TELEGRAM_TEXT_LIMIT.min(remaining.len()));
-        let split_at = remaining[..boundary]
-            .rfind('\n')
-            .filter(|index| *index > 0)
-            .unwrap_or(boundary);
+        let split_at = find_split_index(&remaining);
 
         let mut chunk = remaining[..split_at].to_string();
         let mut next_remaining = remaining[split_at..].to_string();
@@ -43,6 +39,32 @@ pub(super) fn split_response_text(text: &str) -> Vec<String> {
     }
 
     chunks
+}
+
+fn find_split_index(remaining: &str) -> usize {
+    let mut best_newline = 0_usize;
+    let mut best_end = 0_usize;
+    for (index, ch) in remaining.char_indices() {
+        let end = index + ch.len_utf8();
+        if telegram_rendered_len(&remaining[..end]) > TELEGRAM_TEXT_LIMIT {
+            break;
+        }
+        best_end = end;
+        if ch == '\n' && index > 0 {
+            best_newline = index;
+        }
+    }
+    if best_newline > 0 {
+        best_newline
+    } else if best_end > 0 {
+        best_end
+    } else {
+        floor_char_boundary(remaining, TELEGRAM_TEXT_LIMIT.min(remaining.len()))
+    }
+}
+
+fn telegram_rendered_len(text: &str) -> usize {
+    format_telegram_html(text).chars().count()
 }
 
 fn floor_char_boundary(input: &str, mut index: usize) -> usize {

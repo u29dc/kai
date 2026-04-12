@@ -1,6 +1,6 @@
 use super::{
     TELEGRAM_TEXT_LIMIT, failure_notice_text, format_telegram_html, should_retry_telegram_send,
-    should_skip_failed_update, split_response_text,
+    should_skip_failed_update, split_response_text, stable_pending_turn_id,
 };
 use crate::error::{ErrorCode, KaiError};
 
@@ -46,7 +46,7 @@ fn split_response_text_splits_long_messages() {
     assert!(
         chunks
             .iter()
-            .all(|chunk| chunk.chars().count() <= TELEGRAM_TEXT_LIMIT)
+            .all(|chunk| format_telegram_html(chunk).chars().count() <= TELEGRAM_TEXT_LIMIT)
     );
 }
 
@@ -66,6 +66,28 @@ fn split_response_text_balances_fenced_code_blocks() {
             .count();
         assert_eq!(fences % 2, 0);
     }
+}
+
+#[test]
+fn split_response_text_respects_rendered_html_limit() {
+    let input = "<".repeat(TELEGRAM_TEXT_LIMIT / 2);
+    let chunks = split_response_text(&input);
+    assert!(chunks.len() >= 2);
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| format_telegram_html(chunk).chars().count() <= TELEGRAM_TEXT_LIMIT)
+    );
+}
+
+#[test]
+fn stable_pending_turn_id_is_deterministic_and_order_sensitive() {
+    let first = stable_pending_turn_id("telegram", 1, 2, &[100, 101, 102]);
+    let second = stable_pending_turn_id("telegram", 1, 2, &[100, 101, 102]);
+    let reordered = stable_pending_turn_id("telegram", 1, 2, &[102, 101, 100]);
+
+    assert_eq!(first, second);
+    assert_ne!(first, reordered);
 }
 
 #[test]

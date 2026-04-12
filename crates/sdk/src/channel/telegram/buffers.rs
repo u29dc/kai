@@ -166,7 +166,12 @@ pub(super) async fn process_buffered_text_fragments(
         state,
         active_turn,
         PendingTurn {
-            id: Uuid::new_v4().to_string(),
+            id: stable_pending_turn_id(
+                "telegram",
+                validated.chat_id,
+                validated.sender_id,
+                &entry.update_ids,
+            ),
             enqueued_at: chrono::Utc::now().to_rfc3339(),
             channel: "telegram".to_string(),
             update_ids: entry.update_ids.clone(),
@@ -325,7 +330,12 @@ async fn process_buffered_media_group(
         state,
         active_turn,
         PendingTurn {
-            id: Uuid::new_v4().to_string(),
+            id: stable_pending_turn_id(
+                "telegram",
+                validated.chat_id,
+                validated.sender_id,
+                &entry.update_ids,
+            ),
             enqueued_at: chrono::Utc::now().to_rfc3339(),
             channel: "telegram".to_string(),
             update_ids: entry.update_ids.clone(),

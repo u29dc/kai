@@ -10,8 +10,9 @@ use serde_json::Value as JsonValue;
 
 use crate::config::LoadedConfig;
 use crate::context::ContextSnapshot;
-use crate::contract::PendingPairingView;
+use crate::contract::{PendingPairingView, PendingTurnView, SessionView};
 use crate::error::{ErrorCode, KaiError, KaiResult};
+use crate::redaction::{redact_json_value, redact_text};
 use crate::runtime_fs::{ensure_private_dir, ensure_private_file};
 
 mod cleanup;
@@ -23,6 +24,10 @@ mod tests;
 mod turns;
 
 use self::schema::{initialize_schema, migrate_pending_turn_queue_from_kv};
+
+pub const MAX_PENDING_TURNS: usize = 24;
+const ACTIVE_TURN_STATE_KEY: &str = "telegram.active_turn";
+const PENDING_REPLY_DELIVERIES_STATE_KEY: &str = "telegram.pending_reply_deliveries";
 
 #[derive(Debug, Clone)]
 pub struct StatePaths {
@@ -149,6 +154,19 @@ pub struct PendingTurn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingReplyDelivery {
+    pub delivery_id: String,
+    pub turn_id: String,
+    pub chat_id: i64,
+    pub response_text: String,
+    pub codex_session_id: String,
+    pub update_ids: Vec<i64>,
+    pub attempts: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcessedUpdate {
     pub update_id: i64,
     pub created_at: String,
@@ -228,13 +246,20 @@ impl StateStore {
         &self.paths
     }
 
-    pub fn session_view(&self) -> KaiResult<crate::contract::SessionView> {
-        Ok(crate::contract::SessionView {
+    pub fn session_view(&self) -> KaiResult<SessionView> {
+        Ok(SessionView {
             owner_user_id: self.get_owner_user_id()?,
             owner_chat_id: self.get_owner_chat_id()?,
             active_session_id: self.get_active_session_id()?,
             pending_pairing: self.pending_pairing_view()?,
             update_offset: self.get_update_offset()?,
+            queue_limit: MAX_PENDING_TURNS,
+            queued_turns: self.pending_turn_queue_len()?,
+            queued_preview: self.pending_turn_preview(5)?,
+            active_turn: self
+                .get_active_pending_turn()?
+                .map(|turn| pending_turn_view(&turn)),
+            pending_reply_deliveries: self.pending_reply_delivery_count()?,
         })
     }
 }
@@ -279,6 +304,29 @@ pub fn state_paths(config: &LoadedConfig) -> StatePaths {
         state_dir: state_dir.clone(),
         db_path: state_dir.join("kai.sqlite"),
         audit_path: logs_dir.join("turns.jsonl"),
+    }
+}
+
+fn pending_turn_view(turn: &PendingTurn) -> PendingTurnView {
+    PendingTurnView {
+        id: turn.id.clone(),
+        enqueued_at: turn.enqueued_at.clone(),
+        chat_id: turn.chat_id,
+        sender_id: turn.sender_id,
+        update_count: turn.update_ids.len(),
+        attachment_count: turn.attachments.len(),
+        text_excerpt: truncate_turn_text(&turn.text),
+    }
+}
+
+fn truncate_turn_text(input: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut chars = input.chars();
+    let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 

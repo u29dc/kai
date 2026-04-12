@@ -38,7 +38,12 @@ pub(super) async fn handle_message(
         state,
         active_turn,
         PendingTurn {
-            id: Uuid::new_v4().to_string(),
+            id: stable_pending_turn_id(
+                "telegram",
+                validated.chat_id,
+                validated.sender_id,
+                &[update_id],
+            ),
             enqueued_at: chrono::Utc::now().to_rfc3339(),
             channel: "telegram".to_string(),
             update_ids: vec![update_id],

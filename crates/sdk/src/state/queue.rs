@@ -1,6 +1,26 @@
 use super::*;
 
 impl StateStore {
+    pub fn pending_turn_preview(&self, limit: usize) -> KaiResult<Vec<PendingTurnView>> {
+        Ok(self
+            .pending_turn_queue()?
+            .into_iter()
+            .take(limit)
+            .map(|turn| pending_turn_view(&turn))
+            .collect())
+    }
+
+    pub fn get_active_pending_turn(&self) -> KaiResult<Option<PendingTurn>> {
+        self.load_json_state(ACTIVE_TURN_STATE_KEY)
+    }
+
+    pub fn pending_reply_delivery_count(&self) -> KaiResult<usize> {
+        Ok(self
+            .load_json_state::<Vec<PendingReplyDelivery>>(PENDING_REPLY_DELIVERIES_STATE_KEY)?
+            .unwrap_or_default()
+            .len())
+    }
+
     pub fn pending_turn_queue(&self) -> KaiResult<Vec<PendingTurn>> {
         let mut statement = self
             .connection
@@ -38,6 +58,16 @@ impl StateStore {
     }
 
     pub fn enqueue_pending_turn(&self, turn: &PendingTurn) -> KaiResult<usize> {
+        if !self.pending_turn_exists(&turn.id)?
+            && self.pending_turn_queue_len()? >= MAX_PENDING_TURNS
+        {
+            return Err(KaiError::blocked_prerequisite(format!(
+                "pending turn queue is full (limit: {MAX_PENDING_TURNS})"
+            ))
+            .with_hint(
+                "wait for the queue to drain or cancel the running turn before adding more",
+            ));
+        }
         let sort_key: i64 = self
             .connection
             .query_row(
@@ -51,6 +81,16 @@ impl StateStore {
     }
 
     pub fn prepend_pending_turn(&self, turn: &PendingTurn) -> KaiResult<usize> {
+        if !self.pending_turn_exists(&turn.id)?
+            && self.pending_turn_queue_len()? >= MAX_PENDING_TURNS
+        {
+            return Err(KaiError::blocked_prerequisite(format!(
+                "pending turn queue is full (limit: {MAX_PENDING_TURNS})"
+            ))
+            .with_hint(
+                "wait for the queue to drain or cancel the running turn before adding more",
+            ));
+        }
         let sort_key: i64 = self
             .connection
             .query_row(
@@ -188,6 +228,7 @@ impl StateStore {
             .unwrap_or_else(|_| "\"runtime_error\"".to_string())
             .trim_matches('"')
             .to_string();
+        let last_message = redact_text(&error.message);
 
         self.connection
             .execute(
@@ -205,7 +246,7 @@ impl StateStore {
                     now,
                     attempt_count,
                     last_error_code,
-                    error.message
+                    last_message
                 ],
             )
             .map_err(sql_state_error("write update failure"))?;
@@ -246,5 +287,18 @@ impl StateStore {
             )
             .map_err(sql_state_error("insert pending turn"))?;
         Ok(())
+    }
+
+    fn pending_turn_exists(&self, turn_id: &str) -> KaiResult<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM pending_turns WHERE turn_id = ?1 LIMIT 1",
+                [turn_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sql_state_error("check pending turn existence"))?
+            .is_some())
     }
 }

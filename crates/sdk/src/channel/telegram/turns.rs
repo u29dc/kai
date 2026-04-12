@@ -1,5 +1,25 @@
 use super::*;
 
+pub(super) fn stable_pending_turn_id(
+    channel: &str,
+    chat_id: i64,
+    sender_id: i64,
+    update_ids: &[i64],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(channel.as_bytes());
+    hasher.update(b":");
+    hasher.update(chat_id.to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(sender_id.to_string().as_bytes());
+    hasher.update(b":");
+    for update_id in update_ids {
+        hasher.update(update_id.to_string().as_bytes());
+        hasher.update(b",");
+    }
+    format!("turn-{}", hasher.finalize().to_hex())
+}
+
 pub(super) async fn enqueue_owner_turn(
     client: &Client,
     token: &str,

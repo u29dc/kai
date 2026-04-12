@@ -172,6 +172,123 @@ fn pending_turn_queue_round_trips_and_preserves_order() {
 }
 
 #[test]
+fn pending_turn_queue_rejects_new_turns_past_limit() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    for index in 0..MAX_PENDING_TURNS {
+        store
+            .enqueue_pending_turn(&PendingTurn {
+                id: format!("turn-{index}"),
+                enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+                channel: "telegram".to_string(),
+                update_ids: vec![index as i64],
+                chat_id: 1,
+                sender_id: 7,
+                text: format!("turn {index}"),
+                attachments: Vec::new(),
+            })
+            .expect("enqueue turn");
+    }
+
+    let error = store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "overflow".to_string(),
+            enqueued_at: "2026-04-12T00:30:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![999],
+            chat_id: 1,
+            sender_id: 7,
+            text: "overflow".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect_err("queue must reject overflow");
+
+    assert!(matches!(error.code, ErrorCode::BlockedPrerequisite));
+}
+
+#[test]
+fn pending_turn_queue_replaces_duplicate_turn_id_without_growth() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-1".to_string(),
+            enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![1],
+            chat_id: 1,
+            sender_id: 7,
+            text: "first".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("enqueue first");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-1".to_string(),
+            enqueued_at: "2026-04-12T00:05:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![2],
+            chat_id: 1,
+            sender_id: 7,
+            text: "replacement".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("replace duplicate");
+
+    assert_eq!(store.pending_turn_queue_len().expect("queue length"), 1);
+    let turn = store
+        .pop_pending_turn()
+        .expect("pop turn")
+        .expect("queued turn");
+    assert_eq!(turn.update_ids, vec![2]);
+    assert_eq!(turn.text, "replacement");
+}
+
+#[test]
+fn session_view_includes_queue_metadata() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .set_owner_user_id(1000000001)
+        .expect("set owner user id");
+    store
+        .set_owner_chat_id(1000000001)
+        .expect("set owner chat id");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-1".to_string(),
+            enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![1, 2],
+            chat_id: 1000000001,
+            sender_id: 1000000001,
+            text: "hello from queue".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("enqueue turn");
+
+    let session = store.session_view().expect("session view");
+    assert_eq!(session.queue_limit, MAX_PENDING_TURNS);
+    assert_eq!(session.queued_turns, 1);
+    assert_eq!(session.pending_reply_deliveries, 0);
+    assert_eq!(session.queued_preview.len(), 1);
+    assert_eq!(session.queued_preview[0].id, "turn-1");
+    assert_eq!(session.queued_preview[0].update_count, 2);
+}
+
+#[test]
 fn cleanup_staged_attachments_removes_partial_and_stale_files() {
     let tempdir = tempdir().expect("tempdir");
     let root_app = tempdir.path().join("kai-home");
@@ -266,4 +383,28 @@ fn cleanup_runtime_state_prunes_old_rows_and_compacts_audit() {
             .is_none()
     );
     assert!(store.recent_turns(10).expect("recent turns").len() <= 2);
+}
+
+#[test]
+fn audit_log_redacts_secret_like_strings() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .append_audit_json(&serde_json::json!({
+            "event": "test",
+            "message": "Authorization: Bearer secret-value",
+            "token": "[REDACTED-TELEGRAM-TOKEN]",
+            "url": "https://example.com?api_key=gsk_secret",
+        }))
+        .expect("append audit");
+
+    let raw = fs::read_to_string(store.paths().audit_path.clone()).expect("read audit");
+    assert!(raw.contains("[REDACTED]"));
+    assert!(!raw.contains("AAFbluiDk8KPd83dPhcNdXr0XbHbJali72A"));
+    assert!(!raw.contains("Bearer secret-value"));
+    assert!(!raw.contains("api_key=gsk_secret"));
 }

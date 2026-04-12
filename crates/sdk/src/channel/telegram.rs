@@ -24,7 +24,7 @@ use crate::runtime::codex::{
     create_replay_package, poll_running_codex_turn, prepare_codex_turn, start_codex_turn,
 };
 use crate::secrets::resolve_telegram_token;
-use crate::state::{AttachmentInfo, NewTurn, PendingTurn, StateStore};
+use crate::state::{AttachmentInfo, NewTurn, PendingReplyDelivery, PendingTurn, StateStore};
 
 mod api;
 mod attachments;
