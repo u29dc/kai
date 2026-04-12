@@ -1,0 +1,269 @@
+use std::fs;
+
+use tempfile::tempdir;
+
+use super::*;
+use crate::config::{
+    AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
+    PathsConfig, RunnerConfig, TelegramConfig, TranscriptionConfig,
+};
+
+fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
+    LoadedConfig {
+        config_path: root_app.join("config.toml"),
+        config_exists: false,
+        values: Config {
+            agent: AgentConfig {
+                timezone: "Europe/London".to_string(),
+            },
+            channel: ChannelConfig {
+                telegram: TelegramConfig {
+                    enabled: true,
+                    bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
+                    owner_user_id: None,
+                },
+            },
+            media: MediaConfig {
+                transcription: TranscriptionConfig {
+                    provider: "groq".to_string(),
+                    groq_api_key_env: "GROQ_API_KEY".to_string(),
+                    groq_model: "whisper-large-v3-turbo".to_string(),
+                    command: None,
+                },
+            },
+            paths: PathsConfig {
+                root_app: root_app.display().to_string(),
+                root_work: root_work.display().to_string(),
+            },
+            runner: RunnerConfig {
+                codex: CodexConfig {
+                    binary: "codex".to_string(),
+                    override_config: None,
+                },
+            },
+            context_files: ContextFilesConfig {
+                soul: root_app.join("SOUL.md").display().to_string(),
+                memory: root_app.join("MEMORY.md").display().to_string(),
+                todo: root_app.join("TODO.md").display().to_string(),
+            },
+        },
+    }
+}
+
+#[test]
+fn state_round_trips_pending_pairing() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .set_pending_pairing(&PendingPairing::issue("ABC12345", 10, 5))
+        .expect("set pending pairing");
+
+    let pairing = store
+        .get_pending_pairing()
+        .expect("load pending pairing")
+        .expect("pairing exists");
+    assert_eq!(pairing.remaining_attempts, 5);
+    assert!(pairing.verify("ABC12345"));
+}
+
+#[test]
+fn processed_update_round_trips() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .set_processed_update(42, "cached reply", Some("session-1"))
+        .expect("set processed update");
+
+    let processed = store
+        .get_processed_update(42)
+        .expect("load processed update")
+        .expect("processed update must exist");
+    assert_eq!(processed.update_id, 42);
+    assert_eq!(processed.response_text, "cached reply");
+    assert_eq!(processed.codex_session_id.as_deref(), Some("session-1"));
+}
+
+#[test]
+fn update_failure_round_trips_and_clears() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    let first = store
+        .record_update_failure(77, &KaiError::invalid_argument("bad attachment"))
+        .expect("record first failure");
+    assert_eq!(first.attempt_count, 1);
+    assert_eq!(first.last_error_code, "invalid_argument");
+
+    let second = store
+        .record_update_failure(
+            77,
+            &KaiError::new(ErrorCode::RuntimeError, "temporary backend issue"),
+        )
+        .expect("record second failure");
+    assert_eq!(second.attempt_count, 2);
+    assert_eq!(second.last_error_code, "runtime_error");
+
+    store.clear_update_failure(77).expect("clear failure");
+    assert!(
+        store
+            .get_update_failure(77)
+            .expect("load failure")
+            .is_none()
+    );
+}
+
+#[test]
+fn pending_turn_queue_round_trips_and_preserves_order() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-1".to_string(),
+            enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![1],
+            chat_id: 1,
+            sender_id: 7,
+            text: "first".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("enqueue first");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-2".to_string(),
+            enqueued_at: "2026-04-12T00:01:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![2],
+            chat_id: 1,
+            sender_id: 7,
+            text: "second".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("enqueue second");
+
+    assert_eq!(store.pending_turn_queue_len().expect("queue length"), 2);
+    let first = store
+        .pop_pending_turn()
+        .expect("pop first")
+        .expect("first turn");
+    let second = store
+        .pop_pending_turn()
+        .expect("pop second")
+        .expect("second turn");
+
+    assert_eq!(first.id, "turn-1");
+    assert_eq!(second.id, "turn-2");
+    assert!(store.pop_pending_turn().expect("pop empty").is_none());
+}
+
+#[test]
+fn cleanup_staged_attachments_removes_partial_and_stale_files() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    let partial = store.paths().attachments_dir.join("dangling.bin.part");
+    let stale = store.paths().attachments_dir.join("stale.txt");
+    let fresh = store.paths().attachments_dir.join("fresh.txt");
+
+    fs::write(&partial, b"partial").expect("write partial");
+    fs::write(&stale, b"old").expect("write stale");
+    fs::write(&fresh, b"new").expect("write fresh");
+
+    let old_time = filetime::FileTime::from_unix_time(1, 0);
+    filetime::set_file_mtime(&stale, old_time).expect("age stale file");
+
+    let result = store
+        .cleanup_staged_attachments(Duration::from_secs(60))
+        .expect("cleanup attachments");
+    assert_eq!(result.removed_partial_files, 1);
+    assert_eq!(result.removed_stale_files, 1);
+    assert!(!partial.exists());
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+}
+
+#[test]
+fn cleanup_runtime_state_prunes_old_rows_and_compacts_audit() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .connection
+        .execute(
+            "INSERT INTO processed_updates (update_id, created_at, response_text, codex_session_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![1_i64, "2000-01-01T00:00:00Z", "old", Option::<String>::None],
+        )
+        .expect("insert old processed update");
+    store
+        .connection
+        .execute(
+            "INSERT INTO update_failures (update_id, created_at, updated_at, attempt_count, last_error_code, last_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                7_i64,
+                "2000-01-01T00:00:00Z",
+                "2000-01-01T00:00:00Z",
+                1_i64,
+                "runtime_error",
+                "old failure"
+            ],
+        )
+        .expect("insert old update failure");
+
+    for index in 0..4 {
+        store
+            .record_turn(NewTurn {
+                role: "user",
+                channel: "telegram",
+                sender_id: Some(1),
+                text: &format!("turn-{index}"),
+                codex_session_id: None,
+                outcome_status: Some("received"),
+                attachments: &[],
+            })
+            .expect("record turn");
+    }
+
+    fs::write(
+        store.paths().audit_path.clone(),
+        "line-1\nline-2\nline-3\nline-4\nline-5\n",
+    )
+    .expect("write audit log");
+
+    let result = store
+        .cleanup_runtime_state(Duration::from_secs(1), Duration::from_secs(1), 2, 18)
+        .expect("cleanup runtime state");
+    assert_eq!(result.removed_old_processed_updates, 1);
+    assert_eq!(result.removed_old_update_failures, 1);
+    assert_eq!(result.removed_old_turns, 2);
+    assert!(result.audit_compacted);
+    assert!(
+        store
+            .get_processed_update(1)
+            .expect("processed update lookup")
+            .is_none()
+    );
+    assert!(store.recent_turns(10).expect("recent turns").len() <= 2);
+}

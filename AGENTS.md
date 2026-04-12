@@ -1,9 +1,9 @@
-> `kai` is a Rust-first local Telegram-to-Codex portal. `sdk` owns config defaults and JSON contracts; `cli` stays thin over it.
+> `kai` is a Rust-first local Telegram-to-Codex portal. `sdk` owns config, transport, runtime, state, and JSON contracts; `cli` stays thin over it.
 
 ## 1. Documentation
 
 - Primary references: [`SPEC.md`](SPEC.md), [`Cargo.toml`](Cargo.toml), [`package.json`](package.json)
-- Code entrypoints: [`crates/sdk/src/lib.rs`](crates/sdk/src/lib.rs), [`crates/cli/src/main.rs`](crates/cli/src/main.rs)
+- Code entrypoints: [`crates/sdk/src/lib.rs`](crates/sdk/src/lib.rs), [`crates/cli/src/main.rs`](crates/cli/src/main.rs), [`crates/cli/src/handlers.rs`](crates/cli/src/handlers.rs)
 - Use the `align` skill for repo baseline work and the `compose` skill for CLI contract changes
 
 ## 2. Repository Structure
@@ -20,6 +20,7 @@
 
 - Start behavior changes in [`crates/sdk/`](crates/sdk/)
 - Keep [`crates/cli/`](crates/cli/) as an adapter layer only
+- Prefer nested module directories over giant files. Keep Rust source files under roughly 500 lines unless a stronger boundary argues otherwise.
 
 ## 3. Stack
 
@@ -46,10 +47,10 @@
 
 - [`crates/sdk/src/lib.rs`](crates/sdk/src/lib.rs) owns path defaults, JSON envelope types, health output, and tool metadata
 - [`crates/cli/src/main.rs`](crates/cli/src/main.rs) parses subcommands and emits one JSON line to stdout
-- [`crates/sdk/src/channel/telegram.rs`](crates/sdk/src/channel/telegram.rs) owns Telegram long-polling, owner filtering, typing status, queued follow-ups, media intake, mobile commands, and outbound delivery
-- [`crates/sdk/src/runtime/codex.rs`](crates/sdk/src/runtime/codex.rs) owns `codex exec` / `exec resume` orchestration, replay fallback, and current JSON-event parsing
-- [`crates/sdk/src/state.rs`](crates/sdk/src/state.rs) owns SQLite state, queue persistence, replay package storage, processed-update caching, and audit logging
-- [`crates/sdk/src/service.rs`](crates/sdk/src/service.rs) owns macOS LaunchAgent lifecycle and runtime log inspection
+- [`crates/sdk/src/channel/telegram/`](crates/sdk/src/channel/telegram/) owns Telegram long-polling, owner filtering, typing status, native command-menu sync, queued follow-ups, fragment/media buffering, media intake, mobile commands, and outbound delivery
+- [`crates/sdk/src/runtime/codex/`](crates/sdk/src/runtime/codex/) owns `codex exec` / `exec resume` orchestration, replay fallback, prompt shaping, and JSON-event parsing
+- [`crates/sdk/src/state/`](crates/sdk/src/state/) owns SQLite state, queue persistence, in-flight recovery, replay package storage, processed-update caching, cleanup, and audit logging
+- [`crates/sdk/src/service/`](crates/sdk/src/service/) owns macOS LaunchAgent lifecycle, Keychain-backed secret seeding, and runtime log inspection
 - [`crates/sdk/src/media/`](crates/sdk/src/media/) owns attachment policy, transcription, and derived-media enrichment
 - Default prompt mode is currently the lighter passthrough-style turn envelope; the heavier system-instruction wrapper remains code-gated for experimentation
 - Outbound local file sending is explicit via `/send`; do not reintroduce assistant-text path scraping as an implicit delivery trigger
@@ -72,5 +73,6 @@
 ## 8. Validation
 
 - Required gate: `bun run util:check`
+- Rust regression gate: `cargo test --workspace --release`
 - Rust smoke check: `cargo run -p kai-cli -- tools`, `cargo run -p kai-cli -- health`, `cargo run -p kai-cli -- config show`
 - Installed-binary smoke check: `~/.tools/kai/kai health`, `~/.tools/kai/kai service status`

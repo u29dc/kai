@@ -1,0 +1,495 @@
+use super::*;
+
+#[derive(Debug)]
+pub(super) struct RawCodexResult {
+    pub(super) session_id: String,
+    pub(super) response_text: String,
+}
+
+#[derive(Debug, Default)]
+struct ParsedCodexOutput {
+    session_id: Option<String>,
+    response_text: Option<String>,
+}
+
+pub(super) fn build_async_command(
+    config: &LoadedConfig,
+    prepared: &PreparedCodexTurn,
+) -> KaiResult<(TokioCommand, bool)> {
+    if let Some(session_id) = &prepared.requested_session_id {
+        let mut command = TokioCommand::new(&config.values.runner.codex.binary);
+        command.arg("exec");
+        command.arg("resume");
+        command.arg("--json");
+        command.arg("--skip-git-repo-check");
+        apply_codex_overrides_tokio(config, &mut command);
+        apply_image_args_tokio(&mut command, &prepared.attachments);
+        command.arg(session_id);
+        command.arg(&prepared.prompt);
+        return Ok((command, true));
+    }
+
+    let mut command = TokioCommand::new(&config.values.runner.codex.binary);
+    command.arg("exec");
+    command.arg("--json");
+    command.arg("--skip-git-repo-check");
+    command.arg("-C");
+    command.arg(&config.values.paths.root_work);
+
+    for path in extra_access_paths(config, &prepared.attachments) {
+        command.arg("--add-dir");
+        command.arg(path);
+    }
+
+    apply_codex_overrides_tokio(config, &mut command);
+    apply_image_args_tokio(&mut command, &prepared.attachments);
+    command.arg(&prepared.replay_prompt);
+    Ok((command, false))
+}
+
+pub(super) async fn wait_for_codex_turn(
+    config: LoadedConfig,
+    mut child: tokio::process::Child,
+    prepared: PreparedCodexTurn,
+    using_resume: bool,
+) -> KaiResult<AsyncCodexTurnResult> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI did not expose stdout for JSON parsing",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI did not expose stderr for diagnostics",
+        )
+    })?;
+
+    let stdout_task = tokio::spawn(async move { parse_jsonl_stream(stdout).await });
+    let stderr_task = tokio::spawn(async move { read_stream_to_string(stderr).await });
+
+    let status = child.wait().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to wait for Codex CLI: {error}"),
+        )
+    })?;
+    let parsed = stdout_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex stdout parser: {error}"),
+        )
+    })??;
+    let stderr_text = stderr_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex stderr reader: {error}"),
+        )
+    })??;
+
+    let resume_failure = if status.success() {
+        None
+    } else if using_resume {
+        let error = codex_process_failure_from_parts(&status, &stderr_text);
+        if let Some(requested_session_id) = &prepared.requested_session_id
+            && is_stale_resume_error(&error)
+        {
+            let fallback = run_exec_async_fallback(&config, &prepared).await?;
+            return Ok(AsyncCodexTurnResult {
+                result: CodexTurnResult {
+                    session_id: fallback.session_id,
+                    response_text: fallback.response_text,
+                    resumed: false,
+                    context_snapshots: prepared.context_snapshots,
+                },
+                resume_failure: Some(ResumeFailure {
+                    requested_session_id: requested_session_id.clone(),
+                    stale_session: true,
+                    error,
+                }),
+            });
+        }
+
+        return Err(error);
+    } else {
+        return Err(codex_process_failure_from_parts(&status, &stderr_text));
+    };
+
+    let raw = finalize_parsed_output(parsed)?;
+    Ok(AsyncCodexTurnResult {
+        result: CodexTurnResult {
+            session_id: raw.session_id,
+            response_text: raw.response_text,
+            resumed: using_resume,
+            context_snapshots: prepared.context_snapshots,
+        },
+        resume_failure,
+    })
+}
+
+async fn run_exec_async_fallback(
+    config: &LoadedConfig,
+    prepared: &PreparedCodexTurn,
+) -> KaiResult<RawCodexResult> {
+    let mut command = TokioCommand::new(&config.values.runner.codex.binary);
+    command.arg("exec");
+    command.arg("--json");
+    command.arg("--skip-git-repo-check");
+    command.arg("-C");
+    command.arg(&config.values.paths.root_work);
+
+    for path in extra_access_paths(config, &prepared.attachments) {
+        command.arg("--add-dir");
+        command.arg(path);
+    }
+
+    apply_codex_overrides_tokio(config, &mut command);
+    apply_image_args_tokio(&mut command, &prepared.attachments);
+    command.arg(&prepared.replay_prompt);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to launch Codex CLI: {error}"),
+        )
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI fallback run did not expose stdout for JSON parsing",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex CLI fallback run did not expose stderr for diagnostics",
+        )
+    })?;
+    let stdout_task = tokio::spawn(async move { parse_jsonl_stream(stdout).await });
+    let stderr_task = tokio::spawn(async move { read_stream_to_string(stderr).await });
+
+    let status = child.wait().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to wait for Codex CLI: {error}"),
+        )
+    })?;
+    let parsed = stdout_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex fallback stdout parser: {error}"),
+        )
+    })??;
+    let stderr_text = stderr_task.await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to join Codex fallback stderr reader: {error}"),
+        )
+    })??;
+
+    if !status.success() {
+        return Err(codex_process_failure_from_parts(&status, &stderr_text));
+    }
+
+    finalize_parsed_output(parsed)
+}
+
+fn codex_process_failure_from_parts(status: &std::process::ExitStatus, stderr: &str) -> KaiError {
+    KaiError::new(
+        ErrorCode::RuntimeError,
+        format!("Codex CLI exited with status {status}"),
+    )
+    .with_hint(stderr.trim())
+}
+
+pub(super) fn run_exec(
+    config: &LoadedConfig,
+    prompt: &str,
+    attachments: &[AttachmentInfo],
+) -> KaiResult<RawCodexResult> {
+    let mut command = Command::new(&config.values.runner.codex.binary);
+    command.arg("exec");
+    command.arg("--json");
+    command.arg("--skip-git-repo-check");
+    command.arg("-C");
+    command.arg(&config.values.paths.root_work);
+
+    for path in extra_access_paths(config, attachments) {
+        command.arg("--add-dir");
+        command.arg(path);
+    }
+
+    apply_codex_overrides(config, &mut command);
+    apply_image_args(&mut command, attachments);
+    command.arg(prompt);
+
+    run_command(command)
+}
+
+pub(super) fn run_resume(
+    config: &LoadedConfig,
+    session_id: &str,
+    prompt: &str,
+    attachments: &[AttachmentInfo],
+) -> KaiResult<RawCodexResult> {
+    let mut command = Command::new(&config.values.runner.codex.binary);
+    command.arg("exec");
+    command.arg("resume");
+    command.arg("--json");
+    command.arg("--skip-git-repo-check");
+    apply_codex_overrides(config, &mut command);
+    apply_image_args(&mut command, attachments);
+    command.arg(session_id);
+    command.arg(prompt);
+
+    run_command(command)
+}
+
+fn run_command(mut command: Command) -> KaiResult<RawCodexResult> {
+    let output = command.output().map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to launch Codex CLI: {error}"),
+        )
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("Codex CLI exited with status {}", output.status),
+        )
+        .with_hint(stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_jsonl_output(&stdout)
+}
+
+async fn parse_jsonl_stream<R>(reader: R) -> KaiResult<ParsedCodexOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut parsed = ParsedCodexOutput::default();
+
+    while let Some(line) = lines.next_line().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to read Codex JSON stream: {error}"),
+        )
+    })? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let value = match serde_json::from_str::<JsonValue>(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        apply_codex_json_value(&mut parsed, &value);
+    }
+
+    Ok(parsed)
+}
+
+async fn read_stream_to_string<R>(reader: R) -> KaiResult<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut chunks = Vec::new();
+    while let Some(line) = lines.next_line().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            format!("failed to read Codex stderr stream: {error}"),
+        )
+    })? {
+        chunks.push(line);
+    }
+    Ok(chunks.join("\n"))
+}
+
+fn apply_codex_json_value(parsed: &mut ParsedCodexOutput, value: &JsonValue) {
+    if value.get("type").and_then(JsonValue::as_str) == Some("thread.started")
+        && let Some(thread_id) = value.get("thread_id").and_then(JsonValue::as_str)
+    {
+        parsed.session_id = Some(thread_id.to_string());
+    }
+
+    if value.get("type").and_then(JsonValue::as_str) == Some("item.completed")
+        && let Some(item) = value.get("item")
+    {
+        let is_agent_message =
+            item.get("type").and_then(JsonValue::as_str) == Some("agent_message");
+        if is_agent_message && let Some(text) = item.get("text").and_then(JsonValue::as_str) {
+            parsed.response_text = Some(text.to_string());
+        }
+    }
+}
+
+fn finalize_parsed_output(parsed: ParsedCodexOutput) -> KaiResult<RawCodexResult> {
+    let session_id = parsed.session_id.ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex did not emit a session id in JSON output",
+        )
+    })?;
+    let response_text = parsed.response_text.ok_or_else(|| {
+        KaiError::new(
+            ErrorCode::RuntimeError,
+            "Codex did not emit a completed assistant message",
+        )
+    })?;
+
+    Ok(RawCodexResult {
+        session_id,
+        response_text,
+    })
+}
+
+fn parse_jsonl_output(stdout: &str) -> KaiResult<RawCodexResult> {
+    let mut parsed = ParsedCodexOutput::default();
+
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let value = match serde_json::from_str::<JsonValue>(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        apply_codex_json_value(&mut parsed, &value);
+    }
+
+    finalize_parsed_output(parsed)
+}
+
+fn apply_codex_overrides(config: &LoadedConfig, command: &mut Command) {
+    if let Some(override_config) = &config.values.runner.codex.override_config {
+        if let Some(approval_policy) = &override_config.approval_policy {
+            command.arg("-c");
+            command.arg(format!("approval_policy=\"{approval_policy}\""));
+        }
+        if let Some(sandbox_mode) = &override_config.sandbox_mode {
+            command.arg("-s");
+            command.arg(sandbox_mode);
+        }
+    }
+}
+
+fn apply_codex_overrides_tokio(config: &LoadedConfig, command: &mut TokioCommand) {
+    if let Some(override_config) = &config.values.runner.codex.override_config {
+        if let Some(approval_policy) = &override_config.approval_policy {
+            command.arg("-c");
+            command.arg(format!("approval_policy=\"{approval_policy}\""));
+        }
+        if let Some(sandbox_mode) = &override_config.sandbox_mode {
+            command.arg("-s");
+            command.arg(sandbox_mode);
+        }
+    }
+}
+
+fn apply_image_args(command: &mut Command, attachments: &[AttachmentInfo]) {
+    for path in image_input_paths(attachments) {
+        command.arg("-i");
+        command.arg(path);
+    }
+}
+
+fn apply_image_args_tokio(command: &mut TokioCommand, attachments: &[AttachmentInfo]) {
+    for path in image_input_paths(attachments) {
+        command.arg("-i");
+        command.arg(path);
+    }
+}
+
+fn extra_access_paths(config: &LoadedConfig, attachments: &[AttachmentInfo]) -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(&config.values.paths.root_app)];
+
+    for context_path in [
+        config.values.context_files.soul.as_str(),
+        config.values.context_files.memory.as_str(),
+        config.values.context_files.todo.as_str(),
+    ] {
+        if let Some(parent) = Path::new(context_path).parent() {
+            paths.push(parent.to_path_buf());
+        }
+    }
+
+    for attachment in attachments {
+        if let Some(parent) = Path::new(&attachment.path).parent() {
+            paths.push(parent.to_path_buf());
+        }
+        for artifact in &attachment.artifacts {
+            if let Some(parent) = Path::new(&artifact.path).parent() {
+                paths.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+pub(super) fn is_stale_resume_error(error: &KaiError) -> bool {
+    let mut text = error.message.to_ascii_lowercase();
+    if let Some(hint) = &error.hint {
+        text.push('\n');
+        text.push_str(&hint.to_ascii_lowercase());
+    }
+
+    text.contains("no rollout found for thread id")
+        || text.contains("thread not found")
+        || text.contains("unknown thread")
+        || text.contains("session not found")
+        || (text.contains("thread/resume failed") && text.contains("not found"))
+}
+
+fn image_input_paths(attachments: &[AttachmentInfo]) -> Vec<&str> {
+    let mut paths = Vec::new();
+
+    for attachment in attachments {
+        if attachment.kind == "image" {
+            paths.push(attachment.path.as_str());
+        }
+
+        for artifact in attachment.artifacts.iter().filter(|artifact| {
+            artifact.kind == "image_frame"
+                || artifact
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("image/"))
+        }) {
+            paths.push(artifact.path.as_str());
+        }
+    }
+
+    paths
+}
+
+pub(super) fn signal_process(pid: u32, signal: &str) -> KaiResult<()> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("failed to signal Codex process {pid}: {error}"),
+            )
+        })?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(KaiError::new(
+        ErrorCode::RuntimeError,
+        format!("failed to signal Codex process {pid} with {signal}"),
+    ))
+}

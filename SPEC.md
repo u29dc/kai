@@ -1,8 +1,8 @@
 # kai
 
-Status: implemented alpha, spec tracks shipped behavior plus near-term hardening  
+Status: implemented alpha, spec tracks shipped behavior plus the next focused backlog  
 Date: 2026-04-12  
-Scope: owner-only Telegram-to-Codex portal on macOS, with current implementation and next hardening pass documented together
+Scope: owner-only Telegram-to-Codex portal on macOS, with current implementation and the next high-value additions documented together
 
 ## 1. Purpose
 
@@ -434,6 +434,7 @@ Current default behavior:
 
 - a passthrough-style turn prompt is used by default
 - a heavier system-instruction wrapper remains available behind a code-level switch for experimentation
+- the code-level prompt toggle defaults to the lighter passthrough envelope today
 
 The normalized turn envelope should include:
 
@@ -524,6 +525,7 @@ Current ownership model:
 - recovery pairing is explicit, time-limited, and attempt-limited
 - normal operation does not depend on open-ended pairing state
 - later messages from any other sender are ignored
+- background service secrets are loaded from macOS Keychain rather than stored in the LaunchAgent plist
 
 ## 15. Configuration Model
 
@@ -803,6 +805,7 @@ Operational durability requirements:
 - buffered media groups and long text fragments must survive restarts until flushed
 - completed assistant replies must be retryable if Telegram delivery fails after Codex already finished
 - housekeeping should prune stale attachments, stale update-failure rows, stale processed updates, and oversized audit logs
+- the service should persist enough in-flight state that a crash does not silently drop a popped queued turn
 
 Minimum audit fields:
 
@@ -827,14 +830,17 @@ The runtime should stay boring.
 - one serialized inbound queue
 - long-polling for Telegram
 - optional macOS LaunchAgent background service
+- background service secrets resolved from Keychain at runtime, not embedded in the plist
 - typing indicator refresh while a turn is active
 - queued follow-up handling while a turn is busy
 - native Telegram command menu sync for the owner chat
 - chunked Telegram replies with HTML formatting fallback
+- explicit outbound file/media sending via `/send`
 - durable pending-reply delivery retry when Telegram send fails after Codex already completed
 - no web server in v1
 - no background autonomous work
 - no periodic jobs beyond optional internal housekeeping
+- true live draft streaming is deferred until Codex incremental event consumption exists
 
 If the daemon is offline, messages wait at the channel and are processed when it reconnects.
 
@@ -874,50 +880,35 @@ High-value integration tests:
 - optional custom tool-path execution
 - full-access portal turn
 
-## 21. Proposed Phases
+## 21. Current Shipped Surface
 
-### Phase 0
+Current shipped surface includes:
 
-- finalize this spec
-- confirm the small set of wrapper-level soft guardrails
-- confirm Telegram-first scope
+- JSON-first CLI with `tools`, `health`, `config`, `setup`, `session`, and `service` commands
+- owner-only Telegram long-polling runtime
+- native Telegram command menu sync
+- explicit mobile commands such as `/help`, `/status`, `/new`, `/reset`, `/cancel`, and `/send`
+- durable queued follow-ups while a turn is already running
+- explicit cancellation of a running Codex turn
+- media-group and long-text fragment buffering
+- local staging for supported inbound media classes
+- pluggable transcription with Groq-first and command-adapter support
+- replay-package continuity with bounded recent turns and attachment references
+- pending-reply delivery retry after Telegram send failures
+- background macOS LaunchAgent service with Keychain-backed secret loading
+- module-split Rust workspace with `sdk` and thin `cli`
 
-### Phase 1
+## 22. Next High-Value Backlog
 
-- bootstrap Rust workspace and repo tooling
-- implement config, tools, and health surfaces
-- implement configurable context-file plumbing
-- implement SQLite plus JSONL store
+The highest-value remaining additions are:
 
-### Phase 2
+- true Telegram draft streaming once Codex incremental event consumption is available
+- optional local Telegram Bot API mode if file sizes above the cloud Bot API ceiling become important
+- stronger end-to-end integration and soak coverage beyond the current unit-heavy test surface
+- state-retention tuning for very long-lived usage
+- optional future WhatsApp adapter only if Telegram proves insufficient
 
-- implement Telegram long-polling adapter
-- implement pairing and owner filtering
-- implement serialized turn queue
-
-### Phase 3
-
-- implement Codex runner
-- implement session creation, resume, and replay fallback
-- implement normalized prompt envelope
-
-### Phase 4
-
-- implement attachment intake
-- enforce attachment limits and metadata capture
-- add integration tests
-
-### Phase 5
-
-- optionally add explicit override support for a dedicated `kai` Codex runtime profile
-- only after the portal core proves stable
-
-### Phase 6
-
-- evaluate WhatsApp as a separate adapter
-- only if Telegram proves insufficient
-
-## 22. Decisions Locked by This Spec
+## 23. Decisions Locked by This Spec
 
 These points should be treated as decided unless new evidence forces a change:
 
@@ -935,33 +926,19 @@ These points should be treated as decided unless new evidence forces a change:
 - v1 is a full-access Codex portal, not a second safety harness
 - v1 inherits the operator's global Codex config
 - no hard folder blacklist is promised in v1
-- primary owner onboarding uses a one-time pairing code
+- primary owner trust is a pinned `owner_user_id`, with pairing reserved for explicit recovery
 - `kai` should not become a hosted gateway or general agent platform
 
-## 23. Open Questions
+## 24. Open Questions
 
-These are the remaining questions that materially affect the implementation plan.
+The remaining questions are intentionally narrow:
 
-### 23.1 Soft guardrails
+- whether to add wrapper-level soft guardrails such as explicit `sudo` rejection, knowing they are advisory rather than hard isolation
+- whether `MEMORY` and `TODO` should remain explicit edit targets only, or eventually grow lightweight helper commands
+- whether WhatsApp is ever worth adding after Telegram proves out
 
-Do we want wrapper-level rejection for a tiny set of obvious risk escalators such as explicit `sudo` requests, knowing that these are convenience checks rather than hard isolation?
+## 25. Bottom Line
 
-Recommended default: yes for `sudo` and background-self-scheduling requests, no for a larger faux-blacklist.
-
-### 23.2 Context-file write policy
-
-Should `MEMORY` and `TODO` be treated as explicit edit targets only when you ask, or should `kai` also offer lightweight command helpers for appending/updating them?
-
-Recommended default: explicit edits when asked, then add helpers later if they are clearly useful.
-
-### 23.3 WhatsApp timing
-
-Is WhatsApp a near-term v2 requirement, or should it stay completely out of the first milestone?
-
-Recommended default: keep it out until Telegram proves the product shape.
-
-## 24. Bottom Line
-
-`kai` should start as a small, owner-only, Telegram-to-Codex portal with strong local state, reactive behavior, and no platform ambitions.
+`kai` is now a small, owner-only, Telegram-to-Codex portal with strong local state, reactive behavior, background service support, rich media intake, and no platform ambitions.
 
 The large reference projects are useful because they show what must be handled once the surface area grows. The lesson for `kai` is not to replicate that growth. The lesson is to borrow only the parts that remain necessary after the scope is cut down to one person, one machine, one backend, and one safe path to usefulness.
