@@ -2,7 +2,7 @@
 
 ## 1. Documentation
 
-- Primary references: [`SPEC.md`](SPEC.md), [`Cargo.toml`](Cargo.toml), [`package.json`](package.json)
+- Primary references: [`AGENTS.md`](AGENTS.md), [`Cargo.toml`](Cargo.toml), [`package.json`](package.json)
 - Code entrypoints: [`crates/sdk/src/lib.rs`](crates/sdk/src/lib.rs), [`crates/cli/src/main.rs`](crates/cli/src/main.rs), [`crates/cli/src/handlers.rs`](crates/cli/src/handlers.rs)
 - Use the `align` skill for repo baseline work and the `compose` skill for CLI contract changes
 
@@ -14,8 +14,7 @@
 │   ├── sdk/                core types, defaults, envelopes, tool metadata
 │   └── cli/                clap entrypoint over the sdk
 ├── .husky/                 local git hooks
-├── SPEC.md                 product and architecture source of truth
-└── AGENTS.md               canonical repo-level agent instructions
+└── AGENTS.md               canonical product, architecture, and repo-level agent instructions
 ```
 
 - Start behavior changes in [`crates/sdk/`](crates/sdk/)
@@ -55,7 +54,7 @@
 - Default prompt mode is currently the lighter passthrough-style turn envelope; the heavier system-instruction wrapper remains code-gated for experimentation
 - Outbound local file sending is explicit via `/send`; do not reintroduce assistant-text path scraping as an implicit delivery trigger
 - Keep default output JSON-first; if text mode is added later, make it explicit and keep the default machine-readable contract stable
-- Update [`SPEC.md`](SPEC.md) when command surface or architecture intent changes
+- Update [`AGENTS.md`](AGENTS.md) when command surface or architecture intent changes
 
 ## 6. Runtime and State
 
@@ -67,7 +66,7 @@
 ## 7. Constraints
 
 - Keep the workspace split to `sdk` and `cli` until a real boundary justifies more crates
-- Keep CLI contracts aligned with [`SPEC.md`](SPEC.md)
+- Keep CLI contracts aligned with [`AGENTS.md`](AGENTS.md)
 - Treat [`.tmp/`](.tmp/), `target/`, and `node_modules/` as generated
 
 ## 8. Validation
