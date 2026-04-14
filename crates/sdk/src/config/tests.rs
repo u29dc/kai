@@ -5,6 +5,7 @@ fn build_default_config_contains_expected_sections() {
     let config = build_default_config_file();
     assert!(config.contains("[agent]"));
     assert!(config.contains("[channel.telegram]"));
+    assert!(config.contains("[channel.telegram.progress]"));
     assert!(config.contains("[paths]"));
 }
 

@@ -20,11 +20,14 @@ use crate::media::{
     enrich_attachment,
 };
 use crate::runtime::codex::{
-    AsyncCodexTurnResult, ResumeFailure, RunningCodexTurn, cancel_codex_turn,
-    create_replay_package, poll_running_codex_turn, prepare_codex_turn, start_codex_turn,
+    AsyncCodexTurnResult, ResumeFailure, RunningCodexTurn, RunningCodexTurnEvent,
+    cancel_codex_turn, create_replay_package, drain_running_codex_turn_events, prepare_codex_turn,
+    start_codex_turn,
 };
 use crate::secrets::resolve_telegram_token;
-use crate::state::{AttachmentInfo, NewTurn, PendingReplyDelivery, PendingTurn, StateStore};
+use crate::state::{
+    ActiveTurnState, AttachmentInfo, NewTurn, PendingReplyDelivery, PendingTurn, StateStore,
+};
 
 mod api;
 mod attachments;
@@ -33,6 +36,7 @@ mod formatting;
 mod inbound;
 mod menu;
 mod models;
+mod progress;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -46,6 +50,7 @@ use self::formatting::*;
 use self::inbound::*;
 use self::menu::*;
 use self::models::*;
+use self::progress::*;
 use self::store::*;
 use self::transport::*;
 use self::turns::*;
@@ -62,7 +67,6 @@ const TEXT_FRAGMENT_MAX_TOTAL_CHARS: usize = 24_000;
 const TEXT_FRAGMENT_MAX_PARTS: usize = 6;
 const TEXT_FRAGMENT_MAX_ID_GAP: i64 = 5;
 const TEXT_FRAGMENT_MAX_GAP: Duration = Duration::from_millis(1400);
-const ACTIVE_TURN_STATE_KEY: &str = "telegram.active_turn";
 const BUFFERED_MEDIA_GROUPS_STATE_KEY: &str = "telegram.buffered_media_groups";
 const BUFFERED_TEXT_FRAGMENTS_STATE_KEY: &str = "telegram.buffered_text_fragments";
 const PENDING_REPLY_DELIVERIES_STATE_KEY: &str = "telegram.pending_reply_deliveries";
@@ -93,7 +97,10 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
     let mut active_turn: Option<ActiveOwnerTurn> = None;
     let mut synced_menu_chat_id: Option<i64> = None;
 
-    recover_active_turn(state)?;
+    let recovered_active_turn = recover_active_turn(state)?;
+    if let Some(active_turn) = recovered_active_turn.as_ref() {
+        mark_recovered_turn_restarting(&client, &token, config, state, active_turn).await?;
+    }
 
     loop {
         let now = Instant::now();
@@ -108,7 +115,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
 
         let owner_chat_id = state.get_owner_chat_id()?;
 
-        if let Err(error) = flush_pending_reply_deliveries(&client, &token, state).await {
+        if let Err(error) = flush_pending_reply_deliveries(&client, &token, config, state).await {
             record_runtime_error(
                 state,
                 "telegram.pending_reply_delivery_failed",
@@ -146,9 +153,32 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                 turn.next_typing_at = Instant::now() + TELEGRAM_TYPING_REFRESH;
             }
 
-            if let Some(result) = poll_running_codex_turn(&mut turn.running) {
+            let mut completed = None;
+            for event in drain_running_codex_turn_events(&mut turn.running) {
+                match event {
+                    RunningCodexTurnEvent::Progress(progress_event) => {
+                        handle_progress_event(
+                            &client,
+                            &token,
+                            config,
+                            state,
+                            turn,
+                            &progress_event,
+                            now,
+                        )
+                        .await?;
+                    }
+                    RunningCodexTurnEvent::Completed(result) => {
+                        completed = Some(result);
+                    }
+                }
+            }
+
+            if let Some(result) = completed {
                 finish_active_turn(&client, &token, config, state, turn, result).await?;
                 active_turn = None;
+            } else {
+                maybe_send_idle_progress(&client, &token, config, state, turn, now).await?;
             }
         }
 
@@ -174,7 +204,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
         .await?;
 
         if active_turn.is_none() {
-            maybe_start_next_pending_turn(config, state, &mut active_turn).await?;
+            maybe_start_next_pending_turn(&client, &token, config, state, &mut active_turn).await?;
         }
 
         let has_pending_queue = state.pending_turn_queue_len()? > 0;

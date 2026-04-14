@@ -123,6 +123,16 @@ fn build_passthrough_turn_prompt(
         format!("- root_app: {}", config.values.paths.root_app),
     ];
 
+    if channel == "telegram" && config.values.channel.telegram.progress.enabled {
+        sections.push(
+            "- while working on longer tasks, emit brief intermediary progress notes in one short sentence".to_string(),
+        );
+        sections.push(
+            "- describe what you are inspecting or checking, not raw command output".to_string(),
+        );
+        sections.push("- keep the complete final answer separate at the end".to_string());
+    }
+
     append_attachment_sections(&mut sections, attachments);
     sections.push(String::new());
     sections.push("User message:".to_string());

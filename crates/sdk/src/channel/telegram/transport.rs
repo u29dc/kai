@@ -21,6 +21,25 @@ pub(super) async fn send_message_with_retry(
     message::send_message_with_retry(client, token, chat_id, text).await
 }
 
+pub(super) async fn send_status_message(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> KaiResult<i64> {
+    message::send_status_message(client, token, chat_id, text).await
+}
+
+pub(super) async fn edit_message_text_with_retry(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> KaiResult<()> {
+    message::edit_message_text_with_retry(client, token, chat_id, message_id, text).await
+}
+
 pub(super) async fn send_typing_indicator(
     client: &Client,
     token: &str,
@@ -32,6 +51,10 @@ pub(super) async fn send_typing_indicator(
 #[cfg(test)]
 pub(super) fn should_retry_telegram_send(error: &KaiError) -> bool {
     message::should_retry_telegram_send(error)
+}
+
+pub(super) fn is_telegram_edit_target_lost(error: &KaiError) -> bool {
+    message::is_telegram_edit_target_lost(error)
 }
 
 pub(super) async fn send_local_paths(

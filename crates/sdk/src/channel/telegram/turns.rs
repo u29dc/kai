@@ -61,6 +61,8 @@ pub(super) async fn enqueue_owner_turn(
 }
 
 pub(super) async fn maybe_start_next_pending_turn(
+    client: &Client,
+    token: &str,
     config: &LoadedConfig,
     state: &StateStore,
     active_turn: &mut Option<ActiveOwnerTurn>,
@@ -72,10 +74,13 @@ pub(super) async fn maybe_start_next_pending_turn(
     let Some(pending) = state.pop_pending_turn()? else {
         return Ok(());
     };
-    state.store_json_state(ACTIVE_TURN_STATE_KEY, &pending)?;
+    state.set_active_turn_state(&ActiveTurnState {
+        pending: pending.clone(),
+        status_message_id: None,
+    })?;
 
     if pending.text.is_empty() && pending.attachments.is_empty() {
-        state.remove_json_state(ACTIVE_TURN_STATE_KEY)?;
+        state.clear_active_turn_state()?;
         return Ok(());
     }
 
@@ -88,14 +93,14 @@ pub(super) async fn maybe_start_next_pending_turn(
         &pending.attachments,
     )
     .inspect_err(|_| {
-        let _ = state.remove_json_state(ACTIVE_TURN_STATE_KEY);
+        let _ = state.clear_active_turn_state();
         let _ = state.prepend_pending_turn(&pending);
     })?;
 
     let running = match start_codex_turn(config.clone(), prepared).await {
         Ok(running) => running,
         Err(error) => {
-            let _ = state.remove_json_state(ACTIVE_TURN_STATE_KEY);
+            let _ = state.clear_active_turn_state();
             let _ = state.prepend_pending_turn(&pending);
             return Err(error);
         }
@@ -114,7 +119,19 @@ pub(super) async fn maybe_start_next_pending_turn(
         running,
         cancel_requested: false,
         next_typing_at: Instant::now(),
+        status_message_id: None,
+        progress: TurnProgressState {
+            last_event_at: Instant::now(),
+            last_visible_update_at: Instant::now()
+                - Duration::from_millis(config.values.channel.telegram.progress.edit_interval_ms),
+            last_sent_text: None,
+            update_count: 0,
+            edit_interval_ms: config.values.channel.telegram.progress.edit_interval_ms,
+        },
     });
+    if let Some(turn) = active_turn.as_mut() {
+        send_initial_progress_message(client, token, config, state, turn).await?;
+    }
     Ok(())
 }
 
@@ -130,11 +147,12 @@ pub(super) async fn finish_active_turn(
         Ok(async_result) => {
             finalize_successful_turn(client, token, config, state, active_turn, async_result)
                 .await?;
-            state.remove_json_state(ACTIVE_TURN_STATE_KEY)
+            state.clear_active_turn_state()
         }
         Err(error) => {
-            state.remove_json_state(ACTIVE_TURN_STATE_KEY)?;
+            state.clear_active_turn_state()?;
             if active_turn.cancel_requested {
+                mark_turn_canceled(client, token, config, state, active_turn).await?;
                 state.append_audit_json(&serde_json::json!({
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "event": "turn.cancelled",
@@ -154,6 +172,7 @@ pub(super) async fn finish_active_turn(
                 Some(active_turn.pending.sender_id),
                 &error,
             )?;
+            mark_turn_failed(client, token, config, state, active_turn).await?;
             if let Err(notice_error) = send_message_with_retry(
                 client,
                 token,
@@ -237,14 +256,14 @@ async fn finalize_successful_turn(
             chat_id: active_turn.pending.chat_id,
             response_text: result.response_text.clone(),
             codex_session_id: result.session_id.clone(),
+            status_message_id: active_turn.status_message_id,
             update_ids: active_turn.pending.update_ids.clone(),
             attempts: 0,
             created_at: chrono::Utc::now().to_rfc3339(),
         },
     )?;
 
-    let _ = config;
-    flush_pending_reply_deliveries(client, token, state).await?;
+    flush_pending_reply_deliveries(client, token, config, state).await?;
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::mpsc::Sender;
 
 #[derive(Debug)]
 pub(super) struct RawCodexResult {
@@ -52,6 +53,7 @@ pub(super) async fn wait_for_codex_turn(
     mut child: tokio::process::Child,
     prepared: PreparedCodexTurn,
     using_resume: bool,
+    progress_sender: Sender<RunningCodexTurnEvent>,
 ) -> KaiResult<AsyncCodexTurnResult> {
     let stdout = child.stdout.take().ok_or_else(|| {
         KaiError::new(
@@ -66,7 +68,9 @@ pub(super) async fn wait_for_codex_turn(
         )
     })?;
 
-    let stdout_task = tokio::spawn(async move { parse_jsonl_stream(stdout).await });
+    let stdout_progress_sender = progress_sender.clone();
+    let stdout_task =
+        tokio::spawn(async move { parse_jsonl_stream(stdout, stdout_progress_sender).await });
     let stderr_task = tokio::spawn(async move { read_stream_to_string(stderr).await });
 
     let status = child.wait().await.map_err(|error| {
@@ -95,7 +99,8 @@ pub(super) async fn wait_for_codex_turn(
         if let Some(requested_session_id) = &prepared.requested_session_id
             && is_stale_resume_error(&error)
         {
-            let fallback = run_exec_async_fallback(&config, &prepared).await?;
+            let fallback =
+                run_exec_async_fallback(&config, &prepared, progress_sender.clone()).await?;
             return Ok(AsyncCodexTurnResult {
                 result: CodexTurnResult {
                     session_id: fallback.session_id,
@@ -131,6 +136,7 @@ pub(super) async fn wait_for_codex_turn(
 async fn run_exec_async_fallback(
     config: &LoadedConfig,
     prepared: &PreparedCodexTurn,
+    progress_sender: Sender<RunningCodexTurnEvent>,
 ) -> KaiResult<RawCodexResult> {
     let mut command = TokioCommand::new(&config.values.runner.codex.binary);
     command.arg("exec");
@@ -169,7 +175,9 @@ async fn run_exec_async_fallback(
             "Codex CLI fallback run did not expose stderr for diagnostics",
         )
     })?;
-    let stdout_task = tokio::spawn(async move { parse_jsonl_stream(stdout).await });
+    let stdout_progress_sender = progress_sender.clone();
+    let stdout_task =
+        tokio::spawn(async move { parse_jsonl_stream(stdout, stdout_progress_sender).await });
     let stderr_task = tokio::spawn(async move { read_stream_to_string(stderr).await });
 
     let status = child.wait().await.map_err(|error| {
@@ -270,7 +278,10 @@ fn run_command(mut command: Command) -> KaiResult<RawCodexResult> {
     parse_jsonl_output(&stdout)
 }
 
-async fn parse_jsonl_stream<R>(reader: R) -> KaiResult<ParsedCodexOutput>
+async fn parse_jsonl_stream<R>(
+    reader: R,
+    progress_sender: Sender<RunningCodexTurnEvent>,
+) -> KaiResult<ParsedCodexOutput>
 where
     R: AsyncRead + Unpin,
 {
@@ -292,7 +303,7 @@ where
             Ok(value) => value,
             Err(_) => continue,
         };
-        apply_codex_json_value(&mut parsed, &value);
+        apply_codex_json_value(&mut parsed, &value, Some(&progress_sender));
     }
 
     Ok(parsed)
@@ -315,20 +326,72 @@ where
     Ok(chunks.join("\n"))
 }
 
-fn apply_codex_json_value(parsed: &mut ParsedCodexOutput, value: &JsonValue) {
+fn apply_codex_json_value(
+    parsed: &mut ParsedCodexOutput,
+    value: &JsonValue,
+    progress_sender: Option<&Sender<RunningCodexTurnEvent>>,
+) {
     if value.get("type").and_then(JsonValue::as_str) == Some("thread.started")
         && let Some(thread_id) = value.get("thread_id").and_then(JsonValue::as_str)
     {
         parsed.session_id = Some(thread_id.to_string());
     }
 
+    if value.get("type").and_then(JsonValue::as_str) == Some("item.started")
+        && let Some(item) = value.get("item")
+    {
+        let item_type = item.get("type").and_then(JsonValue::as_str);
+        if item_type == Some("command_execution")
+            && let Some(command) = item.get("command").and_then(JsonValue::as_str)
+        {
+            send_progress_event(
+                progress_sender,
+                CodexProgressEvent::CommandStarted {
+                    command: command.to_string(),
+                },
+            );
+        }
+    }
+
     if value.get("type").and_then(JsonValue::as_str) == Some("item.completed")
         && let Some(item) = value.get("item")
     {
-        let is_agent_message =
-            item.get("type").and_then(JsonValue::as_str) == Some("agent_message");
-        if is_agent_message && let Some(text) = item.get("text").and_then(JsonValue::as_str) {
-            parsed.response_text = Some(text.to_string());
+        let item_type = item.get("type").and_then(JsonValue::as_str);
+        let text = item.get("text").and_then(JsonValue::as_str);
+
+        match item_type {
+            Some("agent_message") => {
+                if let Some(text) = text {
+                    parsed.response_text = Some(text.to_string());
+                    send_progress_event(
+                        progress_sender,
+                        CodexProgressEvent::AgentMessage {
+                            text: text.to_string(),
+                        },
+                    );
+                }
+            }
+            Some("plan") => {
+                if let Some(text) = text {
+                    send_progress_event(
+                        progress_sender,
+                        CodexProgressEvent::Plan {
+                            text: text.to_string(),
+                        },
+                    );
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = text {
+                    send_progress_event(
+                        progress_sender,
+                        CodexProgressEvent::ReasoningSummary {
+                            text: text.to_string(),
+                        },
+                    );
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -361,10 +424,19 @@ fn parse_jsonl_output(stdout: &str) -> KaiResult<RawCodexResult> {
             Ok(value) => value,
             Err(_) => continue,
         };
-        apply_codex_json_value(&mut parsed, &value);
+        apply_codex_json_value(&mut parsed, &value, None);
     }
 
     finalize_parsed_output(parsed)
+}
+
+fn send_progress_event(
+    progress_sender: Option<&Sender<RunningCodexTurnEvent>>,
+    event: CodexProgressEvent,
+) {
+    if let Some(progress_sender) = progress_sender {
+        let _ = progress_sender.send(RunningCodexTurnEvent::Progress(event));
+    }
 }
 
 fn apply_codex_overrides(config: &LoadedConfig, command: &mut Command) {
@@ -492,4 +564,59 @@ pub(super) fn signal_process(pid: u32, signal: &str) -> KaiResult<()> {
         ErrorCode::RuntimeError,
         format!("failed to signal Codex process {pid} with {signal}"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn apply_codex_json_value_emits_progress_events_and_tracks_final_message() {
+        let (sender, receiver) = mpsc::channel();
+        let mut parsed = ParsedCodexOutput::default();
+
+        for line in [
+            r#"{"type":"thread.started","thread_id":"thread-1"}"#,
+            r#"{"type":"item.started","item":{"id":"item-1","type":"command_execution","command":"sed -n '1,10p' AGENTS.md"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item-2","type":"agent_message","text":"Inspecting AGENTS.md now."}}"#,
+            r#"{"type":"item.completed","item":{"id":"item-3","type":"plan","text":"check config\ncheck runtime"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item-4","type":"reasoning","text":"hidden summary"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item-5","type":"agent_message","text":"Final reply"}}"#,
+        ] {
+            let value = serde_json::from_str::<JsonValue>(line).expect("json value");
+            apply_codex_json_value(&mut parsed, &value, Some(&sender));
+        }
+
+        assert_eq!(parsed.session_id.as_deref(), Some("thread-1"));
+        assert_eq!(parsed.response_text.as_deref(), Some("Final reply"));
+
+        let events = receiver
+            .try_iter()
+            .map(|event| match event {
+                RunningCodexTurnEvent::Progress(progress) => progress,
+                RunningCodexTurnEvent::Completed(_) => panic!("unexpected completed event"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            vec![
+                CodexProgressEvent::CommandStarted {
+                    command: "sed -n '1,10p' AGENTS.md".to_string(),
+                },
+                CodexProgressEvent::AgentMessage {
+                    text: "Inspecting AGENTS.md now.".to_string(),
+                },
+                CodexProgressEvent::Plan {
+                    text: "check config\ncheck runtime".to_string(),
+                },
+                CodexProgressEvent::ReasoningSummary {
+                    text: "hidden summary".to_string(),
+                },
+                CodexProgressEvent::AgentMessage {
+                    text: "Final reply".to_string(),
+                },
+            ]
+        );
+    }
 }

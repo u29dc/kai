@@ -33,6 +33,17 @@ pub(super) struct ActiveOwnerTurn {
     pub(super) running: RunningCodexTurn,
     pub(super) cancel_requested: bool,
     pub(super) next_typing_at: Instant,
+    pub(super) status_message_id: Option<i64>,
+    pub(super) progress: TurnProgressState,
+}
+
+#[derive(Debug)]
+pub(super) struct TurnProgressState {
+    pub(super) last_event_at: Instant,
+    pub(super) last_visible_update_at: Instant,
+    pub(super) last_sent_text: Option<String>,
+    pub(super) update_count: u32,
+    pub(super) edit_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +136,8 @@ pub(super) struct TelegramUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TelegramMessage {
+    #[serde(default)]
+    pub(super) message_id: Option<i64>,
     pub(super) from: Option<TelegramUser>,
     pub(super) chat: TelegramChat,
     pub(super) text: Option<String>,
@@ -230,6 +243,20 @@ pub(super) struct SendMessageRequest {
     pub(super) text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) parse_mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct EditMessageTextRequest {
+    pub(super) chat_id: i64,
+    pub(super) message_id: i64,
+    pub(super) text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) parse_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct TelegramSentMessage {
+    pub(super) message_id: i64,
 }
 
 #[derive(Debug, Serialize)]

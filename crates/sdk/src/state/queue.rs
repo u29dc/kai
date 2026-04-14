@@ -1,6 +1,30 @@
 use super::*;
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum StoredActiveTurnState {
+    Current(ActiveTurnState),
+    Legacy(PendingTurn),
+}
+
 impl StateStore {
+    pub fn get_active_turn_state(&self) -> KaiResult<Option<ActiveTurnState>> {
+        Ok(self
+            .load_json_state::<StoredActiveTurnState>(ACTIVE_TURN_STATE_KEY)?
+            .map(|value| match value {
+                StoredActiveTurnState::Current(current) => current,
+                StoredActiveTurnState::Legacy(pending) => pending.into(),
+            }))
+    }
+
+    pub fn set_active_turn_state(&self, state: &ActiveTurnState) -> KaiResult<()> {
+        self.store_json_state(ACTIVE_TURN_STATE_KEY, state)
+    }
+
+    pub fn clear_active_turn_state(&self) -> KaiResult<()> {
+        self.remove_json_state(ACTIVE_TURN_STATE_KEY)
+    }
+
     pub fn pending_turn_preview(&self, limit: usize) -> KaiResult<Vec<PendingTurnView>> {
         Ok(self
             .pending_turn_queue()?
@@ -11,7 +35,7 @@ impl StateStore {
     }
 
     pub fn get_active_pending_turn(&self) -> KaiResult<Option<PendingTurn>> {
-        self.load_json_state(ACTIVE_TURN_STATE_KEY)
+        Ok(self.get_active_turn_state()?.map(|state| state.pending))
     }
 
     pub fn pending_reply_delivery_count(&self) -> KaiResult<usize> {

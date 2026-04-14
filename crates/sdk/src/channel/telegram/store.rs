@@ -88,19 +88,20 @@ pub(super) fn persist_text_fragments(
     state.store_json_state(BUFFERED_TEXT_FRAGMENTS_STATE_KEY, &persisted)
 }
 
-pub(super) fn recover_active_turn(state: &StateStore) -> KaiResult<()> {
-    let Some(active) = state.load_json_state::<PendingTurn>(ACTIVE_TURN_STATE_KEY)? else {
-        return Ok(());
+pub(super) fn recover_active_turn(state: &StateStore) -> KaiResult<Option<ActiveTurnState>> {
+    let Some(active) = state.get_active_turn_state()? else {
+        return Ok(None);
     };
 
     if !state
         .pending_turn_queue()?
         .iter()
-        .any(|queued| queued.id == active.id)
+        .any(|queued| queued.id == active.pending.id)
     {
-        state.prepend_pending_turn(&active)?;
+        state.prepend_pending_turn(&active.pending)?;
     }
-    state.remove_json_state(ACTIVE_TURN_STATE_KEY)
+    state.clear_active_turn_state()?;
+    Ok(Some(active))
 }
 
 pub(super) fn run_housekeeping(state: &StateStore) -> KaiResult<()> {
@@ -150,6 +151,7 @@ pub(super) fn enqueue_pending_reply_delivery(
 pub(super) async fn flush_pending_reply_deliveries(
     client: &Client,
     token: &str,
+    config: &LoadedConfig,
     state: &StateStore,
 ) -> KaiResult<()> {
     let mut deliveries = pending_reply_deliveries(state)?;
@@ -170,6 +172,15 @@ pub(super) async fn flush_pending_reply_deliveries(
                         Some(&delivery.codex_session_id),
                     )?;
                 }
+                mark_progress_done(
+                    client,
+                    token,
+                    config,
+                    state,
+                    delivery.chat_id,
+                    delivery.status_message_id,
+                )
+                .await?;
                 state.append_audit_json(&serde_json::json!({
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "event": "telegram.reply_delivered",

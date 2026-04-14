@@ -62,10 +62,24 @@ pub struct AsyncCodexTurnResult {
     pub resume_failure: Option<ResumeFailure>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexProgressEvent {
+    AgentMessage { text: String },
+    Plan { text: String },
+    CommandStarted { command: String },
+    ReasoningSummary { text: String },
+}
+
+#[derive(Debug)]
+pub enum RunningCodexTurnEvent {
+    Progress(CodexProgressEvent),
+    Completed(KaiResult<AsyncCodexTurnResult>),
+}
+
 #[derive(Debug)]
 pub struct RunningCodexTurn {
     pub pid: u32,
-    receiver: Receiver<KaiResult<AsyncCodexTurnResult>>,
+    receiver: Receiver<RunningCodexTurnEvent>,
 }
 
 pub fn run_codex_turn(
@@ -189,17 +203,20 @@ pub async fn start_codex_turn(
 
     let (sender, receiver) = mpsc::channel();
     tokio::spawn(async move {
-        let result = wait_for_codex_turn(config, child, prepared, using_resume).await;
-        let _ = sender.send(result);
+        let result =
+            wait_for_codex_turn(config, child, prepared, using_resume, sender.clone()).await;
+        let _ = sender.send(RunningCodexTurnEvent::Completed(result));
     });
 
     Ok(RunningCodexTurn { pid, receiver })
 }
 
-pub fn poll_running_codex_turn(
-    turn: &mut RunningCodexTurn,
-) -> Option<KaiResult<AsyncCodexTurnResult>> {
-    turn.receiver.try_recv().ok()
+pub fn drain_running_codex_turn_events(turn: &mut RunningCodexTurn) -> Vec<RunningCodexTurnEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = turn.receiver.try_recv() {
+        events.push(event);
+    }
+    events
 }
 
 pub fn cancel_codex_turn(turn: &RunningCodexTurn) -> KaiResult<()> {

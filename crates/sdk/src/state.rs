@@ -154,12 +154,31 @@ pub struct PendingTurn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ActiveTurnState {
+    pub pending: PendingTurn,
+    #[serde(default)]
+    pub status_message_id: Option<i64>,
+}
+
+impl From<PendingTurn> for ActiveTurnState {
+    fn from(pending: PendingTurn) -> Self {
+        Self {
+            pending,
+            status_message_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingReplyDelivery {
     pub delivery_id: String,
     pub turn_id: String,
     pub chat_id: i64,
     pub response_text: String,
     pub codex_session_id: String,
+    #[serde(default)]
+    pub status_message_id: Option<i64>,
     pub update_ids: Vec<i64>,
     pub attempts: u32,
     pub created_at: String,

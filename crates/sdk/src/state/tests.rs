@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use super::*;
 use crate::config::{
     AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
-    PathsConfig, RunnerConfig, TelegramConfig, TranscriptionConfig,
+    PathsConfig, RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig,
 };
 
 fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
@@ -21,6 +21,11 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
                     enabled: true,
                     bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
                     owner_user_id: None,
+                    progress: TelegramProgressConfig {
+                        enabled: true,
+                        edit_interval_ms: 2500,
+                        idle_update_secs: 8,
+                    },
                 },
             },
             media: MediaConfig {
@@ -286,6 +291,77 @@ fn session_view_includes_queue_metadata() {
     assert_eq!(session.queued_preview.len(), 1);
     assert_eq!(session.queued_preview[0].id, "turn-1");
     assert_eq!(session.queued_preview[0].update_count, 2);
+}
+
+#[test]
+fn active_turn_state_round_trips_with_status_message_id() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    let pending = PendingTurn {
+        id: "turn-1".to_string(),
+        enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+        channel: "telegram".to_string(),
+        update_ids: vec![1],
+        chat_id: 1,
+        sender_id: 7,
+        text: "hello".to_string(),
+        attachments: Vec::new(),
+    };
+    store
+        .set_active_turn_state(&ActiveTurnState {
+            pending: pending.clone(),
+            status_message_id: Some(42),
+        })
+        .expect("set active turn state");
+
+    let active = store
+        .get_active_turn_state()
+        .expect("load active turn state")
+        .expect("active turn state");
+    assert_eq!(active.pending.id, pending.id);
+    assert_eq!(active.status_message_id, Some(42));
+    assert_eq!(
+        store
+            .get_active_pending_turn()
+            .expect("load active pending turn")
+            .expect("active pending turn")
+            .id,
+        pending.id
+    );
+}
+
+#[test]
+fn active_turn_state_reads_legacy_pending_turn_payload() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    let pending = PendingTurn {
+        id: "turn-legacy".to_string(),
+        enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+        channel: "telegram".to_string(),
+        update_ids: vec![9],
+        chat_id: 1,
+        sender_id: 7,
+        text: "legacy".to_string(),
+        attachments: Vec::new(),
+    };
+    store
+        .store_json_state("telegram.active_turn", &pending)
+        .expect("store legacy active turn");
+
+    let active = store
+        .get_active_turn_state()
+        .expect("load active turn state")
+        .expect("active turn state");
+    assert_eq!(active.pending.id, pending.id);
+    assert_eq!(active.status_message_id, None);
 }
 
 #[test]

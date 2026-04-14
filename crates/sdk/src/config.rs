@@ -50,6 +50,14 @@ pub struct TelegramConfig {
     pub enabled: bool,
     pub bot_token_env: String,
     pub owner_user_id: Option<i64>,
+    pub progress: TelegramProgressConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramProgressConfig {
+    pub enabled: bool,
+    pub edit_interval_ms: u64,
+    pub idle_update_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +130,14 @@ struct PartialTelegramConfig {
     enabled: Option<bool>,
     bot_token_env: Option<String>,
     owner_user_id: Option<i64>,
+    progress: Option<PartialTelegramProgressConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialTelegramProgressConfig {
+    enabled: Option<bool>,
+    edit_interval_ms: Option<u64>,
+    idle_update_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -246,6 +262,11 @@ pub fn build_default_config_file() -> String {
         "enabled = true",
         "bot_token_env = \"KAI_TELEGRAM_BOT_TOKEN\"",
         "",
+        "[channel.telegram.progress]",
+        "enabled = true",
+        "edit_interval_ms = 2500",
+        "idle_update_secs = 8",
+        "",
         "[media.transcription]",
         "provider = \"groq\"",
         "groq_api_key_env = \"GROQ_API_KEY\"",
@@ -332,6 +353,11 @@ fn default_config(root_app: PathBuf) -> Config {
                 enabled: true,
                 bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
                 owner_user_id: None,
+                progress: TelegramProgressConfig {
+                    enabled: true,
+                    edit_interval_ms: 2500,
+                    idle_update_secs: 8,
+                },
             },
         },
         media: MediaConfig {
@@ -386,6 +412,17 @@ fn apply_partial_config(config: &mut Config, partial: PartialConfig) {
         }
         if telegram.owner_user_id.is_some() {
             config.channel.telegram.owner_user_id = telegram.owner_user_id;
+        }
+        if let Some(progress) = telegram.progress {
+            if let Some(enabled) = progress.enabled {
+                config.channel.telegram.progress.enabled = enabled;
+            }
+            if let Some(edit_interval_ms) = progress.edit_interval_ms {
+                config.channel.telegram.progress.edit_interval_ms = edit_interval_ms;
+            }
+            if let Some(idle_update_secs) = progress.idle_update_secs {
+                config.channel.telegram.progress.idle_update_secs = idle_update_secs;
+            }
         }
     }
 

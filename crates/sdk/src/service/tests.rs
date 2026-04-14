@@ -3,7 +3,7 @@ use tempfile::tempdir;
 use super::*;
 use crate::config::{
     AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
-    PathsConfig, RunnerConfig, TelegramConfig, TranscriptionConfig,
+    PathsConfig, RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig,
 };
 
 fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
@@ -19,6 +19,11 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
                     enabled: true,
                     bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
                     owner_user_id: None,
+                    progress: TelegramProgressConfig {
+                        enabled: true,
+                        edit_interval_ms: 2500,
+                        idle_update_secs: 8,
+                    },
                 },
             },
             media: MediaConfig {
