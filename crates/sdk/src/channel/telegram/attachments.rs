@@ -135,7 +135,7 @@ fn collect_download_requests(message: &TelegramMessage) -> Vec<DownloadRequest> 
 async fn download_file(
     client: &Client,
     token: &str,
-    config: &LoadedConfig,
+    _config: &LoadedConfig,
     state: &StateStore,
     request: DownloadRequest,
 ) -> KaiResult<AttachmentInfo> {
@@ -163,6 +163,7 @@ async fn download_file(
 
     let response = client
         .get(format!("https://api.telegram.org/bot{token}/getFile"))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .query(&[("file_id", file_id.as_str())])
         .send()
         .await
@@ -207,6 +208,7 @@ async fn download_file(
         .get(format!(
             "https://api.telegram.org/file/bot{token}/{file_path}"
         ))
+        .timeout(TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(http_error("download Telegram file"))?;
@@ -261,7 +263,7 @@ async fn download_file(
 
     let checksum_blake3 = hasher.finalize().to_hex().to_string();
 
-    let mut attachment = AttachmentInfo {
+    let attachment = AttachmentInfo {
         kind: kind.as_str().to_string(),
         path: local_path.display().to_string(),
         original_name,
@@ -277,8 +279,6 @@ async fn download_file(
         artifacts: Vec::new(),
         notes: Vec::new(),
     };
-    enrich_attachment(config, &mut attachment).await?;
-
     Ok(attachment)
 }
 

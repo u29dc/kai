@@ -73,6 +73,7 @@ pub enum CodexProgressEvent {
 #[derive(Debug)]
 pub enum RunningCodexTurnEvent {
     Progress(CodexProgressEvent),
+    ResumeFailure(ResumeFailure),
     Completed(KaiResult<AsyncCodexTurnResult>),
 }
 

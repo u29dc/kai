@@ -89,19 +89,7 @@ pub(super) fn persist_text_fragments(
 }
 
 pub(super) fn recover_active_turn(state: &StateStore) -> KaiResult<Option<ActiveTurnState>> {
-    let Some(active) = state.get_active_turn_state()? else {
-        return Ok(None);
-    };
-
-    if !state
-        .pending_turn_queue()?
-        .iter()
-        .any(|queued| queued.id == active.pending.id)
-    {
-        state.prepend_pending_turn(&active.pending)?;
-    }
-    state.clear_active_turn_state()?;
-    Ok(Some(active))
+    state.recover_active_turn()
 }
 
 pub(super) fn run_housekeeping(state: &StateStore) -> KaiResult<()> {
@@ -122,30 +110,11 @@ pub(super) fn run_housekeeping(state: &StateStore) -> KaiResult<()> {
     Ok(())
 }
 
-fn pending_reply_deliveries(state: &StateStore) -> KaiResult<Vec<PendingReplyDelivery>> {
-    Ok(state
-        .load_json_state::<Vec<PendingReplyDelivery>>(PENDING_REPLY_DELIVERIES_STATE_KEY)?
-        .unwrap_or_default())
-}
-
-fn store_pending_reply_deliveries(
-    state: &StateStore,
-    deliveries: &[PendingReplyDelivery],
-) -> KaiResult<()> {
-    if deliveries.is_empty() {
-        return state.remove_json_state(PENDING_REPLY_DELIVERIES_STATE_KEY);
-    }
-    state.store_json_state(PENDING_REPLY_DELIVERIES_STATE_KEY, deliveries)
-}
-
 pub(super) fn enqueue_pending_reply_delivery(
     state: &StateStore,
     delivery: PendingReplyDelivery,
 ) -> KaiResult<()> {
-    let mut deliveries = pending_reply_deliveries(state)?;
-    deliveries.retain(|existing| existing.turn_id != delivery.turn_id);
-    deliveries.push(delivery);
-    store_pending_reply_deliveries(state, &deliveries)
+    state.enqueue_pending_reply_delivery(&delivery)
 }
 
 pub(super) async fn flush_pending_reply_deliveries(
@@ -154,59 +123,85 @@ pub(super) async fn flush_pending_reply_deliveries(
     config: &LoadedConfig,
     state: &StateStore,
 ) -> KaiResult<()> {
-    let mut deliveries = pending_reply_deliveries(state)?;
+    let deliveries = state.pending_reply_deliveries()?;
     if deliveries.is_empty() {
         return Ok(());
     }
 
-    let mut remaining = Vec::new();
-    for mut delivery in deliveries.drain(..) {
-        match send_message_with_retry(client, token, delivery.chat_id, &delivery.response_text)
-            .await
-        {
-            Ok(()) => {
-                for update_id in &delivery.update_ids {
-                    state.set_processed_update(
-                        *update_id,
-                        &delivery.response_text,
-                        Some(&delivery.codex_session_id),
+    for mut delivery in deliveries {
+        if delivery.response_text.trim().is_empty() {
+            state.finalize_pending_reply_delivery(&delivery)?;
+            state.append_audit_json(&serde_json::json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "event": "telegram.reply_delivered",
+                "deliveryId": delivery.delivery_id,
+                "turnId": delivery.turn_id,
+                "chatId": delivery.chat_id,
+                "attempts": delivery.attempts,
+                "updateIds": delivery.update_ids,
+                "chunksSent": 0,
+            }))?;
+            continue;
+        }
+
+        let chunks = split_response_text(&delivery.response_text);
+        let mut completed = true;
+        for (index, chunk) in chunks.iter().enumerate().skip(delivery.next_chunk_index) {
+            match send_message_chunk_with_retry(client, token, delivery.chat_id, chunk).await {
+                Ok(message_id) => {
+                    state.record_pending_reply_delivery_chunk(
+                        &delivery.delivery_id,
+                        index + 1,
+                        message_id,
                     )?;
+                    delivery.next_chunk_index = index + 1;
+                    delivery.sent_message_ids.push(message_id);
                 }
-                mark_progress_done(
-                    client,
-                    token,
-                    config,
-                    state,
-                    delivery.chat_id,
-                    delivery.status_message_id,
-                )
-                .await?;
-                state.append_audit_json(&serde_json::json!({
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "event": "telegram.reply_delivered",
-                    "deliveryId": delivery.delivery_id,
-                    "turnId": delivery.turn_id,
-                    "chatId": delivery.chat_id,
-                    "attempts": delivery.attempts + 1,
-                    "updateIds": delivery.update_ids,
-                }))?;
-            }
-            Err(error) => {
-                delivery.attempts = delivery.attempts.saturating_add(1);
-                state.append_audit_json(&serde_json::json!({
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "event": "telegram.reply_delivery_retry",
-                    "deliveryId": delivery.delivery_id,
-                    "turnId": delivery.turn_id,
-                    "chatId": delivery.chat_id,
-                    "attempts": delivery.attempts,
-                    "message": error.message,
-                    "hint": error.hint,
-                }))?;
-                remaining.push(delivery);
+                Err(error) => {
+                    let attempts =
+                        state.increment_pending_reply_delivery_attempts(&delivery.delivery_id)?;
+                    state.append_audit_json(&serde_json::json!({
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "event": "telegram.reply_delivery_retry",
+                        "deliveryId": delivery.delivery_id,
+                        "turnId": delivery.turn_id,
+                        "chatId": delivery.chat_id,
+                        "attempts": attempts,
+                        "nextChunkIndex": delivery.next_chunk_index,
+                        "message": error.message,
+                        "hint": error.hint,
+                    }))?;
+                    completed = false;
+                    break;
+                }
             }
         }
+
+        if !completed {
+            continue;
+        }
+
+        state.finalize_pending_reply_delivery(&delivery)?;
+        mark_progress_done(
+            client,
+            token,
+            config,
+            state,
+            delivery.chat_id,
+            delivery.status_message_id,
+        )
+        .await?;
+        state.append_audit_json(&serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "event": "telegram.reply_delivered",
+            "deliveryId": delivery.delivery_id,
+            "turnId": delivery.turn_id,
+            "chatId": delivery.chat_id,
+            "attempts": delivery.attempts.saturating_add(1),
+            "updateIds": delivery.update_ids,
+            "chunksSent": delivery.next_chunk_index,
+        }))?;
     }
 
-    store_pending_reply_deliveries(state, &remaining)
+    Ok(())
 }

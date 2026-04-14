@@ -365,6 +365,214 @@ fn active_turn_state_reads_legacy_pending_turn_payload() {
 }
 
 #[test]
+fn claim_next_pending_turn_moves_queue_head_into_active_state() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-1".to_string(),
+            enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![1],
+            chat_id: 1,
+            sender_id: 7,
+            text: "first".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("enqueue first");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-2".to_string(),
+            enqueued_at: "2026-04-12T00:01:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![2],
+            chat_id: 1,
+            sender_id: 7,
+            text: "second".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("enqueue second");
+
+    let active = store
+        .claim_next_pending_turn()
+        .expect("claim pending turn")
+        .expect("active turn");
+    assert_eq!(active.pending.id, "turn-1");
+    assert_eq!(store.pending_turn_queue_len().expect("queue length"), 1);
+    assert_eq!(
+        store
+            .get_active_turn_state()
+            .expect("get active turn state")
+            .expect("persisted active turn")
+            .pending
+            .id,
+        "turn-1"
+    );
+}
+
+#[test]
+fn recover_active_turn_requeues_claimed_turn_once() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .enqueue_pending_turn(&PendingTurn {
+            id: "turn-1".to_string(),
+            enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            channel: "telegram".to_string(),
+            update_ids: vec![1],
+            chat_id: 1,
+            sender_id: 7,
+            text: "first".to_string(),
+            attachments: Vec::new(),
+        })
+        .expect("enqueue turn");
+    let claimed = store
+        .claim_next_pending_turn()
+        .expect("claim turn")
+        .expect("claimed turn");
+    let recovered = store
+        .recover_active_turn()
+        .expect("recover active turn")
+        .expect("recovered turn");
+
+    assert_eq!(claimed.pending.id, recovered.pending.id);
+    assert!(
+        store
+            .get_active_turn_state()
+            .expect("load active")
+            .is_none()
+    );
+    assert_eq!(store.pending_turn_queue_len().expect("queue length"), 1);
+    assert!(
+        store
+            .recover_active_turn()
+            .expect("recover again should succeed")
+            .is_none()
+    );
+}
+
+#[test]
+fn pending_reply_delivery_round_trips_progress_and_clears_matching_active_turn() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    let pending = PendingTurn {
+        id: "turn-1".to_string(),
+        enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+        channel: "telegram".to_string(),
+        update_ids: vec![1, 2],
+        chat_id: 1,
+        sender_id: 7,
+        text: "hello".to_string(),
+        attachments: Vec::new(),
+    };
+    store
+        .set_active_turn_state(&ActiveTurnState {
+            pending: pending.clone(),
+            status_message_id: Some(42),
+        })
+        .expect("set active turn state");
+    store
+        .enqueue_pending_reply_delivery(&PendingReplyDelivery {
+            delivery_id: "delivery-1".to_string(),
+            turn_id: pending.id.clone(),
+            chat_id: pending.chat_id,
+            response_text: "first\nsecond".to_string(),
+            codex_session_id: "session-1".to_string(),
+            status_message_id: Some(42),
+            update_ids: pending.update_ids.clone(),
+            attempts: 0,
+            created_at: "2026-04-12T00:05:00Z".to_string(),
+            next_chunk_index: 0,
+            sent_message_ids: Vec::new(),
+        })
+        .expect("enqueue pending reply delivery");
+
+    assert!(
+        store
+            .get_active_turn_state()
+            .expect("load active turn")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .pending_reply_delivery_count()
+            .expect("pending reply delivery count"),
+        1
+    );
+
+    store
+        .record_pending_reply_delivery_chunk("delivery-1", 1, 777)
+        .expect("record first chunk");
+    let attempts = store
+        .increment_pending_reply_delivery_attempts("delivery-1")
+        .expect("increment attempts");
+    assert_eq!(attempts, 1);
+
+    let deliveries = store
+        .pending_reply_deliveries()
+        .expect("load pending reply deliveries");
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].next_chunk_index, 1);
+    assert_eq!(deliveries[0].sent_message_ids, vec![777]);
+    assert_eq!(deliveries[0].attempts, 1);
+}
+
+#[test]
+fn finalize_pending_reply_delivery_marks_updates_processed_and_removes_delivery() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    let delivery = PendingReplyDelivery {
+        delivery_id: "delivery-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        chat_id: 1,
+        response_text: "done".to_string(),
+        codex_session_id: "session-1".to_string(),
+        status_message_id: Some(42),
+        update_ids: vec![11, 12],
+        attempts: 0,
+        created_at: "2026-04-12T00:05:00Z".to_string(),
+        next_chunk_index: 1,
+        sent_message_ids: vec![777],
+    };
+    store
+        .enqueue_pending_reply_delivery(&delivery)
+        .expect("enqueue delivery");
+
+    store
+        .finalize_pending_reply_delivery(&delivery)
+        .expect("finalize delivery");
+
+    assert_eq!(
+        store
+            .pending_reply_delivery_count()
+            .expect("pending reply delivery count"),
+        0
+    );
+    let processed = store
+        .get_processed_update(11)
+        .expect("processed update")
+        .expect("processed update must exist");
+    assert_eq!(processed.response_text, "done");
+    assert_eq!(processed.codex_session_id.as_deref(), Some("session-1"));
+}
+
+#[test]
 fn cleanup_staged_attachments_removes_partial_and_stale_files() {
     let tempdir = tempdir().expect("tempdir");
     let root_app = tempdir.path().join("kai-home");

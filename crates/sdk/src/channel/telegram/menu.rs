@@ -26,12 +26,14 @@ pub(super) async fn sync_command_menu_if_needed(
         .post(format!(
             "https://api.telegram.org/bot{token}/deleteMyCommands"
         ))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&serde_json::json!({ "scope": scope }))
         .send()
         .await;
 
     let response = client
         .post(format!("https://api.telegram.org/bot{token}/setMyCommands"))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&serde_json::json!({
             "scope": scope,
             "commands": commands,

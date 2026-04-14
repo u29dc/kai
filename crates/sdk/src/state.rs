@@ -23,7 +23,10 @@ mod schema;
 mod tests;
 mod turns;
 
-use self::schema::{initialize_schema, migrate_pending_turn_queue_from_kv};
+use self::schema::{
+    initialize_schema, migrate_active_turn_state_from_kv, migrate_pending_reply_deliveries_from_kv,
+    migrate_pending_turn_queue_from_kv,
+};
 
 pub const MAX_PENDING_TURNS: usize = 24;
 const ACTIVE_TURN_STATE_KEY: &str = "telegram.active_turn";
@@ -182,6 +185,10 @@ pub struct PendingReplyDelivery {
     pub update_ids: Vec<i64>,
     pub attempts: u32,
     pub created_at: String,
+    #[serde(default)]
+    pub next_chunk_index: usize,
+    #[serde(default)]
+    pub sent_message_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,12 +264,37 @@ impl StateStore {
         ensure_private_file(&paths.audit_path)?;
         initialize_schema(&connection)?;
         migrate_pending_turn_queue_from_kv(&connection)?;
+        migrate_active_turn_state_from_kv(&connection)?;
+        migrate_pending_reply_deliveries_from_kv(&connection)?;
 
         Ok(Self { connection, paths })
     }
 
     pub fn paths(&self) -> &StatePaths {
         &self.paths
+    }
+
+    pub(crate) fn with_transaction<T>(
+        &self,
+        action: &'static str,
+        operation: impl FnOnce(&Connection) -> KaiResult<T>,
+    ) -> KaiResult<T> {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION")
+            .map_err(sql_state_error(action))?;
+
+        match operation(&self.connection) {
+            Ok(value) => {
+                self.connection
+                    .execute_batch("COMMIT")
+                    .map_err(sql_state_error(action))?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn session_view(&self) -> KaiResult<SessionView> {

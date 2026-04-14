@@ -240,6 +240,7 @@ async fn send_uploaded_file(
             "https://api.telegram.org/bot{token}/{}",
             upload.method
         ))
+        .timeout(TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT)
         .multipart(form)
         .send()
         .await

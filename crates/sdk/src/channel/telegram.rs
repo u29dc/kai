@@ -62,6 +62,9 @@ const TELEGRAM_TEXT_LIMIT: usize = 4096;
 const MAX_OUTBOUND_ATTACHMENTS_PER_REPLY: usize = 4;
 const TELEGRAM_SEND_RETRY_ATTEMPTS: u32 = 3;
 const TELEGRAM_SEND_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const TELEGRAM_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const TELEGRAM_DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const TELEGRAM_LONG_POLL_TIMEOUT_SLACK_SECS: u64 = 15;
 const TEXT_FRAGMENT_START_THRESHOLD_CHARS: usize = 3500;
 const TEXT_FRAGMENT_MAX_TOTAL_CHARS: usize = 24_000;
 const TEXT_FRAGMENT_MAX_PARTS: usize = 6;
@@ -69,7 +72,6 @@ const TEXT_FRAGMENT_MAX_ID_GAP: i64 = 5;
 const TEXT_FRAGMENT_MAX_GAP: Duration = Duration::from_millis(1400);
 const BUFFERED_MEDIA_GROUPS_STATE_KEY: &str = "telegram.buffered_media_groups";
 const BUFFERED_TEXT_FRAGMENTS_STATE_KEY: &str = "telegram.buffered_text_fragments";
-const PENDING_REPLY_DELIVERIES_STATE_KEY: &str = "telegram.pending_reply_deliveries";
 const PROCESSED_UPDATE_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 14);
 const UPDATE_FAILURE_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 const MAX_TURN_ROWS: usize = 5000;
@@ -83,12 +85,15 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
     }
 
     let token = telegram_token(config)?;
-    let client = Client::builder().build().map_err(|error| {
-        KaiError::new(
-            ErrorCode::RuntimeError,
-            format!("failed to build http client: {error}"),
-        )
-    })?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("failed to build http client: {error}"),
+            )
+        })?;
 
     let mut offset = state.get_update_offset()?;
     let mut next_cleanup_at = Instant::now();
@@ -167,6 +172,11 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                             now,
                         )
                         .await?;
+                    }
+                    RunningCodexTurnEvent::ResumeFailure(resume_failure) => {
+                        if resume_failure.stale_session {
+                            state.clear_active_session_id()?;
+                        }
                     }
                     RunningCodexTurnEvent::Completed(result) => {
                         completed = Some(result);
@@ -378,11 +388,14 @@ pub async fn send_telegram_message(
     text: &str,
 ) -> KaiResult<()> {
     let token = telegram_token(config)?;
-    let client = Client::builder().build().map_err(|error| {
-        KaiError::new(
-            ErrorCode::RuntimeError,
-            format!("failed to build http client: {error}"),
-        )
-    })?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("failed to build http client: {error}"),
+            )
+        })?;
     send_message(&client, &token, chat_id, text).await
 }

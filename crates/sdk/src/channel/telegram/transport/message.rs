@@ -29,29 +29,35 @@ pub(super) async fn send_message_with_retry(
     }
 
     for chunk in split_response_text(text) {
-        let mut last_error: Option<KaiError> = None;
-        for attempt in 0..TELEGRAM_SEND_RETRY_ATTEMPTS {
-            match send_message_chunk(client, token, chat_id, &chunk).await {
-                Ok(()) => {
-                    last_error = None;
-                    break;
-                }
-                Err(error) if should_retry_telegram_send(&error) => {
-                    last_error = Some(error);
-                    if attempt + 1 < TELEGRAM_SEND_RETRY_ATTEMPTS {
-                        sleep(TELEGRAM_SEND_RETRY_BACKOFF).await;
-                        continue;
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        if let Some(error) = last_error {
-            return Err(error);
-        }
+        let _ = send_message_chunk_with_retry(client, token, chat_id, &chunk).await?;
     }
 
     Ok(())
+}
+
+pub(super) async fn send_message_chunk_with_retry(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> KaiResult<i64> {
+    let mut last_error: Option<KaiError> = None;
+    for attempt in 0..TELEGRAM_SEND_RETRY_ATTEMPTS {
+        match send_message_chunk(client, token, chat_id, text).await {
+            Ok(message_id) => return Ok(message_id),
+            Err(error) if should_retry_telegram_send(&error) => {
+                last_error = Some(error);
+                if attempt + 1 < TELEGRAM_SEND_RETRY_ATTEMPTS {
+                    sleep(TELEGRAM_SEND_RETRY_BACKOFF).await;
+                    continue;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| KaiError::new(ErrorCode::RuntimeError, "Telegram sendMessage failed")))
 }
 
 pub(super) async fn send_status_message_with_retry(
@@ -127,7 +133,7 @@ async fn send_message_chunk(
     token: &str,
     chat_id: i64,
     text: &str,
-) -> KaiResult<()> {
+) -> KaiResult<i64> {
     let formatted = format_telegram_html(text);
     if formatted.chars().count() > TELEGRAM_TEXT_LIMIT {
         return send_plain_text_message_chunk(client, token, chat_id, text).await;
@@ -135,6 +141,7 @@ async fn send_message_chunk(
 
     let response = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&SendMessageRequest {
             chat_id,
             text: formatted.clone(),
@@ -145,12 +152,20 @@ async fn send_message_chunk(
         .map_err(http_error("send Telegram message"))?;
 
     let payload = response
-        .json::<TelegramApiResponse<serde_json::Value>>()
+        .json::<TelegramApiResponse<TelegramSentMessage>>()
         .await
         .map_err(http_error("decode Telegram sendMessage response"))?;
 
     if payload.ok {
-        return Ok(());
+        return payload
+            .result
+            .map(|message| message.message_id)
+            .ok_or_else(|| {
+                KaiError::new(
+                    ErrorCode::RuntimeError,
+                    "Telegram message send was missing a message id",
+                )
+            });
     }
 
     let description = payload
@@ -177,6 +192,7 @@ async fn send_status_message_chunk(
 
     let response = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&SendMessageRequest {
             chat_id,
             text: formatted.clone(),
@@ -219,9 +235,10 @@ async fn send_plain_text_message_chunk(
     token: &str,
     chat_id: i64,
     text: &str,
-) -> KaiResult<()> {
+) -> KaiResult<i64> {
     let response = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&SendMessageRequest {
             chat_id,
             text: text.to_string(),
@@ -232,12 +249,20 @@ async fn send_plain_text_message_chunk(
         .map_err(http_error("send Telegram plain-text message"))?;
 
     let payload = response
-        .json::<TelegramApiResponse<serde_json::Value>>()
+        .json::<TelegramApiResponse<TelegramSentMessage>>()
         .await
         .map_err(http_error("decode Telegram plain-text response"))?;
 
     if payload.ok {
-        return Ok(());
+        return payload
+            .result
+            .map(|message| message.message_id)
+            .ok_or_else(|| {
+                KaiError::new(
+                    ErrorCode::RuntimeError,
+                    "Telegram plain-text send was missing a message id",
+                )
+            });
     }
 
     Err(KaiError::new(
@@ -256,6 +281,7 @@ async fn send_plain_status_message_chunk(
 ) -> KaiResult<i64> {
     let response = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&SendMessageRequest {
             chat_id,
             text: text.to_string(),
@@ -306,6 +332,7 @@ async fn edit_message_text(
         .post(format!(
             "https://api.telegram.org/bot{token}/editMessageText"
         ))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&EditMessageTextRequest {
             chat_id,
             message_id,
@@ -349,6 +376,7 @@ async fn edit_plain_text_message(
         .post(format!(
             "https://api.telegram.org/bot{token}/editMessageText"
         ))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&EditMessageTextRequest {
             chat_id,
             message_id,
@@ -389,6 +417,7 @@ pub(super) async fn send_typing_indicator(
         .post(format!(
             "https://api.telegram.org/bot{token}/sendChatAction"
         ))
+        .timeout(TELEGRAM_API_REQUEST_TIMEOUT)
         .json(&SendChatActionRequest {
             chat_id,
             action: "typing".to_string(),

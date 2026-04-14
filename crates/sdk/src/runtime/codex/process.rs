@@ -99,6 +99,13 @@ pub(super) async fn wait_for_codex_turn(
         if let Some(requested_session_id) = &prepared.requested_session_id
             && is_stale_resume_error(&error)
         {
+            let resume_failure = ResumeFailure {
+                requested_session_id: requested_session_id.clone(),
+                stale_session: true,
+                error: error.clone(),
+            };
+            let _ =
+                progress_sender.send(RunningCodexTurnEvent::ResumeFailure(resume_failure.clone()));
             let fallback =
                 run_exec_async_fallback(&config, &prepared, progress_sender.clone()).await?;
             return Ok(AsyncCodexTurnResult {
@@ -108,11 +115,7 @@ pub(super) async fn wait_for_codex_turn(
                     resumed: false,
                     context_snapshots: prepared.context_snapshots,
                 },
-                resume_failure: Some(ResumeFailure {
-                    requested_session_id: requested_session_id.clone(),
-                    stale_session: true,
-                    error,
-                }),
+                resume_failure: Some(resume_failure),
             });
         }
 
@@ -595,6 +598,9 @@ mod tests {
             .try_iter()
             .map(|event| match event {
                 RunningCodexTurnEvent::Progress(progress) => progress,
+                RunningCodexTurnEvent::ResumeFailure(_) => {
+                    panic!("unexpected resume failure event")
+                }
                 RunningCodexTurnEvent::Completed(_) => panic!("unexpected completed event"),
             })
             .collect::<Vec<_>>();

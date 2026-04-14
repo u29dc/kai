@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use reqwest::{Client, multipart};
 use serde::{Deserialize, Serialize};
@@ -163,8 +164,17 @@ async fn transcribe_with_groq(
         .text("response_format", "verbose_json".to_string())
         .part("file", part);
 
-    let response = Client::new()
+    let response = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("failed to build Groq speech-to-text client: {error}"),
+            )
+        })?
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .timeout(Duration::from_secs(180))
         .bearer_auth(api_key)
         .multipart(form)
         .send()

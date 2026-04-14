@@ -21,6 +21,15 @@ pub(super) async fn send_message_with_retry(
     message::send_message_with_retry(client, token, chat_id, text).await
 }
 
+pub(super) async fn send_message_chunk_with_retry(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> KaiResult<i64> {
+    message::send_message_chunk_with_retry(client, token, chat_id, text).await
+}
+
 pub(super) async fn send_status_message(
     client: &Client,
     token: &str,

@@ -12,6 +12,9 @@ pub(super) async fn get_updates(
 ) -> KaiResult<Vec<TelegramUpdate>> {
     let response = client
         .get(format!("https://api.telegram.org/bot{token}/getUpdates"))
+        .timeout(Duration::from_secs(
+            timeout_seconds + TELEGRAM_LONG_POLL_TIMEOUT_SLACK_SECS,
+        ))
         .query(&[
             ("offset", offset.to_string()),
             ("timeout", timeout_seconds.to_string()),

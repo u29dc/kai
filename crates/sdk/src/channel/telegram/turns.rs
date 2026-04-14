@@ -71,18 +71,26 @@ pub(super) async fn maybe_start_next_pending_turn(
         return Ok(());
     }
 
-    let Some(pending) = state.pop_pending_turn()? else {
+    let Some(active_state) = state.claim_next_pending_turn()? else {
         return Ok(());
     };
-    state.set_active_turn_state(&ActiveTurnState {
-        pending: pending.clone(),
-        status_message_id: None,
-    })?;
+    let mut pending = active_state.pending;
 
     if pending.text.is_empty() && pending.attachments.is_empty() {
         state.clear_active_turn_state()?;
         return Ok(());
     }
+
+    enrich_pending_turn_attachments(config, &mut pending)
+        .await
+        .inspect_err(|_| {
+            let _ = state.clear_active_turn_state();
+            let _ = state.prepend_pending_turn(&pending);
+        })?;
+    state.set_active_turn_state(&ActiveTurnState {
+        pending: pending.clone(),
+        status_message_id: None,
+    })?;
 
     let prepared = prepare_codex_turn(
         config,
@@ -145,9 +153,7 @@ pub(super) async fn finish_active_turn(
 ) -> KaiResult<()> {
     match result {
         Ok(async_result) => {
-            finalize_successful_turn(client, token, config, state, active_turn, async_result)
-                .await?;
-            state.clear_active_turn_state()
+            finalize_successful_turn(client, token, config, state, active_turn, async_result).await
         }
         Err(error) => {
             state.clear_active_turn_state()?;
@@ -260,6 +266,8 @@ async fn finalize_successful_turn(
             update_ids: active_turn.pending.update_ids.clone(),
             attempts: 0,
             created_at: chrono::Utc::now().to_rfc3339(),
+            next_chunk_index: 0,
+            sent_message_ids: Vec::new(),
         },
     )?;
 
@@ -342,6 +350,16 @@ fn is_terminal_update_error(error: &KaiError) -> bool {
             | ErrorCode::ConfigError
             | ErrorCode::ToolNotFound
     )
+}
+
+async fn enrich_pending_turn_attachments(
+    config: &LoadedConfig,
+    pending: &mut PendingTurn,
+) -> KaiResult<()> {
+    for attachment in &mut pending.attachments {
+        enrich_attachment(config, attachment).await?;
+    }
+    Ok(())
 }
 
 pub(super) fn failure_notice_text(error: &KaiError, attempt_count: u32) -> String {
