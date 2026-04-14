@@ -5,11 +5,11 @@
     "": {
       "name": "kai",
       "devDependencies": {
-        "@biomejs/biome": "^2.4.11",
-        "@commitlint/cli": "^20.5.0",
-        "@commitlint/config-conventional": "^20.5.0",
-        "husky": "^9.1.7",
-        "lint-staged": "^16.4.0",
+        "@biomejs/biome": "latest",
+        "@commitlint/cli": "latest",
+        "@commitlint/config-conventional": "latest",
+        "husky": "latest",
+        "lint-staged": "latest",
       },
     },
   },
