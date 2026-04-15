@@ -193,7 +193,7 @@ async fn handle_mobile_command(
         MobileCommand::Reset => {
             if let Some(turn) = active_turn.as_mut() {
                 turn.cancel_requested = true;
-                let _ = cancel_codex_turn(&turn.running);
+                let _ = cancel_agent_turn(&turn.running);
             }
             state.clear_active_session_id()?;
             state.clear_replay_package()?;
@@ -211,7 +211,7 @@ async fn handle_mobile_command(
                     .await;
             };
             turn.cancel_requested = true;
-            cancel_codex_turn(&turn.running)?;
+            cancel_agent_turn(&turn.running)?;
             send_message(
                 client,
                 token,

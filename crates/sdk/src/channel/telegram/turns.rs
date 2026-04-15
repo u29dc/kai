@@ -92,7 +92,7 @@ pub(super) async fn maybe_start_next_pending_turn(
         status_message_id: None,
     })?;
 
-    let prepared = prepare_codex_turn(
+    let prepared = prepare_agent_turn(
         config,
         state,
         &pending.channel,
@@ -105,7 +105,7 @@ pub(super) async fn maybe_start_next_pending_turn(
         let _ = state.prepend_pending_turn(&pending);
     })?;
 
-    let running = match start_codex_turn(config.clone(), prepared).await {
+    let running = match start_agent_turn(config.clone(), prepared).await {
         Ok(running) => running,
         Err(error) => {
             let _ = state.clear_active_turn_state();
@@ -149,7 +149,7 @@ pub(super) async fn finish_active_turn(
     config: &LoadedConfig,
     state: &StateStore,
     active_turn: &ActiveOwnerTurn,
-    result: KaiResult<AsyncCodexTurnResult>,
+    result: KaiResult<AsyncAgentTurnResult>,
 ) -> KaiResult<()> {
     match result {
         Ok(async_result) => {
@@ -210,12 +210,13 @@ async fn finalize_successful_turn(
     config: &LoadedConfig,
     state: &StateStore,
     active_turn: &ActiveOwnerTurn,
-    async_result: AsyncCodexTurnResult,
+    async_result: AsyncAgentTurnResult,
 ) -> KaiResult<()> {
-    if let Some(ResumeFailure {
+    if let Some(AgentResumeFailure {
         requested_session_id,
         stale_session,
         error,
+        ..
     }) = async_result.resume_failure
     {
         state.append_audit_json(&serde_json::json!({

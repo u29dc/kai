@@ -7,6 +7,9 @@ fn build_default_config_contains_expected_sections() {
     assert!(config.contains("[channel.telegram]"));
     assert!(config.contains("[channel.telegram.progress]"));
     assert!(config.contains("[paths]"));
+    assert!(config.contains("[runner]"));
+    assert!(config.contains("provider = \"codex\""));
+    assert!(config.contains("[runner.codex]"));
 }
 
 #[test]

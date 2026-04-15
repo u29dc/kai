@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::codex::CodexProgressEvent;
+use crate::runtime::agent::AgentProgressEvent;
 use crate::state::ActiveTurnState;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::path::Path;
@@ -85,7 +85,7 @@ pub(super) async fn handle_progress_event(
     config: &LoadedConfig,
     state: &StateStore,
     turn: &mut ActiveOwnerTurn,
-    event: &CodexProgressEvent,
+    event: &AgentProgressEvent,
     now: Instant,
 ) -> KaiResult<()> {
     turn.progress.last_event_at = now;
@@ -339,12 +339,12 @@ fn record_progress_error(
     }))
 }
 
-fn progress_text_for_event(event: &CodexProgressEvent) -> Option<String> {
+fn progress_text_for_event(event: &AgentProgressEvent) -> Option<String> {
     match event {
-        CodexProgressEvent::AgentMessage { text } => progress_text_from_agent_message(text),
-        CodexProgressEvent::Plan { .. } => Some("Updating plan.".to_string()),
-        CodexProgressEvent::CommandStarted { command } => command_progress_text(command),
-        CodexProgressEvent::ReasoningSummary { .. } => None,
+        AgentProgressEvent::AgentMessage { text } => progress_text_from_agent_message(text),
+        AgentProgressEvent::Plan { .. } => Some("Updating plan.".to_string()),
+        AgentProgressEvent::CommandStarted { command } => command_progress_text(command),
+        AgentProgressEvent::ReasoningSummary { .. } => None,
     }
 }
 

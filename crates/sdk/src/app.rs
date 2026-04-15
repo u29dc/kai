@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::config::LoadedConfig;
 use crate::context::context_report;
 use crate::error::KaiResult;
-use crate::runtime::codex::{create_replay_package, run_codex_turn};
+use crate::runtime::agent::{create_replay_package, run_agent_turn};
 use crate::state::{AttachmentInfo, NewTurn, StateStore};
 
 pub fn handle_owner_prompt(
@@ -26,7 +26,7 @@ pub fn handle_owner_prompt(
         attachments,
     })?;
 
-    let result = run_codex_turn(config, state, channel, sender_id, text, attachments)?;
+    let result = run_agent_turn(config, state, channel, sender_id, text, attachments)?;
 
     state.record_turn(NewTurn {
         role: "assistant",

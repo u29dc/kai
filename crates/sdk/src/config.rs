@@ -82,7 +82,16 @@ pub struct TranscriptionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerConfig {
+    pub provider: RunnerProvider,
     pub codex: CodexConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunnerProvider {
+    #[default]
+    Codex,
+    Claude,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +170,7 @@ struct PartialTranscriptionConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialRunnerConfig {
+    provider: Option<RunnerProvider>,
     codex: Option<PartialCodexConfig>,
 }
 
@@ -276,6 +286,9 @@ pub fn build_default_config_file() -> String {
         "root_app = \"~/.tools/kai\"",
         "root_work = \"~/.tools/kai/work\"",
         "",
+        "[runner]",
+        "provider = \"codex\"",
+        "",
         "[runner.codex]",
         "binary = \"codex\"",
         "",
@@ -373,6 +386,7 @@ fn default_config(root_app: PathBuf) -> Config {
             root_work: root_work.display().to_string(),
         },
         runner: RunnerConfig {
+            provider: RunnerProvider::Codex,
             codex: CodexConfig {
                 binary: "codex".to_string(),
                 override_config: None,
@@ -452,17 +466,21 @@ fn apply_partial_config(config: &mut Config, partial: PartialConfig) {
         }
     }
 
-    if let Some(runner) = partial.runner
-        && let Some(codex) = runner.codex
-    {
-        if let Some(binary) = codex.binary {
-            config.runner.codex.binary = binary;
+    if let Some(runner) = partial.runner {
+        if let Some(provider) = runner.provider {
+            config.runner.provider = provider;
         }
-        if let Some(override_config) = codex.override_config {
-            config.runner.codex.override_config = Some(CodexOverride {
-                approval_policy: override_config.approval_policy,
-                sandbox_mode: override_config.sandbox_mode,
-            });
+
+        if let Some(codex) = runner.codex {
+            if let Some(binary) = codex.binary {
+                config.runner.codex.binary = binary;
+            }
+            if let Some(override_config) = codex.override_config {
+                config.runner.codex.override_config = Some(CodexOverride {
+                    approval_policy: override_config.approval_policy,
+                    sandbox_mode: override_config.sandbox_mode,
+                });
+            }
         }
     }
 

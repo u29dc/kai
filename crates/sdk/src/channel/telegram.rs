@@ -19,10 +19,10 @@ use crate::media::{
     MAX_MEDIA_GROUP_ITEMS, MEDIA_GROUP_DEBOUNCE, attachment_byte_limit, classify_document_kind,
     enrich_attachment,
 };
-use crate::runtime::codex::{
-    AsyncCodexTurnResult, ResumeFailure, RunningCodexTurn, RunningCodexTurnEvent,
-    cancel_codex_turn, create_replay_package, drain_running_codex_turn_events, prepare_codex_turn,
-    start_codex_turn,
+use crate::runtime::agent::{
+    AgentResumeFailure, AsyncAgentTurnResult, RunningAgentTurn, RunningAgentTurnEvent,
+    cancel_agent_turn, create_replay_package, drain_running_agent_turn_events, prepare_agent_turn,
+    start_agent_turn,
 };
 use crate::secrets::resolve_telegram_token;
 use crate::state::{
@@ -159,9 +159,9 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             }
 
             let mut completed = None;
-            for event in drain_running_codex_turn_events(&mut turn.running) {
+            for event in drain_running_agent_turn_events(&mut turn.running) {
                 match event {
-                    RunningCodexTurnEvent::Progress(progress_event) => {
+                    RunningAgentTurnEvent::Progress(progress_event) => {
                         handle_progress_event(
                             &client,
                             &token,
@@ -173,12 +173,12 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                         )
                         .await?;
                     }
-                    RunningCodexTurnEvent::ResumeFailure(resume_failure) => {
+                    RunningAgentTurnEvent::ResumeFailure(resume_failure) => {
                         if resume_failure.stale_session {
                             state.clear_active_session_id()?;
                         }
                     }
-                    RunningCodexTurnEvent::Completed(result) => {
+                    RunningAgentTurnEvent::Completed(result) => {
                         completed = Some(result);
                     }
                 }

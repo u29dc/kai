@@ -1,7 +1,7 @@
 use std::env;
 use std::path::Path;
 
-use crate::config::LoadedConfig;
+use crate::config::{LoadedConfig, RunnerProvider};
 use crate::context::context_report;
 use crate::contract::{HealthCheck, HealthReport};
 use crate::error::{ErrorCode, KaiError, KaiResult};
@@ -12,6 +12,23 @@ use crate::state::{StateStore, state_paths};
 
 pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
     let mut checks = Vec::new();
+
+    let provider_ok = matches!(config.values.runner.provider, RunnerProvider::Codex);
+    checks.push(HealthCheck {
+        name: "runner.provider".to_string(),
+        ok: provider_ok,
+        detail: match config.values.runner.provider {
+            RunnerProvider::Codex => "selected provider `codex` is available".to_string(),
+            RunnerProvider::Claude => {
+                "selected provider `claude` is configured but not available yet".to_string()
+            }
+        },
+        fix: if provider_ok {
+            None
+        } else {
+            Some("set `runner.provider` to `codex` until the Claude adapter lands".to_string())
+        },
+    });
 
     let codex_binary = &config.values.runner.codex.binary;
     let codex_ok = find_binary(codex_binary).is_some();

@@ -30,7 +30,7 @@ pub(super) struct BufferedTextFragments {
 #[derive(Debug)]
 pub(super) struct ActiveOwnerTurn {
     pub(super) pending: PendingTurn,
-    pub(super) running: RunningCodexTurn,
+    pub(super) running: RunningAgentTurn,
     pub(super) cancel_requested: bool,
     pub(super) next_typing_at: Instant,
     pub(super) status_message_id: Option<i64>,

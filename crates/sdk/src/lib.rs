@@ -16,9 +16,9 @@ pub mod state;
 pub use app::{handle_owner_prompt, mobile_help_text, mobile_status_text};
 pub use channel::telegram::run_telegram_loop;
 pub use config::{
-    ContextFilesConfig, LoadedConfig, MediaConfig, TranscriptionConfig, build_default_config_file,
-    config_value_at_key, default_root_app, default_root_work, ensure_config_file, expand_home,
-    load_config, set_config_value, unset_config_value,
+    ContextFilesConfig, LoadedConfig, MediaConfig, RunnerProvider, TranscriptionConfig,
+    build_default_config_file, config_value_at_key, default_root_app, default_root_work,
+    ensure_config_file, expand_home, load_config, set_config_value, unset_config_value,
 };
 pub use context::{
     ContextEntry, ContextReport, ContextSnapshot, context_report, context_snapshots,
@@ -37,6 +37,7 @@ pub use media::{
     enrich_attachment, transcription_provider_status,
 };
 pub use redaction::{redact_json_value, redact_optional_text, redact_text};
+pub use runtime::agent::{AgentTurnResult, run_agent_turn};
 pub use runtime::codex::{CodexTurnResult, run_codex_turn};
 pub use runtime_fs::{
     ensure_private_dir, ensure_private_file, harden_private_executable, harden_private_file,

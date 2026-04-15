@@ -3,7 +3,8 @@ use tempfile::tempdir;
 use super::*;
 use crate::config::{
     AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
-    PathsConfig, RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig,
+    PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
+    TranscriptionConfig,
 };
 
 fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
@@ -39,6 +40,7 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
                 root_work: root_work.display().to_string(),
             },
             runner: RunnerConfig {
+                provider: RunnerProvider::Codex,
                 codex: CodexConfig {
                     binary: "codex".to_string(),
                     override_config: None,
