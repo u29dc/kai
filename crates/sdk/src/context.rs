@@ -35,7 +35,6 @@ pub fn context_report(config: &LoadedConfig) -> ContextReport {
     let paths = [
         ("soul", config.values.context_files.soul.as_str()),
         ("memory", config.values.context_files.memory.as_str()),
-        ("todo", config.values.context_files.todo.as_str()),
     ];
 
     let entries = paths

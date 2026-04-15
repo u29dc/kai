@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -33,6 +35,7 @@ pub struct Config {
     pub paths: PathsConfig,
     pub runner: RunnerConfig,
     pub context_files: ContextFilesConfig,
+    pub workspaces: WorkspacesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +66,6 @@ pub struct TelegramProgressConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathsConfig {
     pub root_app: String,
-    pub root_work: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +96,15 @@ pub enum RunnerProvider {
     Claude,
 }
 
+impl RunnerProvider {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexConfig {
     pub binary: String,
@@ -111,7 +122,32 @@ pub struct CodexOverride {
 pub struct ContextFilesConfig {
     pub soul: String,
     pub memory: String,
-    pub todo: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspacesConfig {
+    #[serde(rename = "default")]
+    pub default_workspace: String,
+    #[serde(flatten)]
+    pub entries: BTreeMap<String, WorkspaceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigMigrationResult {
+    pub config_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<PathBuf>,
+    pub migrated: bool,
+    pub default_workspace_id: String,
+    pub removed_legacy_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -122,6 +158,7 @@ struct PartialConfig {
     paths: Option<PartialPathsConfig>,
     runner: Option<PartialRunnerConfig>,
     context_files: Option<PartialContextFilesConfig>,
+    workspaces: Option<PartialWorkspacesConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -152,7 +189,6 @@ struct PartialTelegramProgressConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialPathsConfig {
     root_app: Option<String>,
-    root_work: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -191,7 +227,20 @@ struct PartialCodexOverride {
 struct PartialContextFilesConfig {
     soul: Option<String>,
     memory: Option<String>,
-    todo: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialWorkspacesConfig {
+    #[serde(rename = "default")]
+    default_workspace: Option<String>,
+    #[serde(flatten)]
+    entries: BTreeMap<String, PartialWorkspaceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialWorkspaceConfig {
+    label: Option<String>,
+    path: Option<String>,
 }
 
 pub fn load_config() -> KaiResult<LoadedConfig> {
@@ -208,6 +257,16 @@ pub fn load_config() -> KaiResult<LoadedConfig> {
                 format!("failed to read config file: {error}"),
             )
         })?;
+        let legacy_keys = legacy_config_keys(&raw)?;
+        if !legacy_keys.is_empty() {
+            return Err(KaiError::blocked_prerequisite(
+                "legacy kai config format is no longer supported",
+            )
+            .with_hint(format!(
+                "run `kai config migrate` to rewrite {}",
+                config_path.display()
+            )));
+        }
         let partial = toml::from_str::<PartialConfig>(&raw).map_err(|error| {
             KaiError::new(
                 ErrorCode::ConfigError,
@@ -219,6 +278,7 @@ pub fn load_config() -> KaiResult<LoadedConfig> {
 
     apply_env_overrides(&mut config);
     expand_config_paths(&mut config);
+    validate_config(&config)?;
 
     Ok(LoadedConfig {
         config_path,
@@ -241,10 +301,6 @@ pub fn default_root_app() -> PathBuf {
     }
 
     PathBuf::from(".tools").join("kai")
-}
-
-pub fn default_root_work(root_app: &Path) -> PathBuf {
-    root_app.join("work")
 }
 
 pub fn expand_home(input: &str) -> PathBuf {
@@ -284,7 +340,6 @@ pub fn build_default_config_file() -> String {
         "",
         "[paths]",
         "root_app = \"~/.tools/kai\"",
-        "root_work = \"~/.tools/kai/work\"",
         "",
         "[runner]",
         "provider = \"codex\"",
@@ -295,7 +350,13 @@ pub fn build_default_config_file() -> String {
         "[context_files]",
         "soul = \"~/.tools/kai/SOUL.md\"",
         "memory = \"~/.tools/kai/MEMORY.md\"",
-        "todo = \"~/.tools/kai/TODO.md\"",
+        "",
+        "[workspaces]",
+        "default = \"main\"",
+        "",
+        "[workspaces.main]",
+        "label = \"Main\"",
+        "path = \"~/.tools/kai/work\"",
         "",
     ]
     .join("\n")
@@ -354,9 +415,71 @@ pub fn unset_config_value(key: &str) -> KaiResult<PathBuf> {
     Ok(config_path)
 }
 
-fn default_config(root_app: PathBuf) -> Config {
-    let root_work = default_root_work(&root_app);
+pub fn migrate_config_to_workspaces() -> KaiResult<ConfigMigrationResult> {
+    let config_path = discover_config_path();
+    migrate_config_to_workspaces_at(&config_path)
+}
 
+pub fn migrate_config_to_workspaces_at(config_path: &Path) -> KaiResult<ConfigMigrationResult> {
+    if !config_path.is_file() {
+        ensure_config_file(config_path)?;
+        return Ok(ConfigMigrationResult {
+            config_path: config_path.to_path_buf(),
+            backup_path: None,
+            migrated: false,
+            default_workspace_id: "main".to_string(),
+            removed_legacy_keys: Vec::new(),
+        });
+    }
+
+    harden_private_file(config_path)?;
+    let raw = fs::read_to_string(config_path).map_err(|error| {
+        KaiError::new(
+            ErrorCode::ConfigError,
+            format!("failed to read config file: {error}"),
+        )
+    })?;
+    let legacy_keys = legacy_config_keys(&raw)?;
+    let mut document = DocumentMut::from_str(&raw).map_err(|error| {
+        KaiError::new(
+            ErrorCode::ConfigError,
+            format!("failed to parse config file for migration: {error}"),
+        )
+    })?;
+
+    let default_workspace_id = ensure_workspace_document_layout(&mut document)?;
+    let mut removed_legacy_keys = Vec::new();
+    for key in ["paths.root_work", "context_files.todo"] {
+        if remove_document_value(&mut document, key).is_ok() {
+            removed_legacy_keys.push(key.to_string());
+        }
+    }
+
+    let backup_path = if legacy_keys.is_empty() && removed_legacy_keys.is_empty() {
+        None
+    } else {
+        let backup_path = backup_config_path(config_path);
+        fs::copy(config_path, &backup_path).map_err(|error| {
+            KaiError::new(
+                ErrorCode::IoError,
+                format!("failed to write config backup: {error}"),
+            )
+        })?;
+        harden_private_file(&backup_path)?;
+        write_document(config_path, &mut document)?;
+        Some(backup_path)
+    };
+
+    Ok(ConfigMigrationResult {
+        config_path: config_path.to_path_buf(),
+        backup_path: backup_path.clone(),
+        migrated: backup_path.is_some(),
+        default_workspace_id,
+        removed_legacy_keys,
+    })
+}
+
+fn default_config(root_app: PathBuf) -> Config {
     Config {
         agent: AgentConfig {
             timezone: "Europe/London".to_string(),
@@ -383,7 +506,6 @@ fn default_config(root_app: PathBuf) -> Config {
         },
         paths: PathsConfig {
             root_app: root_app.display().to_string(),
-            root_work: root_work.display().to_string(),
         },
         runner: RunnerConfig {
             provider: RunnerProvider::Codex,
@@ -395,7 +517,16 @@ fn default_config(root_app: PathBuf) -> Config {
         context_files: ContextFilesConfig {
             soul: root_app.join("SOUL.md").display().to_string(),
             memory: root_app.join("MEMORY.md").display().to_string(),
-            todo: root_app.join("TODO.md").display().to_string(),
+        },
+        workspaces: WorkspacesConfig {
+            default_workspace: "main".to_string(),
+            entries: BTreeMap::from([(
+                "main".to_string(),
+                WorkspaceConfig {
+                    label: Some("Main".to_string()),
+                    path: root_app.join("work").display().to_string(),
+                },
+            )]),
         },
     }
 }
@@ -440,13 +571,10 @@ fn apply_partial_config(config: &mut Config, partial: PartialConfig) {
         }
     }
 
-    if let Some(paths) = partial.paths {
-        if let Some(root_app) = paths.root_app {
-            config.paths.root_app = root_app;
-        }
-        if let Some(root_work) = paths.root_work {
-            config.paths.root_work = root_work;
-        }
+    if let Some(paths) = partial.paths
+        && let Some(root_app) = paths.root_app
+    {
+        config.paths.root_app = root_app;
     }
 
     if let Some(media) = partial.media
@@ -491,8 +619,23 @@ fn apply_partial_config(config: &mut Config, partial: PartialConfig) {
         if let Some(memory) = context_files.memory {
             config.context_files.memory = memory;
         }
-        if let Some(todo) = context_files.todo {
-            config.context_files.todo = todo;
+    }
+
+    if let Some(workspaces) = partial.workspaces {
+        if let Some(default_workspace) = workspaces.default_workspace {
+            config.workspaces.default_workspace = default_workspace;
+        }
+        if !workspaces.entries.is_empty() {
+            config.workspaces.entries.clear();
+        }
+        for (id, workspace) in workspaces.entries {
+            config.workspaces.entries.insert(
+                id,
+                WorkspaceConfig {
+                    label: workspace.label,
+                    path: workspace.path.unwrap_or_default(),
+                },
+            );
         }
     }
 }
@@ -503,9 +646,6 @@ fn apply_env_overrides(config: &mut Config) {
     }
     if let Ok(value) = env::var("KAI_ROOT_APP") {
         config.paths.root_app = value;
-    }
-    if let Ok(value) = env::var("KAI_ROOT_WORK") {
-        config.paths.root_work = value;
     }
     if let Ok(value) = env::var("KAI_CODEX_BINARY") {
         config.runner.codex.binary = value;
@@ -529,14 +669,188 @@ fn apply_env_overrides(config: &mut Config) {
 
 fn expand_config_paths(config: &mut Config) {
     config.paths.root_app = expand_home(&config.paths.root_app).display().to_string();
-    config.paths.root_work = expand_home(&config.paths.root_work).display().to_string();
     config.context_files.soul = expand_home(&config.context_files.soul)
         .display()
         .to_string();
     config.context_files.memory = expand_home(&config.context_files.memory)
         .display()
         .to_string();
-    config.context_files.todo = expand_home(&config.context_files.todo)
-        .display()
+    for workspace in config.workspaces.entries.values_mut() {
+        workspace.path = expand_home(&workspace.path).display().to_string();
+    }
+}
+
+fn validate_config(config: &Config) -> KaiResult<()> {
+    if config.workspaces.default_workspace.trim().is_empty() {
+        return Err(KaiError::new(
+            ErrorCode::ConfigError,
+            "workspaces.default cannot be empty",
+        ));
+    }
+    if config.workspaces.entries.is_empty() {
+        return Err(KaiError::new(
+            ErrorCode::ConfigError,
+            "at least one workspace must be configured",
+        ));
+    }
+    if !config
+        .workspaces
+        .entries
+        .contains_key(config.workspaces.default_workspace.as_str())
+    {
+        return Err(KaiError::new(
+            ErrorCode::ConfigError,
+            format!(
+                "workspaces.default `{}` does not exist",
+                config.workspaces.default_workspace
+            ),
+        ));
+    }
+    for (id, workspace) in &config.workspaces.entries {
+        if id.trim().is_empty() || id == "default" {
+            return Err(KaiError::new(
+                ErrorCode::ConfigError,
+                "workspace ids cannot be empty or `default`",
+            ));
+        }
+        if workspace.path.trim().is_empty() {
+            return Err(KaiError::new(
+                ErrorCode::ConfigError,
+                format!("workspace `{id}` must define a path"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn legacy_config_keys(raw: &str) -> KaiResult<Vec<String>> {
+    let document = DocumentMut::from_str(raw).map_err(|error| {
+        KaiError::new(
+            ErrorCode::ConfigError,
+            format!("failed to inspect config file: {error}"),
+        )
+    })?;
+
+    let mut keys = Vec::new();
+    if document
+        .get("paths")
+        .and_then(|item| item.get("root_work"))
+        .is_some()
+    {
+        keys.push("paths.root_work".to_string());
+    }
+    if document
+        .get("context_files")
+        .and_then(|item| item.get("todo"))
+        .is_some()
+    {
+        keys.push("context_files.todo".to_string());
+    }
+    let has_workspaces = document
+        .get("workspaces")
+        .and_then(|item| item.get("default"))
+        .is_some();
+    if !has_workspaces {
+        keys.push("workspaces.default".to_string());
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn ensure_workspace_document_layout(document: &mut DocumentMut) -> KaiResult<String> {
+    let existing_default = document
+        .get("workspaces")
+        .and_then(|item| item.get("default"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    if let Some(default_workspace_id) = existing_default {
+        return Ok(default_workspace_id);
+    }
+
+    let workspace_path = document
+        .get("paths")
+        .and_then(|item| item.get("root_work"))
+        .and_then(|item| item.as_value())
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "~/.tools/kai/work".to_string());
+    let workspace_id = derive_workspace_id(&workspace_path);
+    let workspace_label = derive_workspace_label(&workspace_id);
+    set_document_value(document, "workspaces.default", &workspace_id)?;
+    set_document_value(
+        document,
+        &format!("workspaces.{workspace_id}.label"),
+        &workspace_label,
+    )?;
+    set_document_value(
+        document,
+        &format!("workspaces.{workspace_id}.path"),
+        &workspace_path,
+    )?;
+    Ok(workspace_id)
+}
+
+fn derive_workspace_id(path: &str) -> String {
+    let file_name = expand_home(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "main".to_string());
+    let mut id = file_name
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() {
+                char.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
         .to_string();
+    while id.contains("--") {
+        id = id.replace("--", "-");
+    }
+    if id.is_empty() || id == "default" {
+        "main".to_string()
+    } else {
+        id
+    }
+}
+
+fn derive_workspace_label(id: &str) -> String {
+    if id == "main" {
+        return "Main".to_string();
+    }
+
+    id.split('-')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut label = String::new();
+                    label.push(first.to_ascii_uppercase());
+                    label.push_str(chars.as_str());
+                    label
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn backup_config_path(config_path: &Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let base_name = config_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.toml");
+    config_path.with_file_name(format!("{base_name}.bak.{timestamp}"))
 }

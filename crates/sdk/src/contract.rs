@@ -138,8 +138,41 @@ pub struct ConfigGetOutput {
 pub struct SetupOutput {
     pub config_path: String,
     pub root_app: String,
-    pub root_work: String,
+    pub default_workspace_id: String,
     pub created_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigMigrationOutput {
+    pub config_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    pub migrated: bool,
+    pub default_workspace_id: String,
+    pub removed_legacy_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceView {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+    pub is_default: bool,
+    pub selected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceStatusOutput {
+    pub provider: String,
+    pub default_workspace_id: String,
+    pub selected_workspace_id: String,
+    pub selected_workspace_path: String,
+    pub workspaces: Vec<WorkspaceView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +195,9 @@ pub struct PendingPairingView {
 pub struct PendingTurnView {
     pub id: String,
     pub enqueued_at: String,
+    pub provider: String,
+    pub workspace_id: String,
+    pub working_dir: String,
     pub chat_id: i64,
     pub sender_id: i64,
     pub update_count: usize,
@@ -174,6 +210,11 @@ pub struct PendingTurnView {
 pub struct SessionView {
     pub owner_user_id: Option<i64>,
     pub owner_chat_id: Option<i64>,
+    pub provider: String,
+    pub default_workspace_id: String,
+    pub selected_workspace_id: String,
+    pub selected_workspace_path: String,
+    pub workspaces: Vec<WorkspaceView>,
     pub active_session_id: Option<String>,
     pub pending_pairing: Option<PendingPairingView>,
     pub update_offset: i64,

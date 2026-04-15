@@ -6,8 +6,9 @@ use super::*;
 use crate::config::{
     AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
     PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-    TranscriptionConfig,
+    TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
 };
+use crate::workspace::ExecutionTarget;
 
 fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
     LoadedConfig {
@@ -39,7 +40,6 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
             },
             paths: PathsConfig {
                 root_app: root_app.display().to_string(),
-                root_work: root_work.display().to_string(),
             },
             runner: RunnerConfig {
                 provider: RunnerProvider::Codex,
@@ -51,9 +51,34 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
             context_files: ContextFilesConfig {
                 soul: root_app.join("SOUL.md").display().to_string(),
                 memory: root_app.join("MEMORY.md").display().to_string(),
-                todo: root_app.join("TODO.md").display().to_string(),
+            },
+            workspaces: WorkspacesConfig {
+                default_workspace: "main".to_string(),
+                entries: std::collections::BTreeMap::from([(
+                    "main".to_string(),
+                    WorkspaceConfig {
+                        label: Some("Main".to_string()),
+                        path: root_work.display().to_string(),
+                    },
+                )]),
             },
         },
+    }
+}
+
+fn test_target(config: &LoadedConfig) -> ExecutionTarget {
+    let path = config
+        .values
+        .workspaces
+        .entries
+        .get("main")
+        .expect("main workspace")
+        .path
+        .clone();
+    ExecutionTarget {
+        workspace_id: "main".to_string(),
+        working_dir: path,
+        provider: RunnerProvider::Codex,
     }
 }
 
@@ -142,6 +167,7 @@ fn pending_turn_queue_round_trips_and_preserves_order() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-1".to_string(),
             enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![1],
             chat_id: 1,
@@ -154,6 +180,7 @@ fn pending_turn_queue_round_trips_and_preserves_order() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-2".to_string(),
             enqueued_at: "2026-04-12T00:01:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![2],
             chat_id: 1,
@@ -191,6 +218,7 @@ fn pending_turn_queue_rejects_new_turns_past_limit() {
             .enqueue_pending_turn(&PendingTurn {
                 id: format!("turn-{index}"),
                 enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+                target: test_target(&config),
                 channel: "telegram".to_string(),
                 update_ids: vec![index as i64],
                 chat_id: 1,
@@ -205,6 +233,7 @@ fn pending_turn_queue_rejects_new_turns_past_limit() {
         .enqueue_pending_turn(&PendingTurn {
             id: "overflow".to_string(),
             enqueued_at: "2026-04-12T00:30:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![999],
             chat_id: 1,
@@ -229,6 +258,7 @@ fn pending_turn_queue_replaces_duplicate_turn_id_without_growth() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-1".to_string(),
             enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![1],
             chat_id: 1,
@@ -241,6 +271,7 @@ fn pending_turn_queue_replaces_duplicate_turn_id_without_growth() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-1".to_string(),
             enqueued_at: "2026-04-12T00:05:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![2],
             chat_id: 1,
@@ -277,6 +308,7 @@ fn session_view_includes_queue_metadata() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-1".to_string(),
             enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![1, 2],
             chat_id: 1000000001,
@@ -286,7 +318,17 @@ fn session_view_includes_queue_metadata() {
         })
         .expect("enqueue turn");
 
-    let session = store.session_view().expect("session view");
+    let session = store.session_view(&config).expect("session view");
+    assert_eq!(session.provider, "codex");
+    assert_eq!(session.default_workspace_id, "main");
+    assert_eq!(session.selected_workspace_id, "main");
+    assert_eq!(
+        session.selected_workspace_path,
+        root_work.display().to_string()
+    );
+    assert_eq!(session.workspaces.len(), 1);
+    assert_eq!(session.workspaces[0].id, "main");
+    assert!(session.workspaces[0].selected);
     assert_eq!(session.queue_limit, MAX_PENDING_TURNS);
     assert_eq!(session.queued_turns, 1);
     assert_eq!(session.pending_reply_deliveries, 0);
@@ -306,6 +348,7 @@ fn active_turn_state_round_trips_with_status_message_id() {
     let pending = PendingTurn {
         id: "turn-1".to_string(),
         enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+        target: test_target(&config),
         channel: "telegram".to_string(),
         update_ids: vec![1],
         chat_id: 1,
@@ -347,6 +390,7 @@ fn active_turn_state_reads_legacy_pending_turn_payload() {
     let pending = PendingTurn {
         id: "turn-legacy".to_string(),
         enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+        target: test_target(&config),
         channel: "telegram".to_string(),
         update_ids: vec![9],
         chat_id: 1,
@@ -378,6 +422,7 @@ fn claim_next_pending_turn_moves_queue_head_into_active_state() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-1".to_string(),
             enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![1],
             chat_id: 1,
@@ -390,6 +435,7 @@ fn claim_next_pending_turn_moves_queue_head_into_active_state() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-2".to_string(),
             enqueued_at: "2026-04-12T00:01:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![2],
             chat_id: 1,
@@ -428,6 +474,7 @@ fn recover_active_turn_requeues_claimed_turn_once() {
         .enqueue_pending_turn(&PendingTurn {
             id: "turn-1".to_string(),
             enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+            target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![1],
             chat_id: 1,
@@ -472,6 +519,7 @@ fn pending_reply_delivery_round_trips_progress_and_clears_matching_active_turn()
     let pending = PendingTurn {
         id: "turn-1".to_string(),
         enqueued_at: "2026-04-12T00:00:00Z".to_string(),
+        target: test_target(&config),
         channel: "telegram".to_string(),
         update_ids: vec![1, 2],
         chat_id: 1,
@@ -635,9 +683,13 @@ fn cleanup_runtime_state_prunes_old_rows_and_compacts_audit() {
         )
         .expect("insert old update failure");
 
+    let working_dir = test_target(&config).working_dir;
     for index in 0..4 {
         store
             .record_turn(NewTurn {
+                provider: RunnerProvider::Codex,
+                workspace_id: "main",
+                working_dir: &working_dir,
                 role: "user",
                 channel: "telegram",
                 sender_id: Some(1),

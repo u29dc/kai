@@ -12,21 +12,25 @@ pub mod runtime_fs;
 pub mod secrets;
 pub mod service;
 pub mod state;
+pub mod workspace;
 
 pub use app::{handle_owner_prompt, mobile_help_text, mobile_status_text};
 pub use channel::telegram::run_telegram_loop;
 pub use config::{
-    ContextFilesConfig, LoadedConfig, MediaConfig, RunnerProvider, TranscriptionConfig,
-    build_default_config_file, config_value_at_key, default_root_app, default_root_work,
-    ensure_config_file, expand_home, load_config, set_config_value, unset_config_value,
+    ConfigMigrationResult, ContextFilesConfig, LoadedConfig, MediaConfig, RunnerProvider,
+    TranscriptionConfig, WorkspaceConfig, WorkspacesConfig, build_default_config_file,
+    config_value_at_key, default_root_app, ensure_config_file, expand_home, load_config,
+    migrate_config_to_workspaces, migrate_config_to_workspaces_at, set_config_value,
+    unset_config_value,
 };
 pub use context::{
     ContextEntry, ContextReport, ContextSnapshot, context_report, context_snapshots,
 };
 pub use contract::{
-    ConfigGetOutput, ConfigShowOutput, GlobalFlag, HealthCheck, HealthReport, Meta, OkEnvelope,
-    PendingTurnView, SessionView, SetupCodexOutput, SetupOutput, ToolCatalog, ToolParameter,
-    ToolSpec, error_envelope, ok_envelope, tool_catalog, tool_spec,
+    ConfigGetOutput, ConfigMigrationOutput, ConfigShowOutput, GlobalFlag, HealthCheck,
+    HealthReport, Meta, OkEnvelope, PendingTurnView, SessionView, SetupCodexOutput, SetupOutput,
+    ToolCatalog, ToolParameter, ToolSpec, WorkspaceStatusOutput, WorkspaceView, error_envelope,
+    ok_envelope, tool_catalog, tool_spec,
 };
 pub use error::{ErrorCode, KaiError, KaiResult};
 pub use health::health_report;
@@ -58,3 +62,7 @@ pub use service::{
     service_status, service_stop, service_uninstall,
 };
 pub use state::{AttachmentInfo, MAX_PENDING_TURNS, StatePaths, StateStore, TurnRecord};
+pub use workspace::{
+    ExecutionTarget, WorkspaceSpec, configured_workspaces, default_workspace, execution_target,
+    selected_workspace, workspace_by_id,
+};

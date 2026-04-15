@@ -176,7 +176,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                     }
                     RunningAgentTurnEvent::ResumeFailure(resume_failure) => {
                         if resume_failure.stale_session {
-                            state.clear_active_session_id()?;
+                            state.clear_session_binding(&turn.pending.target)?;
                         }
                     }
                     RunningAgentTurnEvent::Completed(result) => {

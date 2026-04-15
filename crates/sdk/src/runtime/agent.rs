@@ -2,6 +2,7 @@ use crate::config::{LoadedConfig, RunnerProvider};
 use crate::context::ContextSnapshot;
 use crate::error::{KaiError, KaiResult};
 use crate::state::{AttachmentInfo, StateStore};
+use crate::workspace::ExecutionTarget;
 
 use super::codex;
 
@@ -74,6 +75,7 @@ pub fn selected_provider(config: &LoadedConfig) -> KaiResult<RunnerProvider> {
 pub fn run_agent_turn(
     config: &LoadedConfig,
     state: &StateStore,
+    target: &ExecutionTarget,
     channel: &str,
     sender_id: i64,
     user_text: &str,
@@ -82,7 +84,15 @@ pub fn run_agent_turn(
     match selected_provider(config)? {
         RunnerProvider::Codex => Ok(map_turn_result(
             RunnerProvider::Codex,
-            codex::run_codex_turn(config, state, channel, sender_id, user_text, attachments)?,
+            codex::run_codex_turn(
+                config,
+                state,
+                target,
+                channel,
+                sender_id,
+                user_text,
+                attachments,
+            )?,
         )),
         RunnerProvider::Claude => unreachable!("unsupported provider filtered above"),
     }
@@ -91,6 +101,7 @@ pub fn run_agent_turn(
 pub fn prepare_agent_turn(
     config: &LoadedConfig,
     state: &StateStore,
+    target: &ExecutionTarget,
     channel: &str,
     sender_id: i64,
     user_text: &str,
@@ -102,6 +113,7 @@ pub fn prepare_agent_turn(
             inner: PreparedAgentTurnInner::Codex(codex::prepare_codex_turn(
                 config,
                 state,
+                target,
                 channel,
                 sender_id,
                 user_text,
@@ -201,7 +213,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AgentConfig, ChannelConfig, Config, ContextFilesConfig, MediaConfig, PathsConfig,
-        RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig,
+        RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig, WorkspaceConfig,
+        WorkspacesConfig,
     };
 
     #[test]
@@ -234,7 +247,6 @@ mod tests {
                 },
                 paths: PathsConfig {
                     root_app: "/tmp/kai".to_string(),
-                    root_work: "/tmp/work".to_string(),
                 },
                 runner: RunnerConfig {
                     provider: RunnerProvider::Claude,
@@ -246,7 +258,16 @@ mod tests {
                 context_files: ContextFilesConfig {
                     soul: "/tmp/kai/SOUL.md".to_string(),
                     memory: "/tmp/kai/MEMORY.md".to_string(),
-                    todo: "/tmp/kai/TODO.md".to_string(),
+                },
+                workspaces: WorkspacesConfig {
+                    default_workspace: "main".to_string(),
+                    entries: std::collections::BTreeMap::from([(
+                        "main".to_string(),
+                        WorkspaceConfig {
+                            label: Some("Main".to_string()),
+                            path: "/tmp/work".to_string(),
+                        },
+                    )]),
                 },
             },
             config_exists: false,

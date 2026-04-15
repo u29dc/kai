@@ -70,6 +70,7 @@ pub(super) struct PersistedBufferedTextFragments {
 pub(super) enum MobileCommand {
     Help,
     Status,
+    Dir { workspace_id: Option<String> },
     Reset,
     Cancel,
     Send { path: String },

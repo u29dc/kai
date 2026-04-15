@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::RunnerProvider;
 
 #[test]
 fn stale_resume_detection_matches_missing_rollout_errors() {
@@ -21,6 +22,9 @@ fn replay_package_includes_attachment_refs() {
         TurnRecord {
             id: 1,
             created_at: "2026-04-11T20:00:00Z".to_string(),
+            provider: RunnerProvider::Codex,
+            workspace_id: "vault".to_string(),
+            working_dir: "/tmp/work".to_string(),
             role: "user".to_string(),
             channel: "telegram".to_string(),
             sender_id: Some(1),
@@ -47,6 +51,9 @@ fn replay_package_includes_attachment_refs() {
         TurnRecord {
             id: 2,
             created_at: "2026-04-11T20:01:00Z".to_string(),
+            provider: RunnerProvider::Codex,
+            workspace_id: "vault".to_string(),
+            working_dir: "/tmp/work".to_string(),
             role: "assistant".to_string(),
             channel: "telegram".to_string(),
             sender_id: None,

@@ -718,6 +718,84 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn migrate_pending_turn_targets(
+        &self,
+        default_target: &crate::workspace::ExecutionTarget,
+    ) -> KaiResult<()> {
+        self.with_transaction("migrate pending turn targets", |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT turn_id, sort_key, payload_json
+                     FROM pending_turns
+                     ORDER BY sort_key ASC, rowid ASC",
+                )
+                .map_err(sql_state_error("prepare pending turn target migration"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(sql_state_error("query pending turn target migration"))?;
+
+            for row in rows {
+                let (turn_id, sort_key, payload_json) =
+                    row.map_err(sql_state_error("read pending turn target migration row"))?;
+                let mut turn = deserialize_pending_turn(&payload_json)?;
+                if !pending_turn_missing_target(&turn) {
+                    continue;
+                }
+                turn.target = default_target.clone();
+                connection
+                    .execute(
+                        "INSERT INTO pending_turns (turn_id, sort_key, payload_json)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(turn_id) DO UPDATE
+                         SET sort_key = excluded.sort_key,
+                             payload_json = excluded.payload_json",
+                        params![
+                            turn_id,
+                            sort_key,
+                            serde_json::to_string(&turn).map_err(|error| {
+                                KaiError::new(
+                                    ErrorCode::StateError,
+                                    format!(
+                                        "failed to serialize migrated pending turn payload: {error}"
+                                    ),
+                                )
+                            })?
+                        ],
+                    )
+                    .map_err(sql_state_error("write migrated pending turn payload"))?;
+            }
+
+            let active_payload = connection
+                .query_row(
+                    "SELECT payload_json FROM active_turn WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sql_state_error("load active turn target migration row"))?;
+            if let Some(active_payload) = active_payload {
+                let mut active = deserialize_active_turn_state(&active_payload)?;
+                if pending_turn_missing_target(&active.pending) {
+                    active.pending.target = default_target.clone();
+                    connection
+                        .execute(
+                            "UPDATE active_turn SET payload_json = ?1 WHERE singleton = 1",
+                            [serialize_active_turn_state(&active)?],
+                        )
+                        .map_err(sql_state_error("write migrated active turn payload"))?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     fn insert_pending_turn(&self, turn: &PendingTurn, sort_key: i64) -> KaiResult<()> {
         let payload_json = serde_json::to_string(turn).map_err(|error| {
             KaiError::new(
@@ -786,4 +864,8 @@ fn deserialize_pending_turn(payload: &str) -> KaiResult<PendingTurn> {
             format!("failed to deserialize pending turn payload: {error}"),
         )
     })
+}
+
+fn pending_turn_missing_target(turn: &PendingTurn) -> bool {
+    turn.target.workspace_id.trim().is_empty() || turn.target.working_dir.trim().is_empty()
 }

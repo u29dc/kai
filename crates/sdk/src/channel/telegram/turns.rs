@@ -95,6 +95,7 @@ pub(super) async fn maybe_start_next_pending_turn(
     let prepared = prepare_agent_turn(
         config,
         state,
+        &pending.target,
         &pending.channel,
         pending.sender_id,
         &pending.text,
@@ -114,11 +115,17 @@ pub(super) async fn maybe_start_next_pending_turn(
         }
     };
     state.record_turn(NewTurn {
+        provider: pending.target.provider,
+        workspace_id: &pending.target.workspace_id,
+        working_dir: &pending.target.working_dir,
         role: "user",
         channel: &pending.channel,
         sender_id: Some(pending.sender_id),
         text: &pending.text,
-        codex_session_id: state.get_active_session_id()?.as_deref(),
+        codex_session_id: state
+            .get_session_binding(&pending.target)?
+            .as_ref()
+            .map(|binding| binding.session_id.as_str()),
         outcome_status: Some("received"),
         attachments: &pending.attachments,
     })?;
@@ -222,6 +229,8 @@ async fn finalize_successful_turn(
         state.append_audit_json(&serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "event": "codex.resume_failed",
+            "provider": active_turn.pending.target.provider.as_key(),
+            "workspaceId": active_turn.pending.target.workspace_id,
             "requestedSessionId": requested_session_id,
             "staleSession": stale_session,
             "message": error.message,
@@ -230,8 +239,11 @@ async fn finalize_successful_turn(
     }
 
     let result = async_result.result;
-    state.set_active_session_id(&result.session_id)?;
+    state.set_session_binding(&active_turn.pending.target, &result.session_id)?;
     state.record_turn(NewTurn {
+        provider: active_turn.pending.target.provider,
+        workspace_id: &active_turn.pending.target.workspace_id,
+        working_dir: &active_turn.pending.target.working_dir,
         role: "assistant",
         channel: &active_turn.pending.channel,
         sender_id: None,
@@ -241,13 +253,19 @@ async fn finalize_successful_turn(
         attachments: &[],
     })?;
 
-    let replay_package = create_replay_package(&result.context_snapshots, &state.recent_turns(24)?);
-    state.set_replay_package(&replay_package)?;
+    let replay_package = create_replay_package(
+        &result.context_snapshots,
+        &state.recent_turns_for_target(&active_turn.pending.target, 24)?,
+    );
+    state.set_target_replay_package(&active_turn.pending.target, &replay_package)?;
 
     state.append_audit_json(&serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "event": "turn.completed",
         "turnId": active_turn.pending.id,
+        "provider": active_turn.pending.target.provider.as_key(),
+        "workspaceId": active_turn.pending.target.workspace_id,
+        "workingDir": active_turn.pending.target.working_dir,
         "channel": active_turn.pending.channel,
         "senderId": active_turn.pending.sender_id,
         "codexSessionId": result.session_id,

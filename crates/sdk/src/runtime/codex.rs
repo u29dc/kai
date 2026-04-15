@@ -13,6 +13,7 @@ use crate::error::{ErrorCode, KaiError, KaiResult};
 use crate::state::{
     AttachmentInfo, ReplayAttachmentRef, ReplayPackage, ReplayTurn, StateStore, TurnRecord,
 };
+use crate::workspace::ExecutionTarget;
 
 mod process;
 mod prompt;
@@ -42,6 +43,7 @@ pub struct CodexTurnResult {
 pub struct PreparedCodexTurn {
     pub channel: String,
     pub sender_id: i64,
+    pub target: ExecutionTarget,
     pub attachments: Vec<AttachmentInfo>,
     pub context_snapshots: Vec<ContextSnapshot>,
     pub prompt: String,
@@ -86,6 +88,7 @@ pub struct RunningCodexTurn {
 pub fn run_codex_turn(
     config: &LoadedConfig,
     state: &StateStore,
+    target: &ExecutionTarget,
     channel: &str,
     sender_id: i64,
     user_text: &str,
@@ -94,6 +97,7 @@ pub fn run_codex_turn(
     let context_snapshots = context_snapshots(config);
     let prompt = build_turn_prompt(
         config,
+        target,
         channel,
         sender_id,
         user_text,
@@ -101,10 +105,11 @@ pub fn run_codex_turn(
         &context_snapshots,
     );
 
-    if let Some(session_id) = state.get_active_session_id()? {
-        match run_resume(config, &session_id, &prompt, attachments) {
+    if let Some(session_binding) = state.get_session_binding(target)? {
+        let session_id = session_binding.session_id;
+        match run_resume(config, target, &session_id, &prompt, attachments) {
             Ok(result) => {
-                state.set_active_session_id(&result.session_id)?;
+                state.set_session_binding(target, &result.session_id)?;
                 return Ok(CodexTurnResult {
                     session_id: result.session_id,
                     response_text: result.response_text,
@@ -122,7 +127,7 @@ pub fn run_codex_turn(
                     "hint": error.hint,
                 }))?;
                 if is_stale_resume_error(&error) {
-                    state.clear_active_session_id()?;
+                    state.clear_session_binding(target)?;
                 } else {
                     return Err(error);
                 }
@@ -132,11 +137,11 @@ pub fn run_codex_turn(
 
     let replay_prompt = build_replay_prompt(
         &prompt,
-        state.get_replay_package()?,
-        &state.recent_turns(12)?,
+        state.get_target_replay_package(target)?,
+        &state.recent_turns_for_target(target, 12)?,
     );
-    let result = run_exec(config, &replay_prompt, attachments)?;
-    state.set_active_session_id(&result.session_id)?;
+    let result = run_exec(config, target, &replay_prompt, attachments)?;
+    state.set_session_binding(target, &result.session_id)?;
 
     Ok(CodexTurnResult {
         session_id: result.session_id,
@@ -149,6 +154,7 @@ pub fn run_codex_turn(
 pub fn prepare_codex_turn(
     config: &LoadedConfig,
     state: &StateStore,
+    target: &ExecutionTarget,
     channel: &str,
     sender_id: i64,
     user_text: &str,
@@ -157,6 +163,7 @@ pub fn prepare_codex_turn(
     let context_snapshots = context_snapshots(config);
     let prompt = build_turn_prompt(
         config,
+        target,
         channel,
         sender_id,
         user_text,
@@ -165,18 +172,21 @@ pub fn prepare_codex_turn(
     );
     let replay_prompt = build_replay_prompt(
         &prompt,
-        state.get_replay_package()?,
-        &state.recent_turns(12)?,
+        state.get_target_replay_package(target)?,
+        &state.recent_turns_for_target(target, 12)?,
     );
 
     Ok(PreparedCodexTurn {
         channel: channel.to_string(),
         sender_id,
+        target: target.clone(),
         attachments: attachments.to_vec(),
         context_snapshots,
         prompt,
         replay_prompt,
-        requested_session_id: state.get_active_session_id()?,
+        requested_session_id: state
+            .get_session_binding(target)?
+            .map(|binding| binding.session_id),
     })
 }
 

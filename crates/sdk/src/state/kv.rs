@@ -1,4 +1,6 @@
 use super::*;
+use crate::config::RunnerProvider;
+use crate::workspace::ExecutionTarget;
 
 impl StateStore {
     pub fn get_owner_user_id(&self) -> KaiResult<Option<i64>> {
@@ -73,6 +75,91 @@ impl StateStore {
 
     pub fn clear_replay_package(&self) -> KaiResult<()> {
         self.delete_value("codex.replay_package")
+    }
+
+    pub fn get_selected_workspace_id(&self) -> KaiResult<Option<String>> {
+        self.get_json_value("workspace.selected_id")
+    }
+
+    pub fn set_selected_workspace_id(&self, workspace_id: &str) -> KaiResult<()> {
+        self.set_json_value("workspace.selected_id", &workspace_id)
+    }
+
+    pub fn clear_selected_workspace_id(&self) -> KaiResult<()> {
+        self.delete_value("workspace.selected_id")
+    }
+
+    pub fn get_session_binding(
+        &self,
+        target: &ExecutionTarget,
+    ) -> KaiResult<Option<SessionBinding>> {
+        let key = session_binding_key(target.provider, &target.workspace_id);
+        let binding = self.get_json_value::<SessionBinding>(&key)?;
+        if let Some(binding) = binding {
+            if binding.working_dir == target.working_dir {
+                return Ok(Some(binding));
+            }
+            self.delete_value(&key)?;
+        }
+        Ok(None)
+    }
+
+    pub fn set_session_binding(&self, target: &ExecutionTarget, session_id: &str) -> KaiResult<()> {
+        self.set_json_value(
+            &session_binding_key(target.provider, &target.workspace_id),
+            &SessionBinding {
+                session_id: session_id.to_string(),
+                working_dir: target.working_dir.clone(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+    }
+
+    pub fn clear_session_binding(&self, target: &ExecutionTarget) -> KaiResult<()> {
+        self.delete_value(&session_binding_key(target.provider, &target.workspace_id))
+    }
+
+    pub fn get_target_replay_binding(
+        &self,
+        target: &ExecutionTarget,
+    ) -> KaiResult<Option<ReplayBinding>> {
+        let key = replay_binding_key(target.provider, &target.workspace_id);
+        let binding = self.get_json_value::<ReplayBinding>(&key)?;
+        if let Some(binding) = binding {
+            if binding.working_dir == target.working_dir {
+                return Ok(Some(binding));
+            }
+            self.delete_value(&key)?;
+        }
+        Ok(None)
+    }
+
+    pub fn get_target_replay_package(
+        &self,
+        target: &ExecutionTarget,
+    ) -> KaiResult<Option<ReplayPackage>> {
+        Ok(self
+            .get_target_replay_binding(target)?
+            .map(|binding| binding.replay_package))
+    }
+
+    pub fn set_target_replay_package(
+        &self,
+        target: &ExecutionTarget,
+        replay_package: &ReplayPackage,
+    ) -> KaiResult<()> {
+        self.set_json_value(
+            &replay_binding_key(target.provider, &target.workspace_id),
+            &ReplayBinding {
+                replay_package: replay_package.clone(),
+                working_dir: target.working_dir.clone(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+    }
+
+    pub fn clear_target_replay_package(&self, target: &ExecutionTarget) -> KaiResult<()> {
+        self.delete_value(&replay_binding_key(target.provider, &target.workspace_id))
     }
 
     pub fn load_json_state<T>(&self, key: &str) -> KaiResult<Option<T>>
@@ -152,4 +239,12 @@ impl StateStore {
             .map_err(sql_state_error("delete kv value"))?;
         Ok(())
     }
+}
+
+fn session_binding_key(provider: RunnerProvider, workspace_id: &str) -> String {
+    format!("session.binding.{}.{}", provider.as_key(), workspace_id)
+}
+
+fn replay_binding_key(provider: RunnerProvider, workspace_id: &str) -> String {
+    format!("session.replay.{}.{}", provider.as_key(), workspace_id)
 }

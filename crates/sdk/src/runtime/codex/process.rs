@@ -23,6 +23,7 @@ pub(super) fn build_async_command(
         command.arg("resume");
         command.arg("--json");
         command.arg("--skip-git-repo-check");
+        command.current_dir(&prepared.target.working_dir);
         apply_codex_overrides_tokio(config, &mut command);
         apply_image_args_tokio(&mut command, &prepared.attachments);
         command.arg(session_id);
@@ -35,7 +36,8 @@ pub(super) fn build_async_command(
     command.arg("--json");
     command.arg("--skip-git-repo-check");
     command.arg("-C");
-    command.arg(&config.values.paths.root_work);
+    command.arg(&prepared.target.working_dir);
+    command.current_dir(&prepared.target.working_dir);
 
     for path in extra_access_paths(config, &prepared.attachments) {
         command.arg("--add-dir");
@@ -146,7 +148,8 @@ async fn run_exec_async_fallback(
     command.arg("--json");
     command.arg("--skip-git-repo-check");
     command.arg("-C");
-    command.arg(&config.values.paths.root_work);
+    command.arg(&prepared.target.working_dir);
+    command.current_dir(&prepared.target.working_dir);
 
     for path in extra_access_paths(config, &prepared.attachments) {
         command.arg("--add-dir");
@@ -219,6 +222,7 @@ fn codex_process_failure_from_parts(status: &std::process::ExitStatus, stderr: &
 
 pub(super) fn run_exec(
     config: &LoadedConfig,
+    target: &crate::workspace::ExecutionTarget,
     prompt: &str,
     attachments: &[AttachmentInfo],
 ) -> KaiResult<RawCodexResult> {
@@ -227,7 +231,8 @@ pub(super) fn run_exec(
     command.arg("--json");
     command.arg("--skip-git-repo-check");
     command.arg("-C");
-    command.arg(&config.values.paths.root_work);
+    command.arg(&target.working_dir);
+    command.current_dir(&target.working_dir);
 
     for path in extra_access_paths(config, attachments) {
         command.arg("--add-dir");
@@ -243,6 +248,7 @@ pub(super) fn run_exec(
 
 pub(super) fn run_resume(
     config: &LoadedConfig,
+    target: &crate::workspace::ExecutionTarget,
     session_id: &str,
     prompt: &str,
     attachments: &[AttachmentInfo],
@@ -252,6 +258,7 @@ pub(super) fn run_resume(
     command.arg("resume");
     command.arg("--json");
     command.arg("--skip-git-repo-check");
+    command.current_dir(&target.working_dir);
     apply_codex_overrides(config, &mut command);
     apply_image_args(&mut command, attachments);
     command.arg(session_id);
@@ -488,7 +495,6 @@ fn extra_access_paths(config: &LoadedConfig, attachments: &[AttachmentInfo]) -> 
     for context_path in [
         config.values.context_files.soul.as_str(),
         config.values.context_files.memory.as_str(),
-        config.values.context_files.todo.as_str(),
     ] {
         if let Some(parent) = Path::new(context_path).parent() {
             paths.push(parent.to_path_buf());

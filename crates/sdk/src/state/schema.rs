@@ -20,6 +20,9 @@ pub(super) fn initialize_schema(connection: &Connection) -> KaiResult<()> {
 						CREATE TABLE IF NOT EXISTS turns (
 							id INTEGER PRIMARY KEY AUTOINCREMENT,
 							created_at TEXT NOT NULL,
+					provider TEXT NOT NULL DEFAULT 'codex',
+					workspace_id TEXT NOT NULL DEFAULT '',
+					working_dir TEXT NOT NULL DEFAULT '',
 					role TEXT NOT NULL,
 				channel TEXT NOT NULL,
 				sender_id INTEGER,
@@ -58,6 +61,24 @@ pub(super) fn initialize_schema(connection: &Connection) -> KaiResult<()> {
 					",
         )
         .map_err(sql_state_error("initialize schema"))?;
+    ensure_column(
+        connection,
+        "turns",
+        "provider",
+        "TEXT NOT NULL DEFAULT 'codex'",
+    )?;
+    ensure_column(
+        connection,
+        "turns",
+        "workspace_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "turns",
+        "working_dir",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
 
     Ok(())
 }
@@ -253,5 +274,32 @@ pub(super) fn migrate_pending_reply_deliveries_from_kv(connection: &Connection) 
             [PENDING_REPLY_DELIVERIES_STATE_KEY],
         )
         .map_err(sql_state_error("delete legacy pending reply deliveries"))?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> KaiResult<()> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sql_state_error("inspect schema"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_state_error("inspect schema"))?;
+    for row in rows {
+        if row.map_err(sql_state_error("inspect schema"))? == column {
+            return Ok(());
+        }
+    }
+
+    connection
+        .execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(sql_state_error("migrate schema"))?;
     Ok(())
 }

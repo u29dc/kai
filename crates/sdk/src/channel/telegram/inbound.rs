@@ -1,4 +1,5 @@
 use super::*;
+use crate::workspace::workspace_by_id;
 
 pub(super) async fn handle_message(
     client: &Client,
@@ -45,6 +46,7 @@ pub(super) async fn handle_message(
                 &[update_id],
             ),
             enqueued_at: chrono::Utc::now().to_rfc3339(),
+            target: crate::workspace::execution_target(config, state)?,
             channel: "telegram".to_string(),
             update_ids: vec![update_id],
             chat_id: validated.chat_id,
@@ -156,14 +158,26 @@ fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
     match trimmed {
         "/help" | "help" => Some(MobileCommand::Help),
         "/status" => Some(MobileCommand::Status),
+        "/dir" | "/switchdir" | "dir" => Some(MobileCommand::Dir { workspace_id: None }),
         "/new" | "/reset" => Some(MobileCommand::Reset),
         "/cancel" | "/interrupt" => Some(MobileCommand::Cancel),
         _ => trimmed
-            .strip_prefix("/send ")
+            .strip_prefix("/dir ")
+            .or_else(|| trimmed.strip_prefix("/switchdir "))
+            .or_else(|| trimmed.strip_prefix("dir "))
             .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .map(|path| MobileCommand::Send {
-                path: path.to_string(),
+            .filter(|workspace_id| !workspace_id.is_empty())
+            .map(|workspace_id| MobileCommand::Dir {
+                workspace_id: Some(workspace_id.to_string()),
+            })
+            .or_else(|| {
+                trimmed
+                    .strip_prefix("/send ")
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| MobileCommand::Send {
+                        path: path.to_string(),
+                    })
             }),
     }
 }
@@ -190,18 +204,70 @@ async fn handle_mobile_command(
             ));
             send_message(client, token, validated.chat_id, &status).await
         }
+        MobileCommand::Dir { workspace_id } => {
+            if let Some(workspace_id) = workspace_id {
+                let workspace = workspace_by_id(config, &workspace_id)?;
+                state.set_selected_workspace_id(&workspace.id)?;
+                let session_status = state
+                    .get_session_binding(&crate::workspace::execution_target(config, state)?)?
+                    .map(|binding| format!("resuming session {}", binding.session_id))
+                    .unwrap_or_else(|| "next turn will start fresh".to_string());
+                return send_message(
+                    client,
+                    token,
+                    validated.chat_id,
+                    &format!(
+                        "Workspace set to {} ({})\n{}",
+                        workspace.id, workspace.path, session_status
+                    ),
+                )
+                .await;
+            }
+
+            let workspace_status = state.workspace_status_output(config)?;
+            let lines = workspace_status
+                .workspaces
+                .into_iter()
+                .map(|workspace| {
+                    let marker = if workspace.selected { "*" } else { " " };
+                    format!(
+                        "{} {} ({}){}",
+                        marker,
+                        workspace.id,
+                        workspace.path,
+                        workspace
+                            .active_session_id
+                            .as_ref()
+                            .map(|session_id| format!(" session={session_id}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>();
+            send_message(
+                client,
+                token,
+                validated.chat_id,
+                &format!(
+                    "Current workspace: {}\nAvailable:\n{}",
+                    workspace_status.selected_workspace_id,
+                    lines.join("\n")
+                ),
+            )
+            .await
+        }
         MobileCommand::Reset => {
             if let Some(turn) = active_turn.as_mut() {
                 turn.cancel_requested = true;
                 let _ = cancel_agent_turn(&turn.running);
             }
-            state.clear_active_session_id()?;
-            state.clear_replay_package()?;
+            let target = crate::workspace::execution_target(config, state)?;
+            state.clear_session_binding(&target)?;
+            state.clear_target_replay_package(&target)?;
             send_message(
                 client,
                 token,
                 validated.chat_id,
-                "Cleared the active Codex session. The next queued or new message will start fresh.",
+                "Cleared the current workspace session. The next queued or new message will start fresh.",
             )
             .await
         }
@@ -221,7 +287,7 @@ async fn handle_mobile_command(
             .await
         }
         MobileCommand::Send { path } => {
-            let resolved = resolve_requested_path(config, &path)?;
+            let resolved = resolve_requested_path(config, state, &path)?;
             let sent = send_local_paths(client, token, validated.chat_id, &[resolved]).await?;
             send_message(
                 client,

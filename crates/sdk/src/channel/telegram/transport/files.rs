@@ -285,12 +285,17 @@ async fn build_uploaded_part(upload: &OutboundUpload<'_>) -> KaiResult<multipart
     }
 }
 
-pub(super) fn resolve_requested_path(config: &LoadedConfig, raw: &str) -> KaiResult<PathBuf> {
+pub(super) fn resolve_requested_path(
+    config: &LoadedConfig,
+    state: &StateStore,
+    raw: &str,
+) -> KaiResult<PathBuf> {
     let normalized = crate::config::expand_home(raw);
+    let workspace = crate::workspace::selected_workspace(config, state)?;
     let candidate = if Path::new(&normalized).is_absolute() {
         PathBuf::from(&normalized)
     } else {
-        Path::new(&config.values.paths.root_work).join(normalized)
+        Path::new(&workspace.path).join(normalized)
     };
 
     let canonical = candidate.canonicalize().map_err(|error| {
@@ -311,14 +316,12 @@ pub(super) fn resolve_requested_path(config: &LoadedConfig, raw: &str) -> KaiRes
         ));
     }
 
-    let root_work = Path::new(&config.values.paths.root_work)
-        .canonicalize()
-        .map_err(|error| {
-            KaiError::new(
-                ErrorCode::ConfigError,
-                format!("failed to resolve root_work: {error}"),
-            )
-        })?;
+    let workspace_root = Path::new(&workspace.path).canonicalize().map_err(|error| {
+        KaiError::new(
+            ErrorCode::ConfigError,
+            format!("failed to resolve workspace path: {error}"),
+        )
+    })?;
     let root_app = Path::new(&config.values.paths.root_app)
         .canonicalize()
         .map_err(|error| {
@@ -328,7 +331,7 @@ pub(super) fn resolve_requested_path(config: &LoadedConfig, raw: &str) -> KaiRes
             )
         })?;
 
-    if !canonical.starts_with(&root_work) && !canonical.starts_with(&root_app) {
+    if !canonical.starts_with(&workspace_root) && !canonical.starts_with(&root_app) {
         return Err(KaiError::blocked_prerequisite(
             "requested path is outside the approved kai roots",
         ));

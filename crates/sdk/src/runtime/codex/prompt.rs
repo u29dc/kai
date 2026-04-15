@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) fn build_turn_prompt(
     config: &LoadedConfig,
+    target: &crate::workspace::ExecutionTarget,
     channel: &str,
     sender_id: i64,
     user_text: &str,
@@ -9,10 +10,17 @@ pub(super) fn build_turn_prompt(
     context: &[ContextSnapshot],
 ) -> String {
     if !USE_SYSTEM_INSTRUCTION_PROMPT {
-        return build_passthrough_turn_prompt(config, channel, sender_id, user_text, attachments);
+        return build_passthrough_turn_prompt(
+            config,
+            target,
+            channel,
+            sender_id,
+            user_text,
+            attachments,
+        );
     }
 
-    let agents_path = Path::new(&config.values.paths.root_work).join("AGENTS.md");
+    let agents_path = Path::new(&target.working_dir).join("AGENTS.md");
     let mut sections = vec![
         "You are a private owner-only chat portal into a local AI operator running on the user's machine.".to_string(),
         String::new(),
@@ -21,10 +29,6 @@ pub(super) fn build_turn_prompt(
         "- be useful, practical, and safe".to_string(),
         String::new(),
         "Context sources:".to_string(),
-        format!(
-            "- TODO.md = live queue, current commitments, what matters now at {}",
-            config.values.context_files.todo
-        ),
         format!(
             "- MEMORY.md = durable facts, preferences, and stable context at {}",
             config.values.context_files.memory
@@ -55,7 +59,7 @@ pub(super) fn build_turn_prompt(
         "- stay within the intended local workspace and approved operating scope".to_string(),
         String::new(),
         "Operating defaults:".to_string(),
-        "- the local vault is the main source of truth".to_string(),
+        "- preserve continuity within the selected workspace session".to_string(),
         "- use local tools when they materially improve accuracy".to_string(),
         "- preserve continuity across the ongoing session".to_string(),
         "- optimize for usefulness, clarity, and low friction on phone".to_string(),
@@ -67,7 +71,8 @@ pub(super) fn build_turn_prompt(
         String::new(),
         "Resolved paths:".to_string(),
         format!("- config: {}", config.config_path.display()),
-        format!("- root_work: {}", config.values.paths.root_work),
+        format!("- workspace_id: {}", target.workspace_id),
+        format!("- working_dir: {}", target.working_dir),
         format!("- root_app: {}", config.values.paths.root_app),
         String::new(),
         "Context references:".to_string(),
@@ -109,6 +114,7 @@ pub(super) fn build_turn_prompt(
 
 fn build_passthrough_turn_prompt(
     config: &LoadedConfig,
+    target: &crate::workspace::ExecutionTarget,
     channel: &str,
     sender_id: i64,
     user_text: &str,
@@ -119,7 +125,8 @@ fn build_passthrough_turn_prompt(
         format!("- channel: {channel}"),
         format!("- sender_id: {sender_id}"),
         format!("- local_timezone: {}", config.values.agent.timezone),
-        format!("- root_work: {}", config.values.paths.root_work),
+        format!("- workspace_id: {}", target.workspace_id),
+        format!("- working_dir: {}", target.working_dir),
         format!("- root_app: {}", config.values.paths.root_app),
     ];
 

@@ -7,6 +7,7 @@ use crate::context::context_report;
 use crate::error::KaiResult;
 use crate::runtime::agent::{create_replay_package, run_agent_turn, selected_provider};
 use crate::state::{AttachmentInfo, NewTurn, StateStore};
+use crate::workspace::execution_target;
 
 pub fn handle_owner_prompt(
     config: &LoadedConfig,
@@ -16,21 +17,39 @@ pub fn handle_owner_prompt(
     text: &str,
     attachments: &[AttachmentInfo],
 ) -> KaiResult<String> {
+    let target = execution_target(config, state)?;
     let _ = selected_provider(config)?;
 
     state.record_turn(NewTurn {
+        provider: target.provider,
+        workspace_id: &target.workspace_id,
+        working_dir: &target.working_dir,
         role: "user",
         channel,
         sender_id: Some(sender_id),
         text,
-        codex_session_id: state.get_active_session_id()?.as_deref(),
+        codex_session_id: state
+            .get_session_binding(&target)?
+            .as_ref()
+            .map(|binding| binding.session_id.as_str()),
         outcome_status: Some("received"),
         attachments,
     })?;
 
-    let result = run_agent_turn(config, state, channel, sender_id, text, attachments)?;
+    let result = run_agent_turn(
+        config,
+        state,
+        &target,
+        channel,
+        sender_id,
+        text,
+        attachments,
+    )?;
 
     state.record_turn(NewTurn {
+        provider: target.provider,
+        workspace_id: &target.workspace_id,
+        working_dir: &target.working_dir,
         role: "assistant",
         channel,
         sender_id: None,
@@ -40,13 +59,19 @@ pub fn handle_owner_prompt(
         attachments: &[],
     })?;
 
-    let replay_package = create_replay_package(&result.context_snapshots, &state.recent_turns(24)?);
-    state.set_replay_package(&replay_package)?;
+    let replay_package = create_replay_package(
+        &result.context_snapshots,
+        &state.recent_turns_for_target(&target, 24)?,
+    );
+    state.set_target_replay_package(&target, &replay_package)?;
 
     state.append_audit_json(&json!({
         "timestamp": Utc::now().to_rfc3339(),
         "event": "turn.completed",
         "turnId": Uuid::new_v4().to_string(),
+        "provider": target.provider.as_key(),
+        "workspaceId": target.workspace_id,
+        "workingDir": target.working_dir,
         "channel": channel,
         "senderId": sender_id,
         "codexSessionId": result.session_id,
@@ -62,17 +87,19 @@ pub fn mobile_help_text() -> String {
         "kai commands:",
         "/help - show this help",
         "/status - show current pairing and session status",
-        "/new - clear the current Codex session so the next message starts fresh",
+        "/dir - show the current workspace and available workspaces",
+        "/dir <workspace> - switch the next turns to a configured workspace",
+        "/new - clear the current workspace session so the next message starts fresh",
         "/reset - same as /new",
         "/cancel - stop the current running Codex turn",
-        "/send <path> - send a local file from root_work or root_app",
+        "/send <path> - send a local file from the current workspace or root_app",
         "/pair <code> - recovery-only owner pairing when locally enabled",
     ]
     .join("\n")
 }
 
 pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResult<String> {
-    let mut session = state.session_view()?;
+    let mut session = state.session_view(config)?;
     if session.owner_user_id.is_none() {
         session.owner_user_id = config.values.channel.telegram.owner_user_id;
     }
@@ -92,6 +119,9 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
                 .active_session_id
                 .unwrap_or_else(|| "none".to_string())
         ),
+        format!("provider: {}", session.provider),
+        format!("workspace: {}", session.selected_workspace_id),
+        format!("workspace_path: {}", session.selected_workspace_path),
         format!(
             "owner_chat: {}",
             session
@@ -121,6 +151,20 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
         lines.push("recovery_pairing: closed".to_string());
     }
 
+    let workspace_summary = session
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            if workspace.selected {
+                format!("{}*", workspace.id)
+            } else {
+                workspace.id.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(format!("workspaces: {}", workspace_summary));
+
     for entry in context.entries {
         let status = if entry.exists { "ok" } else { "missing" };
         lines.push(format!("context {}: {}", entry.role, status));
@@ -135,7 +179,7 @@ mod tests {
     use crate::config::{
         AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, MediaConfig,
         PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-        TranscriptionConfig,
+        TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
     };
     use crate::error::ErrorCode;
     use std::path::Path;
@@ -171,7 +215,6 @@ mod tests {
                 },
                 paths: PathsConfig {
                     root_app: root_app.display().to_string(),
-                    root_work: root_work.display().to_string(),
                 },
                 runner: RunnerConfig {
                     provider,
@@ -183,7 +226,16 @@ mod tests {
                 context_files: ContextFilesConfig {
                     soul: root_app.join("SOUL.md").display().to_string(),
                     memory: root_app.join("MEMORY.md").display().to_string(),
-                    todo: root_app.join("TODO.md").display().to_string(),
+                },
+                workspaces: WorkspacesConfig {
+                    default_workspace: "main".to_string(),
+                    entries: std::collections::BTreeMap::from([(
+                        "main".to_string(),
+                        WorkspaceConfig {
+                            label: Some("Main".to_string()),
+                            path: root_work.display().to_string(),
+                        },
+                    )]),
                 },
             },
         }

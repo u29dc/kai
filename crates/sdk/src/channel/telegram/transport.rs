@@ -75,6 +75,10 @@ pub(super) async fn send_local_paths(
     files::send_local_paths(client, token, chat_id, paths).await
 }
 
-pub(super) fn resolve_requested_path(config: &LoadedConfig, raw: &str) -> KaiResult<PathBuf> {
-    files::resolve_requested_path(config, raw)
+pub(super) fn resolve_requested_path(
+    config: &LoadedConfig,
+    state: &StateStore,
+    raw: &str,
+) -> KaiResult<PathBuf> {
+    files::resolve_requested_path(config, state, raw)
 }

@@ -63,6 +63,7 @@ pub(super) async fn sync_command_menu_if_needed(
 fn telegram_menu_commands() -> Vec<TelegramMenuCommand> {
     vec![
         TelegramMenuCommand::new("status", "Show current session and queue status"),
+        TelegramMenuCommand::new("dir", "Show or switch configured workspaces"),
         TelegramMenuCommand::new("new", "Start the next turn with a fresh session"),
         TelegramMenuCommand::new("cancel", "Cancel the current running turn"),
         TelegramMenuCommand::new("send", "Send a local file back to this chat"),

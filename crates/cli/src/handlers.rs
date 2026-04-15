@@ -28,6 +28,7 @@ pub(super) async fn dispatch(cli: Cli) -> KaiResult<Flow> {
             })
         }
         Command::Config { command } => handle_config_command(command),
+        Command::Workspace { command } => handle_workspace_command(command),
         Command::Setup { command } => handle_setup_command(command).await,
         Command::Context { command } => {
             let config = load_config()?;
@@ -138,6 +139,25 @@ fn handle_config_command(command: ConfigCommand) -> KaiResult<Flow> {
                 payload,
             })
         }
+        ConfigCommand::Migrate => {
+            let result = kai_sdk::migrate_config_to_workspaces()?;
+            let payload = serde_json::to_value(ConfigMigrationOutput {
+                config_path: result.config_path.display().to_string(),
+                backup_path: result
+                    .backup_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                migrated: result.migrated,
+                default_workspace_id: result.default_workspace_id,
+                removed_legacy_keys: result.removed_legacy_keys,
+            })
+            .map_err(serialize_error("serialize config migration output"))?;
+
+            Ok(Flow::Immediate {
+                tool: "kai.config.migrate".to_string(),
+                payload,
+            })
+        }
     }
 }
 
@@ -155,7 +175,7 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
             let payload = serde_json::to_value(SetupOutput {
                 config_path: config.config_path.display().to_string(),
                 root_app: config.values.paths.root_app.clone(),
-                root_work: config.values.paths.root_work.clone(),
+                default_workspace_id: config.values.workspaces.default_workspace.clone(),
                 created_paths,
             })
             .map_err(serialize_error("serialize setup output"))?;
@@ -241,6 +261,7 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
 fn handle_session_command(command: SessionCommand) -> KaiResult<Flow> {
     let config = load_config()?;
     let state = StateStore::open(&config)?;
+    let target = kai_sdk::execution_target(&config, &state)?;
     let tool = match &command {
         SessionCommand::Show => "kai.session.show",
         SessionCommand::Set { .. } => "kai.session.set",
@@ -254,12 +275,12 @@ fn handle_session_command(command: SessionCommand) -> KaiResult<Flow> {
             if session_id.trim().is_empty() {
                 return Err(KaiError::invalid_argument("session id cannot be empty"));
             }
-            state.set_active_session_id(session_id.trim())?;
-            state.clear_replay_package()?;
+            state.set_session_binding(&target, session_id.trim())?;
+            state.clear_target_replay_package(&target)?;
         }
         SessionCommand::New | SessionCommand::Reset => {
-            state.clear_active_session_id()?;
-            state.clear_replay_package()?;
+            state.clear_session_binding(&target)?;
+            state.clear_target_replay_package(&target)?;
         }
     }
 
@@ -276,11 +297,34 @@ fn session_view_with_override(
     config: &kai_sdk::LoadedConfig,
     state: &StateStore,
 ) -> KaiResult<SessionView> {
-    let mut session = state.session_view()?;
+    let mut session = state.session_view(config)?;
     if session.owner_user_id.is_none() {
         session.owner_user_id = config.values.channel.telegram.owner_user_id;
     }
     Ok(session)
+}
+
+fn handle_workspace_command(command: WorkspaceCommand) -> KaiResult<Flow> {
+    let config = load_config()?;
+    let state = StateStore::open(&config)?;
+
+    if let WorkspaceCommand::Select { workspace_id } = &command {
+        let workspace = kai_sdk::workspace_by_id(&config, workspace_id)?;
+        state.set_selected_workspace_id(&workspace.id)?;
+    }
+
+    let payload = serde_json::to_value(state.workspace_status_output(&config)?)
+        .map_err(serialize_error("serialize workspace status output"))?;
+    let tool = match command {
+        WorkspaceCommand::List => "kai.workspace.list",
+        WorkspaceCommand::Show => "kai.workspace.show",
+        WorkspaceCommand::Select { .. } => "kai.workspace.select",
+    };
+
+    Ok(Flow::Immediate {
+        tool: tool.to_string(),
+        payload,
+    })
 }
 
 fn create_runtime_dirs(
@@ -291,13 +335,20 @@ fn create_runtime_dirs(
 
     for path in [
         Path::new(&config.values.paths.root_app).to_path_buf(),
-        Path::new(&config.values.paths.root_work).to_path_buf(),
         state.paths().attachments_dir.clone(),
         state.paths().logs_dir.clone(),
         state.paths().state_dir.clone(),
     ] {
         ensure_private_dir(&path)?;
         created.push(path.display().to_string());
+    }
+
+    for workspace in config.values.workspaces.entries.values() {
+        let workspace_path = Path::new(&workspace.path);
+        if workspace_path.starts_with(Path::new(&config.values.paths.root_app)) {
+            fs::create_dir_all(workspace_path).map_err(io_error("create workspace directory"))?;
+            created.push(workspace_path.display().to_string());
+        }
     }
 
     created.sort();
@@ -309,7 +360,6 @@ fn create_context_placeholders(config: &kai_sdk::LoadedConfig) -> KaiResult<()> 
     for (path, title) in [
         (config.values.context_files.soul.as_str(), "SOUL"),
         (config.values.context_files.memory.as_str(), "MEMORY"),
-        (config.values.context_files.todo.as_str(), "TODO"),
     ] {
         let file_path = Path::new(path);
         if file_path.is_file() {
@@ -320,7 +370,12 @@ fn create_context_placeholders(config: &kai_sdk::LoadedConfig) -> KaiResult<()> 
             fs::create_dir_all(parent).map_err(io_error("create context directory"))?;
         }
 
-        write_private_file(file_path, format!("# {title}\n\n").as_bytes())?;
+        if file_path.starts_with(Path::new(&config.values.paths.root_app)) {
+            write_private_file(file_path, format!("# {title}\n\n").as_bytes())?;
+        } else {
+            fs::write(file_path, format!("# {title}\n\n"))
+                .map_err(io_error("write context placeholder"))?;
+        }
     }
 
     Ok(())
@@ -393,7 +448,7 @@ mod tests {
         config::{
             AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, MediaConfig,
             PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-            TranscriptionConfig,
+            TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
         },
     };
     use std::path::PathBuf;
@@ -428,7 +483,6 @@ mod tests {
                 },
                 paths: PathsConfig {
                     root_app: "/tmp/kai".to_string(),
-                    root_work: "/tmp/work".to_string(),
                 },
                 runner: RunnerConfig {
                     provider,
@@ -440,7 +494,16 @@ mod tests {
                 context_files: ContextFilesConfig {
                     soul: "/tmp/kai/SOUL.md".to_string(),
                     memory: "/tmp/kai/MEMORY.md".to_string(),
-                    todo: "/tmp/kai/TODO.md".to_string(),
+                },
+                workspaces: WorkspacesConfig {
+                    default_workspace: "main".to_string(),
+                    entries: std::collections::BTreeMap::from([(
+                        "main".to_string(),
+                        WorkspaceConfig {
+                            label: Some("Main".to_string()),
+                            path: "/tmp/work".to_string(),
+                        },
+                    )]),
                 },
             },
         }

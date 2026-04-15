@@ -43,7 +43,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "config",
                     "Read one effective config key.",
                     "configGetOutput",
-                    "kai config get paths.root_work",
+                    "kai config get workspaces.vault.path",
                 )
                 .with_parameters(vec![parameter(
                     "key",
@@ -60,7 +60,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "config",
                     "Persist a config override.",
                     "configSetOutput",
-                    "kai config set paths.root_work ~/Dropbox/VAULT",
+                    "kai config set workspaces.vault.path ~/Dropbox/VAULT",
                 )
                 .with_parameters(vec![
                     parameter("key", "string", true, "Dotted config key path."),
@@ -91,6 +91,24 @@ pub fn tool_catalog() -> ToolCatalog {
             ),
             tool(
                 ToolSeed::new(
+                    "config.migrate",
+                    "kai config migrate",
+                    "config",
+                    "Rewrite legacy config into the workspace-based format.",
+                    "configMigrationOutput",
+                    "kai config migrate",
+                )
+                .with_output_fields([
+                    "configPath",
+                    "backupPath",
+                    "migrated",
+                    "defaultWorkspaceId",
+                    "removedLegacyKeys",
+                ])
+                .with_idempotent(false),
+            ),
+            tool(
+                ToolSeed::new(
                     "setup",
                     "kai setup",
                     "setup",
@@ -98,7 +116,12 @@ pub fn tool_catalog() -> ToolCatalog {
                     "setupOutput",
                     "kai setup",
                 )
-                .with_output_fields(["configPath", "rootApp", "rootWork", "createdPaths"])
+                .with_output_fields([
+                    "configPath",
+                    "rootApp",
+                    "defaultWorkspaceId",
+                    "createdPaths",
+                ])
                 .with_idempotent(false),
             ),
             tool(
@@ -145,7 +168,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "contextReport",
                     "kai context show",
                 )
-                .with_output_fields(["rootApp", "rootWork", "files"]),
+                .with_output_fields(["entries"]),
             ),
             tool(
                 ToolSeed::new(
@@ -156,20 +179,83 @@ pub fn tool_catalog() -> ToolCatalog {
                     "contextReport",
                     "kai context check",
                 )
-                .with_output_fields(["rootApp", "rootWork", "files"]),
+                .with_output_fields(["entries"]),
+            ),
+            tool(
+                ToolSeed::new(
+                    "workspace.list",
+                    "kai workspace list",
+                    "workspace",
+                    "List configured workspaces and current selection.",
+                    "workspaceStatusOutput",
+                    "kai workspace list",
+                )
+                .with_output_fields([
+                    "provider",
+                    "defaultWorkspaceId",
+                    "selectedWorkspaceId",
+                    "selectedWorkspacePath",
+                    "workspaces",
+                ]),
+            ),
+            tool(
+                ToolSeed::new(
+                    "workspace.show",
+                    "kai workspace show",
+                    "workspace",
+                    "Show the current workspace selection.",
+                    "workspaceStatusOutput",
+                    "kai workspace show",
+                )
+                .with_output_fields([
+                    "provider",
+                    "defaultWorkspaceId",
+                    "selectedWorkspaceId",
+                    "selectedWorkspacePath",
+                    "workspaces",
+                ]),
+            ),
+            tool(
+                ToolSeed::new(
+                    "workspace.select",
+                    "kai workspace select <workspace_id>",
+                    "workspace",
+                    "Select the workspace used for subsequent turns.",
+                    "workspaceStatusOutput",
+                    "kai workspace select vault",
+                )
+                .with_parameters(vec![parameter(
+                    "workspace_id",
+                    "string",
+                    true,
+                    "Configured workspace id.",
+                )])
+                .with_output_fields([
+                    "provider",
+                    "defaultWorkspaceId",
+                    "selectedWorkspaceId",
+                    "selectedWorkspacePath",
+                    "workspaces",
+                ])
+                .with_idempotent(false),
             ),
             tool(
                 ToolSeed::new(
                     "session.show",
                     "kai session show",
                     "session",
-                    "Show owner/session/runtime state.",
+                    "Show owner/session/runtime state for the current workspace target.",
                     "sessionView",
                     "kai session show",
                 )
                 .with_output_fields([
                     "ownerUserId",
                     "ownerChatId",
+                    "provider",
+                    "defaultWorkspaceId",
+                    "selectedWorkspaceId",
+                    "selectedWorkspacePath",
+                    "workspaces",
                     "activeSessionId",
                     "pendingPairing",
                     "updateOffset",
@@ -185,7 +271,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "session.set",
                     "kai session set <session_id>",
                     "session",
-                    "Override the active Codex session id.",
+                    "Override the active session id for the current workspace target.",
                     "sessionView",
                     "kai session set 019d7c6a-2460-7e91-b6eb-8643f9f9930f",
                 )
@@ -198,6 +284,11 @@ pub fn tool_catalog() -> ToolCatalog {
                 .with_output_fields([
                     "ownerUserId",
                     "ownerChatId",
+                    "provider",
+                    "defaultWorkspaceId",
+                    "selectedWorkspaceId",
+                    "selectedWorkspacePath",
+                    "workspaces",
                     "activeSessionId",
                     "pendingPairing",
                     "updateOffset",
@@ -214,13 +305,18 @@ pub fn tool_catalog() -> ToolCatalog {
                     "session.new",
                     "kai session new",
                     "session",
-                    "Clear active session so the next turn starts fresh.",
+                    "Clear the current workspace session so the next turn starts fresh.",
                     "sessionView",
                     "kai session new",
                 )
                 .with_output_fields([
                     "ownerUserId",
                     "ownerChatId",
+                    "provider",
+                    "defaultWorkspaceId",
+                    "selectedWorkspaceId",
+                    "selectedWorkspacePath",
+                    "workspaces",
                     "activeSessionId",
                     "pendingPairing",
                     "updateOffset",
@@ -244,6 +340,11 @@ pub fn tool_catalog() -> ToolCatalog {
                 .with_output_fields([
                     "ownerUserId",
                     "ownerChatId",
+                    "provider",
+                    "defaultWorkspaceId",
+                    "selectedWorkspaceId",
+                    "selectedWorkspacePath",
+                    "workspaces",
                     "activeSessionId",
                     "pendingPairing",
                     "updateOffset",

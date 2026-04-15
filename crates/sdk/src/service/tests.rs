@@ -4,7 +4,7 @@ use super::*;
 use crate::config::{
     AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
     PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-    TranscriptionConfig,
+    TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
 };
 
 fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
@@ -37,7 +37,6 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
             },
             paths: PathsConfig {
                 root_app: root_app.display().to_string(),
-                root_work: root_work.display().to_string(),
             },
             runner: RunnerConfig {
                 provider: RunnerProvider::Codex,
@@ -49,7 +48,16 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
             context_files: ContextFilesConfig {
                 soul: root_app.join("SOUL.md").display().to_string(),
                 memory: root_app.join("MEMORY.md").display().to_string(),
-                todo: root_app.join("TODO.md").display().to_string(),
+            },
+            workspaces: WorkspacesConfig {
+                default_workspace: "main".to_string(),
+                entries: std::collections::BTreeMap::from([(
+                    "main".to_string(),
+                    WorkspaceConfig {
+                        label: Some("Main".to_string()),
+                        path: root_work.display().to_string(),
+                    },
+                )]),
             },
         },
     }
