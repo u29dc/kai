@@ -84,6 +84,7 @@ pub fn service_start(config: &LoadedConfig) -> KaiResult<ServiceActionOutput> {
 
     #[cfg(target_os = "macos")]
     {
+        validate_service_runtime_prerequisites(config)?;
         seed_secrets(config)?;
 
         let binary_path = runtime_binary_path(config);
@@ -242,6 +243,7 @@ pub fn service_restart(config: &LoadedConfig) -> KaiResult<ServiceActionOutput> 
             ));
         }
 
+        validate_service_runtime_prerequisites(config)?;
         let _ = service_stop(config)?;
         service_start(config).map(|mut output| {
             output.action = "restarted".to_string();

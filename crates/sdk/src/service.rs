@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::LoadedConfig;
 use crate::error::{ErrorCode, KaiError, KaiResult};
+use crate::runtime::agent::selected_provider;
 use crate::runtime_fs::{
     ensure_private_dir, ensure_private_file, harden_private_file, write_private_executable,
 };
@@ -39,6 +40,11 @@ const SERVICE_STDERR_FILE: &str = "service.stderr.log";
 const SERVICE_RUNNER_FILE: &str = "service-run.sh";
 const SERVICE_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+fn validate_service_runtime_prerequisites(config: &LoadedConfig) -> KaiResult<()> {
+    let _ = selected_provider(config)?;
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct RunGuard {

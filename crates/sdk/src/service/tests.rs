@@ -76,6 +76,21 @@ fn run_lock_status_reports_stale_after_release() {
     assert!(!status.stale);
 }
 
+#[test]
+fn validate_service_runtime_prerequisites_blocks_unsupported_provider() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let mut config = test_config(&root_app, &root_work);
+    config.values.runner.provider = RunnerProvider::Claude;
+
+    let error = validate_service_runtime_prerequisites(&config)
+        .expect_err("unsupported provider should be blocked");
+
+    assert!(matches!(error.code, ErrorCode::BlockedPrerequisite));
+    assert!(error.message.contains("claude"));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn render_macos_plist_contains_required_fields() {
