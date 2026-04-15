@@ -48,12 +48,7 @@ pub(super) async fn dispatch(cli: Cli) -> KaiResult<Flow> {
         Command::Service { command } => handle_service_command(command),
         Command::Run => {
             let config = load_config()?;
-            if !config.values.channel.telegram.enabled {
-                return Err(KaiError::blocked_prerequisite(
-                    "telegram is disabled in config",
-                ));
-            }
-            let _ = resolve_telegram_token(&config)?;
+            validate_run_prerequisites(&config)?;
             let run_guard = acquire_run_guard(&config)?;
             let state = StateStore::open(&config)?;
             let payload = json!({
@@ -73,6 +68,18 @@ pub(super) async fn dispatch(cli: Cli) -> KaiResult<Flow> {
             })
         }
     }
+}
+
+fn validate_run_prerequisites(config: &kai_sdk::LoadedConfig) -> KaiResult<()> {
+    if !config.values.channel.telegram.enabled {
+        return Err(KaiError::blocked_prerequisite(
+            "telegram is disabled in config",
+        ));
+    }
+
+    let _ = selected_provider(config)?;
+    let _ = resolve_telegram_token(config)?;
+    Ok(())
 }
 
 fn handle_config_command(command: ConfigCommand) -> KaiResult<Flow> {
@@ -375,5 +382,76 @@ fn io_error(action: &'static str) -> impl Fn(std::io::Error) -> KaiError {
             kai_sdk::ErrorCode::IoError,
             format!("failed to {action}: {error}"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kai_sdk::{
+        ErrorCode, LoadedConfig,
+        config::{
+            AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, MediaConfig,
+            PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
+            TranscriptionConfig,
+        },
+    };
+    use std::path::PathBuf;
+
+    fn test_config(provider: RunnerProvider) -> LoadedConfig {
+        LoadedConfig {
+            config_path: PathBuf::from("/tmp/kai.toml"),
+            config_exists: false,
+            values: Config {
+                agent: AgentConfig {
+                    timezone: "Europe/London".to_string(),
+                },
+                channel: ChannelConfig {
+                    telegram: TelegramConfig {
+                        enabled: true,
+                        bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
+                        owner_user_id: None,
+                        progress: TelegramProgressConfig {
+                            enabled: true,
+                            edit_interval_ms: 2500,
+                            idle_update_secs: 8,
+                        },
+                    },
+                },
+                media: MediaConfig {
+                    transcription: TranscriptionConfig {
+                        provider: "groq".to_string(),
+                        groq_api_key_env: "GROQ_API_KEY".to_string(),
+                        groq_model: "whisper-large-v3-turbo".to_string(),
+                        command: None,
+                    },
+                },
+                paths: PathsConfig {
+                    root_app: "/tmp/kai".to_string(),
+                    root_work: "/tmp/work".to_string(),
+                },
+                runner: RunnerConfig {
+                    provider,
+                    codex: CodexConfig {
+                        binary: "codex".to_string(),
+                        override_config: None,
+                    },
+                },
+                context_files: ContextFilesConfig {
+                    soul: "/tmp/kai/SOUL.md".to_string(),
+                    memory: "/tmp/kai/MEMORY.md".to_string(),
+                    todo: "/tmp/kai/TODO.md".to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn validate_run_prerequisites_blocks_unsupported_provider_before_token_lookup() {
+        let error = validate_run_prerequisites(&test_config(RunnerProvider::Claude))
+            .expect_err("unsupported provider should be blocked");
+
+        assert!(matches!(error.code, ErrorCode::BlockedPrerequisite));
+        assert!(error.message.contains("claude"));
     }
 }

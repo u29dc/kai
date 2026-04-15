@@ -8,8 +8,8 @@ use kai_sdk::{
     ConfigGetOutput, ConfigShowOutput, KaiError, KaiResult, SessionView, SetupCodexOutput,
     SetupOutput, StateStore, acquire_run_guard, config_value_at_key, context_report,
     ensure_config_file, ensure_private_dir, error_envelope, health_report, load_config,
-    mobile_help_text, ok_envelope, resolve_telegram_token, run_telegram_loop, service_logs,
-    service_restart, service_start, service_status, service_stop, service_uninstall,
+    mobile_help_text, ok_envelope, resolve_telegram_token, run_telegram_loop, selected_provider,
+    service_logs, service_restart, service_start, service_status, service_stop, service_uninstall,
     set_config_value, tool_catalog, tool_spec, unset_config_value, write_private_file,
 };
 use serde::Serialize;

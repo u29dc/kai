@@ -37,7 +37,7 @@ pub use media::{
     enrich_attachment, transcription_provider_status,
 };
 pub use redaction::{redact_json_value, redact_optional_text, redact_text};
-pub use runtime::agent::{AgentTurnResult, run_agent_turn};
+pub use runtime::agent::{AgentTurnResult, run_agent_turn, selected_provider};
 pub use runtime::codex::{CodexTurnResult, run_codex_turn};
 pub use runtime_fs::{
     ensure_private_dir, ensure_private_file, harden_private_executable, harden_private_file,

@@ -22,7 +22,7 @@ use crate::media::{
 use crate::runtime::agent::{
     AgentResumeFailure, AsyncAgentTurnResult, RunningAgentTurn, RunningAgentTurnEvent,
     cancel_agent_turn, create_replay_package, drain_running_agent_turn_events, prepare_agent_turn,
-    start_agent_turn,
+    selected_provider, start_agent_turn,
 };
 use crate::secrets::resolve_telegram_token;
 use crate::state::{
@@ -83,6 +83,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             "telegram is disabled in config",
         ));
     }
+    let _ = selected_provider(config)?;
 
     let token = telegram_token(config)?;
     let client = Client::builder()

@@ -338,21 +338,28 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
         });
     }
 
-    let status = if checks
-        .iter()
-        .any(|check| !check.ok && matches!(check.name.as_str(), "codex.binary" | "telegram.token"))
-    {
-        "blocked"
-    } else if checks.iter().any(|check| !check.ok) {
-        "degraded"
-    } else {
-        "ready"
-    };
+    let status = overall_health_status(&checks);
 
     Ok(HealthReport {
         status: status.to_string(),
         checks,
     })
+}
+
+fn overall_health_status(checks: &[HealthCheck]) -> &'static str {
+    if checks.iter().any(|check| {
+        !check.ok
+            && matches!(
+                check.name.as_str(),
+                "runner.provider" | "codex.binary" | "telegram.token"
+            )
+    }) {
+        "blocked"
+    } else if checks.iter().any(|check| !check.ok) {
+        "degraded"
+    } else {
+        "ready"
+    }
 }
 
 fn find_binary(binary: &str) -> Option<String> {
@@ -416,4 +423,30 @@ fn detect_insecure_plist_secret(config: &LoadedConfig) -> KaiResult<Option<Strin
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(name: &str, ok: bool) -> HealthCheck {
+        HealthCheck {
+            name: name.to_string(),
+            ok,
+            detail: String::new(),
+            fix: None,
+        }
+    }
+
+    #[test]
+    fn overall_health_status_blocks_when_provider_is_unavailable() {
+        let checks = vec![check("runner.provider", false), check("codex.binary", true)];
+        assert_eq!(overall_health_status(&checks), "blocked");
+    }
+
+    #[test]
+    fn overall_health_status_degrades_for_non_blocking_checks() {
+        let checks = vec![check("context.soul", false), check("codex.binary", true)];
+        assert_eq!(overall_health_status(&checks), "degraded");
+    }
 }
