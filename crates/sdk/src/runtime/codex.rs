@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
 
-use crate::config::LoadedConfig;
+use crate::config::{CodexTransport, LoadedConfig};
 use crate::context::{ContextSnapshot, context_snapshots};
 use crate::error::{ErrorCode, KaiError, KaiResult};
 use crate::state::{
@@ -15,11 +15,13 @@ use crate::state::{
 };
 use crate::workspace::ExecutionTarget;
 
+mod app_server;
 mod process;
 mod prompt;
 #[cfg(test)]
 mod tests;
 
+use self::app_server::{drain_turn_events as drain_app_server_turn_events, handshake_smoke_test};
 use self::process::{
     build_async_command, is_stale_resume_error, run_exec, run_resume, signal_process,
     wait_for_codex_turn,
@@ -79,10 +81,16 @@ pub enum RunningCodexTurnEvent {
     Completed(KaiResult<AsyncCodexTurnResult>),
 }
 
-#[derive(Debug)]
 pub struct RunningCodexTurn {
-    pub pid: u32,
-    receiver: Receiver<RunningCodexTurnEvent>,
+    inner: RunningCodexTurnInner,
+}
+
+enum RunningCodexTurnInner {
+    Exec {
+        pid: u32,
+        receiver: Receiver<RunningCodexTurnEvent>,
+    },
+    AppServer(app_server::RunningAppServerTurn),
 }
 
 pub fn run_codex_turn(
@@ -94,6 +102,25 @@ pub fn run_codex_turn(
     user_text: &str,
     attachments: &[AttachmentInfo],
 ) -> KaiResult<CodexTurnResult> {
+    if matches!(
+        config.values.runner.codex.transport,
+        CodexTransport::AppServer
+    ) {
+        let prepared = prepare_codex_turn(
+            config,
+            state,
+            target,
+            channel,
+            sender_id,
+            user_text,
+            attachments,
+        )?;
+        let async_result =
+            block_on_codex_future(app_server::run_turn_once(config.clone(), prepared))?;
+        state.set_session_binding(target, &async_result.result.session_id)?;
+        return Ok(async_result.result);
+    }
+
     let context_snapshots = context_snapshots(config);
     let prompt = build_turn_prompt(
         config,
@@ -194,6 +221,17 @@ pub async fn start_codex_turn(
     config: LoadedConfig,
     prepared: PreparedCodexTurn,
 ) -> KaiResult<RunningCodexTurn> {
+    if matches!(
+        config.values.runner.codex.transport,
+        CodexTransport::AppServer
+    ) {
+        return Ok(RunningCodexTurn {
+            inner: RunningCodexTurnInner::AppServer(
+                app_server::prepare_or_start_turn(config, prepared).await?,
+            ),
+        });
+    }
+
     let (mut command, using_resume) = build_async_command(&config, &prepared)?;
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -219,17 +257,52 @@ pub async fn start_codex_turn(
         let _ = sender.send(RunningCodexTurnEvent::Completed(result));
     });
 
-    Ok(RunningCodexTurn { pid, receiver })
+    Ok(RunningCodexTurn {
+        inner: RunningCodexTurnInner::Exec { pid, receiver },
+    })
 }
 
 pub fn drain_running_codex_turn_events(turn: &mut RunningCodexTurn) -> Vec<RunningCodexTurnEvent> {
-    let mut events = Vec::new();
-    while let Ok(event) = turn.receiver.try_recv() {
-        events.push(event);
+    match &mut turn.inner {
+        RunningCodexTurnInner::Exec { receiver, .. } => {
+            let mut events = Vec::new();
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+        RunningCodexTurnInner::AppServer(turn) => drain_app_server_turn_events(turn),
     }
-    events
 }
 
 pub fn cancel_codex_turn(turn: &RunningCodexTurn) -> KaiResult<()> {
-    signal_process(turn.pid, "TERM")
+    match &turn.inner {
+        RunningCodexTurnInner::Exec { pid, .. } => signal_process(*pid, "TERM"),
+        RunningCodexTurnInner::AppServer(turn) => {
+            block_on_codex_future(app_server::cancel_turn(turn))
+        }
+    }
+}
+
+pub fn app_server_health_check(config: &LoadedConfig) -> KaiResult<()> {
+    handshake_smoke_test(config)
+}
+
+fn block_on_codex_future<T>(
+    future: impl std::future::Future<Output = KaiResult<T>>,
+) -> KaiResult<T> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                KaiError::new(
+                    ErrorCode::RuntimeError,
+                    format!("failed to build Codex runtime bridge: {error}"),
+                )
+            })?
+            .block_on(future)
+    }
 }

@@ -42,6 +42,8 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
                 provider: RunnerProvider::Codex,
                 codex: CodexConfig {
                     binary: "codex".to_string(),
+                    transport: crate::config::CodexTransport::AppServer,
+                    service_name: Some("kai".to_string()),
                     override_config: None,
                 },
             },

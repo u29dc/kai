@@ -157,7 +157,12 @@ pub fn tool_catalog() -> ToolCatalog {
                     "setupCodexOutput",
                     "kai setup codex",
                 )
-                .with_output_fields(["binary", "execAvailable", "resumeAvailable"]),
+                .with_output_fields([
+                    "binary",
+                    "execAvailable",
+                    "resumeAvailable",
+                    "appServerAvailable",
+                ]),
             ),
             tool(
                 ToolSeed::new(
@@ -252,6 +257,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "ownerUserId",
                     "ownerChatId",
                     "provider",
+                    "transport",
                     "defaultWorkspaceId",
                     "selectedWorkspaceId",
                     "selectedWorkspacePath",

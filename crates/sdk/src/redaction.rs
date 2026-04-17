@@ -20,6 +20,10 @@ static URL_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
 static TELEGRAM_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\b\d{8,12}:[A-Za-z0-9_-]{20,}\b"#).expect("valid telegram token regex")
 });
+static TELEGRAM_BOT_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(/bot)(\d{8,12}:[A-Za-z0-9_-]{20,})"#)
+        .expect("valid telegram bot path redaction regex")
+});
 static GENERIC_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\b(?:sk|gsk)-[A-Za-z0-9_-]{10,}\b"#).expect("valid generic key regex")
 });
@@ -31,6 +35,7 @@ pub fn redact_text(input: &str) -> String {
     let output = URL_SECRET_RE.replace_all(&output, format!("${{1}}{REDACTED}"));
     let output = SECRET_ASSIGNMENT_RE.replace_all(&output, format!("${{1}}${{2}}{REDACTED}"));
     let output = TELEGRAM_TOKEN_RE.replace_all(&output, REDACTED);
+    let output = TELEGRAM_BOT_PATH_RE.replace_all(&output, format!("${{1}}{REDACTED}"));
     GENERIC_KEY_RE.replace_all(&output, REDACTED).into_owned()
 }
 
@@ -78,6 +83,15 @@ mod tests {
         assert!(output.contains("?token=[REDACTED]"));
         assert!(output.contains("&api_key=[REDACTED]"));
         assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("8581338097:AAF"));
+    }
+
+    #[test]
+    fn redact_text_masks_telegram_bot_url_paths() {
+        let input =
+            "https://api.telegram.org/bot[REDACTED-TELEGRAM-TOKEN]/getUpdates";
+        let output = redact_text(input);
+        assert!(output.contains("/bot[REDACTED]/getUpdates"));
         assert!(!output.contains("8581338097:AAF"));
     }
 }

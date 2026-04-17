@@ -242,11 +242,18 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
                 .output()
                 .map(|output| output.status.success())
                 .unwrap_or(false);
+            let app_server_available = ProcessCommand::new(&binary)
+                .arg("app-server")
+                .arg("--help")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
 
             let payload = serde_json::to_value(SetupCodexOutput {
                 binary,
                 exec_available,
                 resume_available,
+                app_server_available,
             })
             .map_err(serialize_error("serialize setup codex output"))?;
 
@@ -488,6 +495,8 @@ mod tests {
                     provider,
                     codex: CodexConfig {
                         binary: "codex".to_string(),
+                        transport: kai_sdk::CodexTransport::AppServer,
+                        service_name: Some("kai".to_string()),
                         override_config: None,
                     },
                 },

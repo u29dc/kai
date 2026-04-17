@@ -422,6 +422,7 @@ impl StateStore {
             owner_user_id: self.get_owner_user_id()?,
             owner_chat_id: self.get_owner_chat_id()?,
             provider: target.provider.as_key().to_string(),
+            transport: config.values.runner.codex.transport.as_key().to_string(),
             default_workspace_id: workspace_status.default_workspace_id.clone(),
             selected_workspace_id: workspace_status.selected_workspace_id.clone(),
             selected_workspace_path: workspace_status.selected_workspace_path.clone(),

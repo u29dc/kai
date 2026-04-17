@@ -89,6 +89,37 @@ pub struct RunnerConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexTransport {
+    Exec,
+    #[default]
+    AppServer,
+}
+
+impl CodexTransport {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::AppServer => "app_server",
+        }
+    }
+}
+
+impl FromStr for CodexTransport {
+    type Err = KaiError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "exec" => Ok(Self::Exec),
+            "app_server" | "app-server" | "appserver" => Ok(Self::AppServer),
+            _ => Err(KaiError::invalid_argument(format!(
+                "unsupported codex transport: {input}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunnerProvider {
     #[default]
@@ -108,6 +139,10 @@ impl RunnerProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexConfig {
     pub binary: String,
+    #[serde(default)]
+    pub transport: CodexTransport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_config: Option<CodexOverride>,
 }
@@ -213,6 +248,8 @@ struct PartialRunnerConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialCodexConfig {
     binary: Option<String>,
+    transport: Option<CodexTransport>,
+    service_name: Option<String>,
     #[serde(rename = "override")]
     override_config: Option<PartialCodexOverride>,
 }
@@ -346,6 +383,7 @@ pub fn build_default_config_file() -> String {
         "",
         "[runner.codex]",
         "binary = \"codex\"",
+        "transport = \"app_server\"",
         "",
         "[context_files]",
         "soul = \"~/.tools/kai/SOUL.md\"",
@@ -511,6 +549,8 @@ fn default_config(root_app: PathBuf) -> Config {
             provider: RunnerProvider::Codex,
             codex: CodexConfig {
                 binary: "codex".to_string(),
+                transport: CodexTransport::AppServer,
+                service_name: Some("kai".to_string()),
                 override_config: None,
             },
         },
@@ -603,6 +643,12 @@ fn apply_partial_config(config: &mut Config, partial: PartialConfig) {
             if let Some(binary) = codex.binary {
                 config.runner.codex.binary = binary;
             }
+            if let Some(transport) = codex.transport {
+                config.runner.codex.transport = transport;
+            }
+            if codex.service_name.is_some() {
+                config.runner.codex.service_name = codex.service_name;
+            }
             if let Some(override_config) = codex.override_config {
                 config.runner.codex.override_config = Some(CodexOverride {
                     approval_policy: override_config.approval_policy,
@@ -649,6 +695,11 @@ fn apply_env_overrides(config: &mut Config) {
     }
     if let Ok(value) = env::var("KAI_CODEX_BINARY") {
         config.runner.codex.binary = value;
+    }
+    if let Ok(value) = env::var("KAI_CODEX_TRANSPORT")
+        && let Ok(transport) = CodexTransport::from_str(&value)
+    {
+        config.runner.codex.transport = transport;
     }
     if let Ok(value) = env::var("KAI_TRANSCRIPTION_PROVIDER") {
         config.media.transcription.provider = value;

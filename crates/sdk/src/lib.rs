@@ -17,11 +17,11 @@ pub mod workspace;
 pub use app::{handle_owner_prompt, mobile_help_text, mobile_status_text};
 pub use channel::telegram::run_telegram_loop;
 pub use config::{
-    ConfigMigrationResult, ContextFilesConfig, LoadedConfig, MediaConfig, RunnerProvider,
-    TranscriptionConfig, WorkspaceConfig, WorkspacesConfig, build_default_config_file,
-    config_value_at_key, default_root_app, ensure_config_file, expand_home, load_config,
-    migrate_config_to_workspaces, migrate_config_to_workspaces_at, set_config_value,
-    unset_config_value,
+    CodexTransport, ConfigMigrationResult, ContextFilesConfig, LoadedConfig, MediaConfig,
+    RunnerProvider, TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
+    build_default_config_file, config_value_at_key, default_root_app, ensure_config_file,
+    expand_home, load_config, migrate_config_to_workspaces, migrate_config_to_workspaces_at,
+    set_config_value, unset_config_value,
 };
 pub use context::{
     ContextEntry, ContextReport, ContextSnapshot, context_report, context_snapshots,
@@ -42,7 +42,7 @@ pub use media::{
 };
 pub use redaction::{redact_json_value, redact_optional_text, redact_text};
 pub use runtime::agent::{AgentTurnResult, run_agent_turn, selected_provider};
-pub use runtime::codex::{CodexTurnResult, run_codex_turn};
+pub use runtime::codex::{CodexTurnResult, app_server_health_check, run_codex_turn};
 pub use runtime_fs::{
     ensure_private_dir, ensure_private_file, harden_private_executable, harden_private_file,
     octal_mode, read_unix_mode, write_private_executable, write_private_file,

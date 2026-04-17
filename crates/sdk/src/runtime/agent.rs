@@ -57,7 +57,6 @@ pub enum RunningAgentTurnEvent {
     Completed(KaiResult<AsyncAgentTurnResult>),
 }
 
-#[derive(Debug)]
 pub enum RunningAgentTurn {
     Codex(codex::RunningCodexTurn),
 }
@@ -252,6 +251,8 @@ mod tests {
                     provider: RunnerProvider::Claude,
                     codex: crate::config::CodexConfig {
                         binary: "codex".to_string(),
+                        transport: crate::config::CodexTransport::AppServer,
+                        service_name: Some("kai".to_string()),
                         override_config: None,
                     },
                 },

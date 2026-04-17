@@ -181,6 +181,7 @@ pub struct SetupCodexOutput {
     pub binary: String,
     pub exec_available: bool,
     pub resume_available: bool,
+    pub app_server_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +212,7 @@ pub struct SessionView {
     pub owner_user_id: Option<i64>,
     pub owner_chat_id: Option<i64>,
     pub provider: String,
+    pub transport: String,
     pub default_workspace_id: String,
     pub selected_workspace_id: String,
     pub selected_workspace_path: String,

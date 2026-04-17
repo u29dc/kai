@@ -52,7 +52,7 @@
 - [`crates/sdk/src/workspace.rs`](crates/sdk/src/workspace.rs) resolves configured workspaces, current selection, and the execution target `{ workspace_id, working_dir, provider }`
 - [`crates/sdk/src/channel/telegram/`](crates/sdk/src/channel/telegram/) owns Telegram long-polling, owner filtering, typing status, native command-menu sync, queued follow-ups, fragment/media buffering, media intake, `/dir`, `/new`, `/send`, and outbound delivery
 - [`crates/sdk/src/runtime/agent.rs`](crates/sdk/src/runtime/agent.rs) is the provider seam; it currently accepts `codex` and blocks `claude` until the adapter lands
-- [`crates/sdk/src/runtime/codex/`](crates/sdk/src/runtime/codex/) owns `codex exec` / `exec resume` orchestration, replay fallback, prompt shaping, and JSON-event parsing for the selected workspace target
+- [`crates/sdk/src/runtime/codex/`](crates/sdk/src/runtime/codex/) owns the Codex transport layer: App Server JSON-RPC over stdio by default, `exec` / `exec resume` fallback support, replay fallback, prompt shaping, and event parsing for the selected workspace target
 - [`crates/sdk/src/state/`](crates/sdk/src/state/) owns SQLite state, target-scoped queue persistence, in-flight recovery, per-workspace session and replay bindings, processed-update caching, cleanup, and audit logging
 - [`crates/sdk/src/service/`](crates/sdk/src/service/) owns macOS LaunchAgent lifecycle, Keychain-backed secret seeding, and runtime log inspection
 - [`crates/sdk/src/media/`](crates/sdk/src/media/) owns attachment policy, transcription, and derived-media enrichment
@@ -69,6 +69,7 @@
 - Named workspaces are mandatory config. Legacy configs with `paths.root_work` or `context_files.todo` must be rewritten with `kai config migrate`
 - Global core context files are `context_files.soul` and `context_files.memory`; `TODO.md` is no longer a configured special file
 - Selected workspace is runtime state. Session continuity and replay bindings are scoped per `{ provider, workspace_id }`, not one global session id
+- In App Server mode, persisted `session_id` values are Codex thread ids bound per `{ provider, workspace_id }`
 - Relative `/send` paths resolve against the selected workspace root or `root_app`
 - Telegram owner filtering, recovery pairing, Codex session continuity, durable queueing, media staging, and background service management are implemented in the current codebase
 - `runner.provider = "claude"` is config-valid but intentionally blocked in `run` and `health` until the Claude adapter lands

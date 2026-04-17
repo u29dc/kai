@@ -27,7 +27,6 @@ pub(super) struct BufferedTextFragments {
     pub(super) messages: Vec<TelegramMessage>,
 }
 
-#[derive(Debug)]
 pub(super) struct ActiveOwnerTurn {
     pub(super) pending: PendingTurn,
     pub(super) running: RunningAgentTurn,

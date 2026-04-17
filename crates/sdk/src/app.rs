@@ -120,6 +120,7 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
                 .unwrap_or_else(|| "none".to_string())
         ),
         format!("provider: {}", session.provider),
+        format!("transport: {}", session.transport),
         format!("workspace: {}", session.selected_workspace_id),
         format!("workspace_path: {}", session.selected_workspace_path),
         format!(
@@ -220,6 +221,8 @@ mod tests {
                     provider,
                     codex: CodexConfig {
                         binary: "codex".to_string(),
+                        transport: crate::config::CodexTransport::AppServer,
+                        service_name: Some("kai".to_string()),
                         override_config: None,
                     },
                 },

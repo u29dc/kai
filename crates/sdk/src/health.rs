@@ -1,11 +1,12 @@
 use std::env;
 use std::path::Path;
 
-use crate::config::{LoadedConfig, RunnerProvider};
+use crate::config::{CodexTransport, LoadedConfig, RunnerProvider};
 use crate::context::context_report;
 use crate::contract::{HealthCheck, HealthReport};
 use crate::error::{ErrorCode, KaiError, KaiResult};
 use crate::media::transcription_provider_status;
+use crate::runtime::codex::app_server_health_check;
 use crate::runtime_fs::{octal_mode, read_unix_mode};
 use crate::secrets::{groq_api_key_status, telegram_token_status};
 use crate::state::{StateStore, state_paths};
@@ -46,6 +47,32 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
             Some("install Codex CLI or point `runner.codex.binary` at an executable".to_string())
         },
     });
+
+    let transport = config.values.runner.codex.transport;
+    checks.push(HealthCheck {
+        name: "codex.transport".to_string(),
+        ok: true,
+        detail: format!("selected transport `{}`", transport.as_key()),
+        fix: None,
+    });
+
+    if matches!(transport, CodexTransport::AppServer) {
+        let handshake_result = app_server_health_check(config);
+        checks.push(HealthCheck {
+            name: "codex.app_server".to_string(),
+            ok: handshake_result.is_ok(),
+            detail: match handshake_result {
+                Ok(()) => "Codex App Server initialized successfully".to_string(),
+                Err(ref error) => format!("Codex App Server handshake failed: {}", error.message),
+            },
+            fix: match handshake_result {
+                Ok(()) => None,
+                Err(_) => Some(
+                    "check `runner.codex.binary`, local Codex auth, and whether `codex app-server` runs successfully".to_string(),
+                ),
+            },
+        });
+    }
 
     let token_status = telegram_token_status(config)?;
     let token_ok = token_status.env_available || token_status.keychain_available;
