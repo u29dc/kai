@@ -31,12 +31,13 @@ pub(super) fn initialize_schema(connection: &Connection) -> KaiResult<()> {
 					outcome_status TEXT,
 					attachments_json TEXT NOT NULL DEFAULT '[]'
 				);
-				CREATE TABLE IF NOT EXISTS processed_updates (
-					update_id INTEGER PRIMARY KEY,
-					created_at TEXT NOT NULL,
-					response_text TEXT NOT NULL,
-					codex_session_id TEXT
-				);
+					CREATE TABLE IF NOT EXISTS processed_updates (
+						update_id INTEGER PRIMARY KEY,
+						created_at TEXT NOT NULL,
+						response_text TEXT NOT NULL,
+						codex_session_id TEXT,
+						outcome_json TEXT
+					);
 	                CREATE TABLE IF NOT EXISTS update_failures (
 	                    update_id INTEGER PRIMARY KEY,
 	                    created_at TEXT NOT NULL,
@@ -79,6 +80,7 @@ pub(super) fn initialize_schema(connection: &Connection) -> KaiResult<()> {
         "working_dir",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    ensure_column(connection, "processed_updates", "outcome_json", "TEXT")?;
 
     Ok(())
 }

@@ -209,6 +209,28 @@ pub struct ProcessedUpdate {
     pub created_at: String,
     pub response_text: String,
     pub codex_session_id: Option<String>,
+    pub outcome: ProcessedUpdateOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ProcessedUpdateOutcome {
+    TextReply {
+        text: String,
+    },
+    SendLocalPaths {
+        paths: Vec<String>,
+        response_text: String,
+    },
+}
+
+impl ProcessedUpdateOutcome {
+    pub fn response_text(&self) -> &str {
+        match self {
+            Self::TextReply { text } => text,
+            Self::SendLocalPaths { response_text, .. } => response_text,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

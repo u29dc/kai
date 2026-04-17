@@ -26,7 +26,8 @@ use crate::runtime::agent::{
 };
 use crate::secrets::resolve_telegram_token;
 use crate::state::{
-    ActiveTurnState, AttachmentInfo, NewTurn, PendingReplyDelivery, PendingTurn, StateStore,
+    ActiveTurnState, AttachmentInfo, NewTurn, PendingReplyDelivery, PendingTurn, ProcessedUpdate,
+    ProcessedUpdateOutcome, StateStore,
 };
 
 mod api;

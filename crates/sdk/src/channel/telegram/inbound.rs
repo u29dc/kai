@@ -11,7 +11,7 @@ pub(super) async fn handle_message(
     message: TelegramMessage,
 ) -> KaiResult<()> {
     if let Some(processed) = state.get_processed_update(update_id)? {
-        return send_message(client, token, message.chat.id, &processed.response_text).await;
+        return replay_processed_update(client, token, message.chat.id, &processed).await;
     }
 
     let Some(validated) = validate_inbound_message(client, token, config, state, &message).await?
@@ -20,7 +20,7 @@ pub(super) async fn handle_message(
     };
 
     if let Some(command) = parse_mobile_command(&validated.text) {
-        return handle_mobile_command(
+        let outcome = handle_mobile_command(
             client,
             token,
             config,
@@ -29,7 +29,9 @@ pub(super) async fn handle_message(
             &validated,
             command,
         )
-        .await;
+        .await?;
+        state.set_processed_update(update_id, &outcome, None)?;
+        return Ok(());
     }
 
     let attachments = download_message_attachments(client, token, config, state, &message).await?;
@@ -190,10 +192,12 @@ async fn handle_mobile_command(
     active_turn: &mut Option<ActiveOwnerTurn>,
     validated: &ValidatedInbound,
     command: MobileCommand,
-) -> KaiResult<()> {
+) -> KaiResult<ProcessedUpdateOutcome> {
     match command {
         MobileCommand::Help => {
-            send_message(client, token, validated.chat_id, &mobile_help_text()).await
+            let text = mobile_help_text();
+            send_message(client, token, validated.chat_id, &text).await?;
+            Ok(ProcessedUpdateOutcome::TextReply { text })
         }
         MobileCommand::Status => {
             let mut status = mobile_status_text(config, state)?;
@@ -202,7 +206,8 @@ async fn handle_mobile_command(
                 if active_turn.is_some() { "yes" } else { "no" },
                 state.pending_turn_queue_len()?
             ));
-            send_message(client, token, validated.chat_id, &status).await
+            send_message(client, token, validated.chat_id, &status).await?;
+            Ok(ProcessedUpdateOutcome::TextReply { text: status })
         }
         MobileCommand::Dir { workspace_id } => {
             if let Some(workspace_id) = workspace_id {
@@ -212,16 +217,12 @@ async fn handle_mobile_command(
                     .get_session_binding(&crate::workspace::execution_target(config, state)?)?
                     .map(|binding| format!("resuming session {}", binding.session_id))
                     .unwrap_or_else(|| "next turn will start fresh".to_string());
-                return send_message(
-                    client,
-                    token,
-                    validated.chat_id,
-                    &format!(
-                        "Workspace set to {} ({})\n{}",
-                        workspace.id, workspace.path, session_status
-                    ),
-                )
-                .await;
+                let text = format!(
+                    "Workspace set to {} ({})\n{}",
+                    workspace.id, workspace.path, session_status
+                );
+                send_message(client, token, validated.chat_id, &text).await?;
+                return Ok(ProcessedUpdateOutcome::TextReply { text });
             }
 
             let workspace_status = state.workspace_status_output(config)?;
@@ -243,17 +244,13 @@ async fn handle_mobile_command(
                     )
                 })
                 .collect::<Vec<_>>();
-            send_message(
-                client,
-                token,
-                validated.chat_id,
-                &format!(
-                    "Current workspace: {}\nAvailable:\n{}",
-                    workspace_status.selected_workspace_id,
-                    lines.join("\n")
-                ),
-            )
-            .await
+            let text = format!(
+                "Current workspace: {}\nAvailable:\n{}",
+                workspace_status.selected_workspace_id,
+                lines.join("\n")
+            );
+            send_message(client, token, validated.chat_id, &text).await?;
+            Ok(ProcessedUpdateOutcome::TextReply { text })
         }
         MobileCommand::Reset => {
             if let Some(turn) = active_turn.as_mut() {
@@ -263,39 +260,60 @@ async fn handle_mobile_command(
             let target = crate::workspace::execution_target(config, state)?;
             state.clear_session_binding(&target)?;
             state.clear_target_replay_package(&target)?;
-            send_message(
-                client,
-                token,
-                validated.chat_id,
-                "Cleared the current workspace session. The next queued or new message will start fresh.",
-            )
-            .await
+            let text =
+                "Cleared the current workspace session. The next queued or new message will start fresh."
+                    .to_string();
+            send_message(client, token, validated.chat_id, &text).await?;
+            Ok(ProcessedUpdateOutcome::TextReply { text })
         }
         MobileCommand::Cancel => {
             let Some(turn) = active_turn.as_mut() else {
-                return send_message(client, token, validated.chat_id, "No active run to cancel.")
-                    .await;
+                let text = "No active run to cancel.".to_string();
+                send_message(client, token, validated.chat_id, &text).await?;
+                return Ok(ProcessedUpdateOutcome::TextReply { text });
             };
             turn.cancel_requested = true;
             cancel_agent_turn(&turn.running)?;
-            send_message(
-                client,
-                token,
-                validated.chat_id,
-                "Cancel requested. I will stop the current run.",
-            )
-            .await
+            let text = "Cancel requested. I will stop the current run.".to_string();
+            send_message(client, token, validated.chat_id, &text).await?;
+            Ok(ProcessedUpdateOutcome::TextReply { text })
         }
         MobileCommand::Send { path } => {
             let resolved = resolve_requested_path(config, state, &path)?;
-            let sent = send_local_paths(client, token, validated.chat_id, &[resolved]).await?;
-            send_message(
+            let sent = send_local_paths(
                 client,
                 token,
                 validated.chat_id,
-                &format!("Sent {} file(s).", sent),
+                std::slice::from_ref(&resolved),
             )
-            .await
+            .await?;
+            let response_text = format!("Sent {} file(s).", sent);
+            send_message(client, token, validated.chat_id, &response_text).await?;
+            Ok(ProcessedUpdateOutcome::SendLocalPaths {
+                paths: vec![resolved.display().to_string()],
+                response_text,
+            })
+        }
+    }
+}
+
+async fn replay_processed_update(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    processed: &ProcessedUpdate,
+) -> KaiResult<()> {
+    match &processed.outcome {
+        ProcessedUpdateOutcome::TextReply { text } => {
+            send_message(client, token, chat_id, text).await
+        }
+        ProcessedUpdateOutcome::SendLocalPaths {
+            paths,
+            response_text,
+        } => {
+            let paths = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+            send_local_paths(client, token, chat_id, &paths).await?;
+            send_message(client, token, chat_id, response_text).await
         }
     }
 }

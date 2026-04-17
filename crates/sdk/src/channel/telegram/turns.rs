@@ -1,4 +1,7 @@
 use super::*;
+use tokio::task::JoinSet;
+
+const ATTACHMENT_ENRICH_CONCURRENCY: usize = 3;
 
 pub(super) fn stable_pending_turn_id(
     channel: &str,
@@ -378,9 +381,49 @@ async fn enrich_pending_turn_attachments(
     config: &LoadedConfig,
     pending: &mut PendingTurn,
 ) -> KaiResult<()> {
-    for attachment in &mut pending.attachments {
-        enrich_attachment(config, attachment).await?;
+    if pending.attachments.is_empty() {
+        return Ok(());
     }
+
+    let mut in_flight = JoinSet::new();
+    let mut attachments = std::mem::take(&mut pending.attachments);
+    let concurrency = attachments.len().clamp(1, ATTACHMENT_ENRICH_CONCURRENCY);
+    let mut next_index = 0usize;
+    let total = attachments.len();
+
+    while next_index < total && in_flight.len() < concurrency {
+        let index = next_index;
+        let config = config.clone();
+        let mut attachment = attachments[index].clone();
+        in_flight.spawn(async move {
+            enrich_attachment(&config, &mut attachment).await?;
+            Ok::<_, KaiError>((index, attachment))
+        });
+        next_index += 1;
+    }
+
+    while let Some(result) = in_flight.join_next().await {
+        let (index, attachment) = result.map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("attachment enrichment task failed: {error}"),
+            )
+        })??;
+        attachments[index] = attachment;
+
+        if next_index < total {
+            let index = next_index;
+            let config = config.clone();
+            let mut attachment = attachments[index].clone();
+            in_flight.spawn(async move {
+                enrich_attachment(&config, &mut attachment).await?;
+                Ok::<_, KaiError>((index, attachment))
+            });
+            next_index += 1;
+        }
+    }
+
+    pending.attachments = attachments;
     Ok(())
 }
 

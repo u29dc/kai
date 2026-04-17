@@ -119,7 +119,13 @@ fn processed_update_round_trips() {
 
     let store = StateStore::open(&config).expect("state store");
     store
-        .set_processed_update(42, "cached reply", Some("session-1"))
+        .set_processed_update(
+            42,
+            &ProcessedUpdateOutcome::TextReply {
+                text: "cached reply".to_string(),
+            },
+            Some("session-1"),
+        )
         .expect("set processed update");
 
     let processed = store
@@ -129,6 +135,79 @@ fn processed_update_round_trips() {
     assert_eq!(processed.update_id, 42);
     assert_eq!(processed.response_text, "cached reply");
     assert_eq!(processed.codex_session_id.as_deref(), Some("session-1"));
+    assert_eq!(
+        processed.outcome,
+        ProcessedUpdateOutcome::TextReply {
+            text: "cached reply".to_string()
+        }
+    );
+}
+
+#[test]
+fn processed_send_update_round_trips_paths() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .set_processed_update(
+            99,
+            &ProcessedUpdateOutcome::SendLocalPaths {
+                paths: vec!["/tmp/report.pdf".to_string()],
+                response_text: "Sent 1 file(s).".to_string(),
+            },
+            None,
+        )
+        .expect("set processed update");
+
+    let processed = store
+        .get_processed_update(99)
+        .expect("load processed update")
+        .expect("processed update must exist");
+    assert_eq!(processed.response_text, "Sent 1 file(s).");
+    assert_eq!(
+        processed.outcome,
+        ProcessedUpdateOutcome::SendLocalPaths {
+            paths: vec!["/tmp/report.pdf".to_string()],
+            response_text: "Sent 1 file(s).".to_string()
+        }
+    );
+}
+
+#[test]
+fn processed_update_without_outcome_json_falls_back_to_text_reply() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+
+    let store = StateStore::open(&config).expect("state store");
+    store
+        .connection
+        .execute(
+            "INSERT INTO processed_updates (update_id, created_at, response_text, codex_session_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                5_i64,
+                "2026-04-17T00:00:00Z",
+                "legacy reply",
+                Option::<String>::None
+            ],
+        )
+        .expect("insert legacy processed update");
+
+    let processed = store
+        .get_processed_update(5)
+        .expect("load processed update")
+        .expect("processed update must exist");
+    assert_eq!(
+        processed.outcome,
+        ProcessedUpdateOutcome::TextReply {
+            text: "legacy reply".to_string()
+        }
+    );
 }
 
 #[test]
@@ -628,6 +707,12 @@ fn finalize_pending_reply_delivery_marks_updates_processed_and_removes_delivery(
         .expect("processed update must exist");
     assert_eq!(processed.response_text, "done");
     assert_eq!(processed.codex_session_id.as_deref(), Some("session-1"));
+    assert_eq!(
+        processed.outcome,
+        ProcessedUpdateOutcome::TextReply {
+            text: "done".to_string()
+        }
+    );
 }
 
 #[test]
@@ -670,9 +755,18 @@ fn cleanup_runtime_state_prunes_old_rows_and_compacts_audit() {
     store
         .connection
         .execute(
-            "INSERT INTO processed_updates (update_id, created_at, response_text, codex_session_id)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![1_i64, "2000-01-01T00:00:00Z", "old", Option::<String>::None],
+            "INSERT INTO processed_updates (update_id, created_at, response_text, codex_session_id, outcome_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                1_i64,
+                "2000-01-01T00:00:00Z",
+                "old",
+                Option::<String>::None,
+                serde_json::to_string(&ProcessedUpdateOutcome::TextReply {
+                    text: "old".to_string()
+                })
+                .expect("serialize processed update outcome")
+            ],
         )
         .expect("insert old processed update");
     store

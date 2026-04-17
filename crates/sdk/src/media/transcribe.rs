@@ -1,14 +1,18 @@
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::{Client, multipart};
 use serde::{Deserialize, Serialize};
-use tokio::fs;
+use tokio::fs::File;
 use tokio::process::Command;
+use tokio_util::io::ReaderStream;
 
 use crate::config::LoadedConfig;
 use crate::error::{ErrorCode, KaiError, KaiResult};
 use crate::secrets::resolve_groq_api_key;
+
+static GROQ_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,10 +140,16 @@ async fn transcribe_with_groq(
     file_path: &Path,
     mime_type: Option<&str>,
 ) -> KaiResult<TranscriptionResult> {
-    let bytes = fs::read(file_path).await.map_err(|error| {
+    let file = File::open(file_path).await.map_err(|error| {
         KaiError::new(
             ErrorCode::IoError,
             format!("failed to read media file for Groq transcription: {error}"),
+        )
+    })?;
+    let file_bytes = file.metadata().await.map_err(|error| {
+        KaiError::new(
+            ErrorCode::IoError,
+            format!("failed to inspect media file for Groq transcription: {error}"),
         )
     })?;
     let file_name = file_path
@@ -147,7 +157,9 @@ async fn transcribe_with_groq(
         .and_then(|value| value.to_str())
         .unwrap_or("media.bin");
 
-    let mut part = multipart::Part::bytes(bytes).file_name(file_name.to_string());
+    let stream = reqwest::Body::wrap_stream(ReaderStream::new(file));
+    let mut part = multipart::Part::stream_with_length(stream, file_bytes.len())
+        .file_name(file_name.to_string());
     if let Some(mime_type) = mime_type
         && !mime_type.trim().is_empty()
     {
@@ -164,15 +176,7 @@ async fn transcribe_with_groq(
         .text("response_format", "verbose_json".to_string())
         .part("file", part);
 
-    let response = Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| {
-            KaiError::new(
-                ErrorCode::RuntimeError,
-                format!("failed to build Groq speech-to-text client: {error}"),
-            )
-        })?
+    let response = groq_client()?
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
         .timeout(Duration::from_secs(180))
         .bearer_auth(api_key)
@@ -279,6 +283,18 @@ async fn transcribe_with_command(
         text,
         segments: Vec::new(),
     })
+}
+
+fn groq_client() -> KaiResult<&'static Client> {
+    match GROQ_CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| format!("failed to build Groq speech-to-text client: {error}"))
+    }) {
+        Ok(client) => Ok(client),
+        Err(message) => Err(KaiError::new(ErrorCode::RuntimeError, message.clone())),
+    }
 }
 
 fn shell_quote(input: &str) -> String {

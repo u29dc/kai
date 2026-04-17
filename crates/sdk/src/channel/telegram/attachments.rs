@@ -1,9 +1,12 @@
 use super::*;
+use tokio::task::JoinSet;
+
+const ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 4;
 
 pub(super) async fn download_message_attachments(
     client: &Client,
     token: &str,
-    config: &LoadedConfig,
+    _config: &LoadedConfig,
     state: &StateStore,
     message: &TelegramMessage,
 ) -> KaiResult<Vec<AttachmentInfo>> {
@@ -14,12 +17,61 @@ pub(super) async fn download_message_attachments(
         )));
     }
 
-    let mut attachments = Vec::new();
-    for request in requests {
-        attachments.push(download_file(client, token, config, state, request).await?);
+    if requests.is_empty() {
+        return Ok(Vec::new());
     }
 
-    Ok(attachments)
+    let attachments_dir = state.paths().attachments_dir.clone();
+    let request_count = requests.len();
+    let concurrency = request_count.clamp(1, ATTACHMENT_DOWNLOAD_CONCURRENCY);
+    let mut pending = requests.into_iter().enumerate();
+    let mut in_flight = JoinSet::new();
+    let mut attachments = vec![None; request_count];
+
+    while in_flight.len() < concurrency {
+        let Some((index, request)) = pending.next() else {
+            break;
+        };
+        let client = client.clone();
+        let token = token.to_string();
+        let attachments_dir = attachments_dir.clone();
+        in_flight.spawn(async move {
+            let attachment = download_file(&client, &token, &attachments_dir, request).await?;
+            Ok::<_, KaiError>((index, attachment))
+        });
+    }
+
+    while let Some(result) = in_flight.join_next().await {
+        let (index, attachment) = result.map_err(|error| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("attachment download task failed: {error}"),
+            )
+        })??;
+        attachments[index] = Some(attachment);
+
+        if let Some((next_index, request)) = pending.next() {
+            let client = client.clone();
+            let token = token.to_string();
+            let attachments_dir = attachments_dir.clone();
+            in_flight.spawn(async move {
+                let attachment = download_file(&client, &token, &attachments_dir, request).await?;
+                Ok::<_, KaiError>((next_index, attachment))
+            });
+        }
+    }
+
+    attachments
+        .into_iter()
+        .map(|attachment| {
+            attachment.ok_or_else(|| {
+                KaiError::new(
+                    ErrorCode::RuntimeError,
+                    "attachment download completed without a result",
+                )
+            })
+        })
+        .collect()
 }
 
 fn collect_download_requests(message: &TelegramMessage) -> Vec<DownloadRequest> {
@@ -135,8 +187,7 @@ fn collect_download_requests(message: &TelegramMessage) -> Vec<DownloadRequest> 
 async fn download_file(
     client: &Client,
     token: &str,
-    _config: &LoadedConfig,
-    state: &StateStore,
+    attachments_dir: &Path,
     request: DownloadRequest,
 ) -> KaiResult<AttachmentInfo> {
     let DownloadRequest {
@@ -201,7 +252,7 @@ async fn download_file(
 
     let safe_name = sanitize_filename(original_name.as_deref().unwrap_or(&file_id));
     let storage_name = format!("{}-{}", Uuid::new_v4().simple(), safe_name);
-    let local_path = state.paths().attachments_dir.join(storage_name);
+    let local_path = attachments_dir.join(storage_name);
     let partial_path = local_path.with_extension("part");
 
     let mut response = client
