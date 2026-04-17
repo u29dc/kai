@@ -60,7 +60,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "config",
                     "Persist a config override.",
                     "configSetOutput",
-                    "kai config set workspaces.vault.path ~/Dropbox/VAULT",
+                    "kai config set workspaces.main.path ~/work/main",
                 )
                 .with_parameters(vec![
                     parameter("key", "string", true, "Dotted config key path."),

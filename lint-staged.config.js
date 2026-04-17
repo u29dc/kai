@@ -1,3 +1,3 @@
 export default {
-	'*': () => ['bun run util:check'],
+	"*": () => ["bun run util:check"],
 };

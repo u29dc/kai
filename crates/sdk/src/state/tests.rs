@@ -10,6 +10,12 @@ use crate::config::{
 };
 use crate::workspace::ExecutionTarget;
 
+const TEST_TELEGRAM_OWNER_ID: i64 = 1_000_000_001;
+
+fn fake_telegram_token() -> String {
+    ["1234567890", ":", "AATEST_TOKEN_FOR_TESTS_ONLY_123456"].concat()
+}
+
 fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
     LoadedConfig {
         config_path: root_app.join("config.toml"),
@@ -301,10 +307,10 @@ fn session_view_includes_queue_metadata() {
 
     let store = StateStore::open(&config).expect("state store");
     store
-        .set_owner_user_id(1000000001)
+        .set_owner_user_id(TEST_TELEGRAM_OWNER_ID)
         .expect("set owner user id");
     store
-        .set_owner_chat_id(1000000001)
+        .set_owner_chat_id(TEST_TELEGRAM_OWNER_ID)
         .expect("set owner chat id");
     store
         .enqueue_pending_turn(&PendingTurn {
@@ -313,8 +319,8 @@ fn session_view_includes_queue_metadata() {
             target: test_target(&config),
             channel: "telegram".to_string(),
             update_ids: vec![1, 2],
-            chat_id: 1000000001,
-            sender_id: 1000000001,
+            chat_id: TEST_TELEGRAM_OWNER_ID,
+            sender_id: TEST_TELEGRAM_OWNER_ID,
             text: "hello from queue".to_string(),
             attachments: Vec::new(),
         })
@@ -737,7 +743,7 @@ fn audit_log_redacts_secret_like_strings() {
         .append_audit_json(&serde_json::json!({
             "event": "test",
             "message": "Authorization: Bearer secret-value",
-            "token": "[REDACTED-TELEGRAM-TOKEN]",
+            "token": fake_telegram_token(),
             "url": "https://example.com?api_key=gsk_secret",
         }))
         .expect("append audit");

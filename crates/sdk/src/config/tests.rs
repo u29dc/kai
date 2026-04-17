@@ -45,6 +45,7 @@ owner_user_id = 123
 fn migrate_config_to_workspaces_rewrites_legacy_keys() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let root_app = tempdir.path().join("kai-home");
+    let legacy_root_work = tempdir.path().join("vault");
     let config_path = tempdir.path().join("config.toml");
     std::fs::write(
         &config_path,
@@ -52,7 +53,7 @@ fn migrate_config_to_workspaces_rewrites_legacy_keys() {
             r#"
 [paths]
 root_app = "{}"
-root_work = "/tmp/example-vault"
+root_work = "{}"
 
 [context_files]
 soul = "{}/SOUL.md"
@@ -60,6 +61,7 @@ memory = "{}/MEMORY.md"
 todo = "{}/TODO.md"
 "#,
             root_app.display(),
+            legacy_root_work.display(),
             root_app.display(),
             root_app.display(),
             root_app.display()
@@ -75,7 +77,7 @@ todo = "{}/TODO.md"
     assert!(rendered.contains("[workspaces]"));
     assert!(rendered.contains("default = \"vault\""));
     assert!(rendered.contains("[workspaces.vault]"));
-    assert!(rendered.contains("path = \"/tmp/example-vault\""));
+    assert!(rendered.contains(&format!("path = \"{}\"", legacy_root_work.display())));
     assert!(!rendered.contains("root_work"));
     assert!(!rendered.contains("todo ="));
 }

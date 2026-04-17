@@ -66,6 +66,10 @@ pub fn redact_json_value(value: &mut JsonValue) {
 mod tests {
     use super::*;
 
+    fn fake_telegram_token() -> String {
+        ["1234567890", ":", "AATEST_TOKEN_FOR_TESTS_ONLY_123456"].concat()
+    }
+
     #[test]
     fn redact_text_masks_bearer_and_assignment_secrets() {
         let input = "Authorization: Bearer abc123 SECRET=super GROQ_API_KEY=gsk_secret";
@@ -77,21 +81,25 @@ mod tests {
 
     #[test]
     fn redact_text_masks_url_and_telegram_tokens() {
-        let input =
-            "https://x.test?token=abc&api_key=def [REDACTED-TELEGRAM-TOKEN]";
-        let output = redact_text(input);
+        let input = format!(
+            "https://x.test?token=abc&api_key=def {}",
+            fake_telegram_token()
+        );
+        let output = redact_text(input.as_str());
         assert!(output.contains("?token=[REDACTED]"));
         assert!(output.contains("&api_key=[REDACTED]"));
         assert!(output.contains("[REDACTED]"));
-        assert!(!output.contains("8581338097:AAF"));
+        assert!(!output.contains("1234567890:AAT"));
     }
 
     #[test]
     fn redact_text_masks_telegram_bot_url_paths() {
-        let input =
-            "https://api.telegram.org/bot[REDACTED-TELEGRAM-TOKEN]/getUpdates";
-        let output = redact_text(input);
+        let input = format!(
+            "https://api.telegram.org/bot{}/getUpdates",
+            fake_telegram_token()
+        );
+        let output = redact_text(input.as_str());
         assert!(output.contains("/bot[REDACTED]/getUpdates"));
-        assert!(!output.contains("8581338097:AAF"));
+        assert!(!output.contains("1234567890:AAT"));
     }
 }
