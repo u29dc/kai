@@ -167,11 +167,22 @@ pub struct ItemCompletedParams {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ItemInfo {
     AgentMessage {
+        id: String,
         text: String,
         #[serde(default)]
         phase: Option<String>,
     },
+    Plan {
+        id: String,
+        text: String,
+    },
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<String>,
+    },
     CommandExecution {
+        id: String,
         command: String,
     },
     #[serde(other)]
@@ -183,6 +194,7 @@ pub enum ItemInfo {
 pub struct TextDeltaParams {
     pub thread_id: String,
     pub turn_id: String,
+    pub item_id: String,
     pub delta: String,
 }
 
@@ -206,6 +218,8 @@ pub enum ServerNotification {
 pub struct ReasoningSummaryTextDeltaParams {
     pub thread_id: String,
     pub turn_id: String,
+    pub item_id: String,
+    pub summary_index: i64,
     pub delta: String,
 }
 

@@ -4,8 +4,51 @@ use crate::state::ActiveTurnState;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::path::Path;
 
-const INITIAL_PROGRESS_TEXT: &str = "Working on it.";
-const IDLE_PROGRESS_TEXT: &str = "Still working.";
+const INITIAL_PROGRESS_DELAY_MS: u64 = 700;
+const INITIAL_PROGRESS_VARIANTS: &[&str] = &[
+    "Looking around.",
+    "Thinking this through.",
+    "Pulling on the right thread.",
+    "Poking at the likely bits.",
+    "Tracing this through.",
+    "Thinking really hard about this.",
+    "Following the clues.",
+    "Checking where this goes.",
+];
+const IDLE_PROGRESS_VARIANTS: &[&str] = &[
+    "Still on it.",
+    "Still pulling on the thread.",
+    "Still tracing this through.",
+    "Still looking around.",
+    "Still untangling it.",
+    "Still checking one more thing.",
+    "Still thinking this through.",
+    "Still trying not to embarrass myself.",
+];
+const PLAN_PROGRESS_VARIANTS: &[&str] = &[
+    "Updating the route.",
+    "Narrowing the next step.",
+    "Working through the plan.",
+];
+const REASONING_PROGRESS_PREFIXES: &[&str] = &[
+    "Thinking:",
+    "Reasoning:",
+    "Working theory:",
+    "Current read:",
+];
+const CHECKS_PROGRESS_VARIANTS: &[&str] = &[
+    "Running checks.",
+    "Kicking the tires.",
+    "Putting it through checks.",
+    "Running the boring but useful bits.",
+];
+const INSPECTING_PATTERNS: &[&str] = &[
+    "Inspecting {subject}.",
+    "Looking through {subject}.",
+    "Reading {subject}.",
+    "Poking at {subject}.",
+    "Tracing {subject}.",
+];
 const DONE_PROGRESS_TEXT: &str = "Done.";
 const CANCELED_PROGRESS_TEXT: &str = "Canceled.";
 const FAILED_PROGRESS_TEXT: &str = "Failed.";
@@ -38,10 +81,22 @@ const PROGRESS_UPDATE_PREFIXES: &[&str] = &[
     "running",
     "search",
     "searching",
+    "think",
+    "thinking",
+    "figure out",
+    "figuring out",
     "test",
     "testing",
     "trace",
     "tracing",
+    "look around",
+    "looking around",
+    "poke at",
+    "poking at",
+    "pull on",
+    "pulling on",
+    "untangle",
+    "untangling",
     "validate",
     "validating",
     "work through",
@@ -56,14 +111,35 @@ pub(super) fn progress_enabled(config: &LoadedConfig) -> bool {
     config.values.channel.telegram.progress.enabled
 }
 
-pub(super) async fn send_initial_progress_message(
+pub(super) fn initial_progress_delay() -> Duration {
+    Duration::from_millis(INITIAL_PROGRESS_DELAY_MS)
+}
+
+pub(super) fn progress_variant_seed(turn_id: &str) -> u64 {
+    let hash = blake3::hash(turn_id.as_bytes());
+    let bytes = hash.as_bytes();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+pub(super) async fn maybe_send_initial_progress(
     client: &Client,
     token: &str,
     config: &LoadedConfig,
     state: &StateStore,
     turn: &mut ActiveOwnerTurn,
+    now: Instant,
 ) -> KaiResult<()> {
     if !progress_enabled(config) {
+        return Ok(());
+    }
+
+    if turn.progress.initial_progress_sent
+        || turn.status_message_id.is_some()
+        || turn.progress.semantic_update_count > 0
+        || now < turn.progress.initial_progress_due_at
+    {
         return Ok(());
     }
 
@@ -72,11 +148,22 @@ pub(super) async fn send_initial_progress_message(
         token,
         state,
         turn,
-        INITIAL_PROGRESS_TEXT,
-        true,
-        true,
+        select_variant(
+            INITIAL_PROGRESS_VARIANTS,
+            turn.progress.variant_seed,
+            "initial",
+            0,
+        ),
+        false,
+        false,
     )
-    .await
+    .await?;
+
+    if turn.status_message_id.is_some() {
+        turn.progress.initial_progress_sent = true;
+    }
+
+    Ok(())
 }
 
 pub(super) async fn handle_progress_event(
@@ -97,6 +184,7 @@ pub(super) async fn handle_progress_event(
         return Ok(());
     };
 
+    turn.progress.semantic_update_count = turn.progress.semantic_update_count.saturating_add(1);
     apply_progress_text(client, token, state, turn, &text, false, false).await
 }
 
@@ -117,7 +205,19 @@ pub(super) async fn maybe_send_idle_progress(
         return Ok(());
     }
 
-    apply_progress_text(client, token, state, turn, IDLE_PROGRESS_TEXT, false, false).await
+    let text = select_variant(
+        IDLE_PROGRESS_VARIANTS,
+        turn.progress.variant_seed,
+        "idle",
+        turn.progress.idle_update_count,
+    )
+    .to_string();
+
+    apply_progress_text(client, token, state, turn, &text, false, false).await?;
+    if turn.status_message_id.is_some() {
+        turn.progress.idle_update_count = turn.progress.idle_update_count.saturating_add(1);
+    }
+    Ok(())
 }
 
 pub(super) async fn mark_progress_done(
@@ -342,10 +442,27 @@ fn record_progress_error(
 fn progress_text_for_event(event: &AgentProgressEvent) -> Option<String> {
     match event {
         AgentProgressEvent::AgentMessage { text } => progress_text_from_agent_message(text),
-        AgentProgressEvent::Plan { .. } => Some("Updating plan.".to_string()),
+        AgentProgressEvent::Plan { text } => progress_text_from_plan(text),
         AgentProgressEvent::CommandStarted { command } => command_progress_text(command),
-        AgentProgressEvent::ReasoningSummary { .. } => None,
+        AgentProgressEvent::ReasoningSummary { text } => progress_text_from_reasoning_summary(text),
     }
+}
+
+fn progress_text_from_plan(text: &str) -> Option<String> {
+    let normalized = collapse_whitespace(text);
+    if normalized.is_empty() {
+        return Some(PLAN_PROGRESS_VARIANTS[0].to_string());
+    }
+
+    let summary = trim_progress_summary(&normalized)?;
+    Some(summary)
+}
+
+fn progress_text_from_reasoning_summary(text: &str) -> Option<String> {
+    let normalized = collapse_whitespace(text);
+    let summary = trim_progress_summary(&normalized)?;
+    let prefix = select_text_variant(REASONING_PROGRESS_PREFIXES, &normalized, "reasoning", 0);
+    Some(format!("{prefix} {summary}"))
 }
 
 fn progress_text_from_agent_message(text: &str) -> Option<String> {
@@ -421,7 +538,9 @@ fn command_progress_text(command: &str) -> Option<String> {
         || lower.contains("bun run util:")
         || lower.contains("bun run build")
     {
-        return Some("Running checks.".to_string());
+        return Some(
+            select_text_variant(CHECKS_PROGRESS_VARIANTS, command, "checks", 0).to_string(),
+        );
     }
 
     let is_file_inspection = [
@@ -435,9 +554,18 @@ fn command_progress_text(command: &str) -> Option<String> {
 
     let files = extract_command_files(command);
     match files.as_slice() {
-        [] => Some("Inspecting files.".to_string()),
-        [file] => Some(format!("Inspecting {file}.")),
-        [first, second, ..] => Some(format!("Inspecting {first} and {second}.")),
+        [] => Some(apply_subject_pattern(
+            select_text_variant(INSPECTING_PATTERNS, command, "inspect", 0),
+            "files",
+        )),
+        [file] => Some(apply_subject_pattern(
+            select_text_variant(INSPECTING_PATTERNS, file, "inspect", 0),
+            file,
+        )),
+        [first, second, ..] => Some(apply_subject_pattern(
+            select_text_variant(INSPECTING_PATTERNS, command, "inspect", 1),
+            &format!("{first} and {second}"),
+        )),
     }
 }
 
@@ -493,6 +621,49 @@ fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn trim_progress_summary(input: &str) -> Option<String> {
+    let trimmed = input
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '.' | ':' | ';'));
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(truncate_progress_text(trimmed))
+}
+
+fn select_variant<'a>(variants: &'a [&'a str], seed: u64, lane: &str, cycle: u32) -> &'a str {
+    if variants.is_empty() {
+        return "";
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&seed.to_le_bytes());
+    hasher.update(lane.as_bytes());
+    hasher.update(&cycle.to_le_bytes());
+    let bytes = hasher.finalize();
+    let index = u16::from_le_bytes([bytes.as_bytes()[0], bytes.as_bytes()[1]]) as usize;
+    variants[index % variants.len()]
+}
+
+fn select_text_variant<'a>(variants: &'a [&'a str], text: &str, lane: &str, cycle: u32) -> &'a str {
+    if variants.is_empty() {
+        return "";
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(text.as_bytes());
+    hasher.update(lane.as_bytes());
+    hasher.update(&cycle.to_le_bytes());
+    let bytes = hasher.finalize();
+    let index = u16::from_le_bytes([bytes.as_bytes()[0], bytes.as_bytes()[1]]) as usize;
+    variants[index % variants.len()]
+}
+
+fn apply_subject_pattern(pattern: &str, subject: &str) -> String {
+    pattern.replace("{subject}", subject)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,13 +681,11 @@ mod tests {
 
     #[test]
     fn command_progress_extracts_file_names() {
-        assert_eq!(
-            command_progress_text("/bin/zsh -lc \"sed -n '1,10p' AGENTS.md\""),
-            Some("Inspecting AGENTS.md.".to_string())
-        );
-        assert_eq!(
-            command_progress_text("/bin/zsh -lc \"cargo test --workspace --release\""),
-            Some("Running checks.".to_string())
+        let file_progress = command_progress_text("/bin/zsh -lc \"sed -n '1,10p' AGENTS.md\"")
+            .expect("file progress");
+        assert!(file_progress.contains("AGENTS.md"));
+        assert!(
+            command_progress_text("/bin/zsh -lc \"cargo test --workspace --release\"").is_some()
         );
     }
 
@@ -525,5 +694,49 @@ mod tests {
         let input = format!("Inspecting {}", "a".repeat(400));
         let output = truncate_progress_text(&input);
         assert!(output.chars().count() <= MAX_PROGRESS_TEXT_CHARS);
+    }
+
+    #[test]
+    fn progress_variant_seed_is_deterministic() {
+        assert_eq!(
+            progress_variant_seed("turn-123"),
+            progress_variant_seed("turn-123")
+        );
+        assert_ne!(
+            progress_variant_seed("turn-123"),
+            progress_variant_seed("turn-456")
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_progress_is_surfaced_as_text() {
+        let text =
+            progress_text_from_reasoning_summary("Need to confirm which workspace owns this");
+        assert!(text.is_some());
+        let text = text.expect("reasoning text");
+        assert!(
+            text.starts_with("Thinking:")
+                || text.starts_with("Reasoning:")
+                || text.starts_with("Working theory:")
+                || text.starts_with("Current read:")
+        );
+        assert!(text.contains("workspace"));
+    }
+
+    #[test]
+    fn plan_progress_prefers_actual_text() {
+        assert_eq!(
+            progress_text_from_plan("Inspect queue state and retry path."),
+            Some("Inspect queue state and retry path".to_string())
+        );
+    }
+
+    #[test]
+    fn select_variant_is_stable_for_same_seed_and_lane() {
+        let first = select_variant(INITIAL_PROGRESS_VARIANTS, 123, "initial", 0);
+        let second = select_variant(INITIAL_PROGRESS_VARIANTS, 123, "initial", 0);
+        let rotated = select_variant(INITIAL_PROGRESS_VARIANTS, 123, "initial", 1);
+        assert_eq!(first, second);
+        assert_ne!(first, rotated);
     }
 }

@@ -189,6 +189,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                 finish_active_turn(&client, &token, config, state, turn, result).await?;
                 active_turn = None;
             } else {
+                maybe_send_initial_progress(&client, &token, config, state, turn, now).await?;
                 maybe_send_idle_progress(&client, &token, config, state, turn, now).await?;
             }
         }

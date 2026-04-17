@@ -90,7 +90,7 @@ enum RunningCodexTurnInner {
         pid: u32,
         receiver: Receiver<RunningCodexTurnEvent>,
     },
-    AppServer(app_server::RunningAppServerTurn),
+    AppServer(Box<app_server::RunningAppServerTurn>),
 }
 
 pub fn run_codex_turn(
@@ -226,9 +226,9 @@ pub async fn start_codex_turn(
         CodexTransport::AppServer
     ) {
         return Ok(RunningCodexTurn {
-            inner: RunningCodexTurnInner::AppServer(
+            inner: RunningCodexTurnInner::AppServer(Box::new(
                 app_server::prepare_or_start_turn(config, prepared).await?,
-            ),
+            )),
         });
     }
 

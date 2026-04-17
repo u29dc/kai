@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
@@ -63,7 +64,16 @@ pub struct RunningAppServerTurn {
     resumed: bool,
     context_snapshots: Vec<crate::context::ContextSnapshot>,
     response_text: Option<String>,
+    agent_message_buffers: HashMap<String, DeltaProgressBuffer>,
+    plan_buffers: HashMap<String, DeltaProgressBuffer>,
+    reasoning_buffers: HashMap<String, DeltaProgressBuffer>,
     completed: bool,
+}
+
+#[derive(Default)]
+struct DeltaProgressBuffer {
+    text: String,
+    last_emitted: Option<String>,
 }
 
 pub async fn prepare_or_start_turn(
@@ -223,6 +233,9 @@ async fn start_turn_with_client(
         resumed,
         context_snapshots: prepared.context_snapshots,
         response_text: None,
+        agent_message_buffers: HashMap::new(),
+        plan_buffers: HashMap::new(),
+        reasoning_buffers: HashMap::new(),
         completed: false,
     })
 }
@@ -234,24 +247,47 @@ fn apply_notification(
     match notification {
         ServerNotification::ItemStarted(params) => map_item_started(turn, params),
         ServerNotification::ItemCompleted(params) => map_item_completed(turn, params),
-        ServerNotification::AgentMessageDelta(params) => filter_text_delta(
-            turn,
-            params.thread_id,
-            params.turn_id,
-            CodexProgressEvent::AgentMessage { text: params.delta },
-        ),
-        ServerNotification::PlanDelta(params) => filter_text_delta(
-            turn,
-            params.thread_id,
-            params.turn_id,
-            CodexProgressEvent::Plan { text: params.delta },
-        ),
-        ServerNotification::ReasoningSummaryTextDelta(params) => filter_text_delta(
-            turn,
-            params.thread_id,
-            params.turn_id,
-            CodexProgressEvent::ReasoningSummary { text: params.delta },
-        ),
+        ServerNotification::AgentMessageDelta(params) => {
+            let snapshot = append_progress_delta(
+                &mut turn.agent_message_buffers,
+                &params.item_id,
+                &params.delta,
+                18,
+                28,
+            );
+            filter_text_delta(
+                turn,
+                params.thread_id,
+                params.turn_id,
+                snapshot.map(|text| CodexProgressEvent::AgentMessage { text }),
+            )
+        }
+        ServerNotification::PlanDelta(params) => {
+            let snapshot = append_progress_delta(
+                &mut turn.plan_buffers,
+                &params.item_id,
+                &params.delta,
+                12,
+                20,
+            );
+            filter_text_delta(
+                turn,
+                params.thread_id,
+                params.turn_id,
+                snapshot.map(|text| CodexProgressEvent::Plan { text }),
+            )
+        }
+        ServerNotification::ReasoningSummaryTextDelta(params) => {
+            let key = format!("{}:{}", params.item_id, params.summary_index);
+            let snapshot =
+                append_progress_delta(&mut turn.reasoning_buffers, &key, &params.delta, 18, 28);
+            filter_text_delta(
+                turn,
+                params.thread_id,
+                params.turn_id,
+                snapshot.map(|text| CodexProgressEvent::ReasoningSummary { text }),
+            )
+        }
         ServerNotification::CommandExecutionOutputDelta => None,
         ServerNotification::TurnCompleted(params) => map_turn_completed(turn, params),
         ServerNotification::ServerExited { message } => Some(RunningCodexTurnEvent::Completed(
@@ -289,11 +325,40 @@ fn map_item_completed(
         return None;
     }
 
-    if let ItemInfo::AgentMessage { text, phase, .. } = params.item
-        && phase.as_deref() == Some("final_answer")
-        && !text.trim().is_empty()
-    {
-        turn.response_text = Some(text);
+    match params.item {
+        ItemInfo::AgentMessage { id, text, phase } => {
+            turn.agent_message_buffers.remove(&id);
+            if phase.as_deref() == Some("final_answer") && !text.trim().is_empty() {
+                turn.response_text = Some(text);
+            }
+        }
+        ItemInfo::Plan { id, text } => {
+            turn.plan_buffers.remove(&id);
+            if !text.trim().is_empty() {
+                return Some(RunningCodexTurnEvent::Progress(CodexProgressEvent::Plan {
+                    text,
+                }));
+            }
+        }
+        ItemInfo::Reasoning { id, summary } => {
+            turn.reasoning_buffers
+                .retain(|key, _| !key.starts_with(&format!("{id}:")));
+            let text = summary
+                .into_iter()
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return Some(RunningCodexTurnEvent::Progress(
+                    CodexProgressEvent::ReasoningSummary { text },
+                ));
+            }
+        }
+        ItemInfo::CommandExecution { id, .. } => {
+            let _ = id;
+        }
+        ItemInfo::Unknown => {}
     }
 
     None
@@ -345,12 +410,12 @@ fn filter_text_delta(
     turn: &RunningAppServerTurn,
     thread_id: String,
     turn_id: String,
-    progress: CodexProgressEvent,
+    progress: Option<CodexProgressEvent>,
 ) -> Option<RunningCodexTurnEvent> {
     if !matches_turn(turn, &thread_id, &turn_id) {
         return None;
     }
-    Some(RunningCodexTurnEvent::Progress(progress))
+    progress.map(RunningCodexTurnEvent::Progress)
 }
 
 fn matches_turn(turn: &RunningAppServerTurn, thread_id: &str, turn_id: &str) -> bool {
@@ -385,4 +450,43 @@ where
             method: method.to_string(),
         },
     }
+}
+
+fn append_progress_delta(
+    buffers: &mut HashMap<String, DeltaProgressBuffer>,
+    key: &str,
+    delta: &str,
+    min_chars: usize,
+    min_growth: usize,
+) -> Option<String> {
+    let buffer = buffers.entry(key.to_string()).or_default();
+    buffer.text.push_str(delta);
+
+    let candidate = collapse_whitespace(&buffer.text);
+    if candidate.chars().count() < min_chars {
+        return None;
+    }
+
+    if buffer.last_emitted.as_deref() == Some(candidate.as_str()) {
+        return None;
+    }
+
+    let last_len = buffer
+        .last_emitted
+        .as_ref()
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+    let current_len = candidate.chars().count();
+    let grew_by = current_len.saturating_sub(last_len);
+    let ends_cleanly = candidate.ends_with(['.', '!', '?', ':']);
+    if !ends_cleanly && grew_by < min_growth {
+        return None;
+    }
+
+    buffer.last_emitted = Some(candidate.clone());
+    Some(candidate)
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
 }

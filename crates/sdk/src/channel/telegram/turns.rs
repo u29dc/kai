@@ -61,8 +61,8 @@ pub(super) async fn enqueue_owner_turn(
 }
 
 pub(super) async fn maybe_start_next_pending_turn(
-    client: &Client,
-    token: &str,
+    _client: &Client,
+    _token: &str,
     config: &LoadedConfig,
     state: &StateStore,
     active_turn: &mut Option<ActiveOwnerTurn>,
@@ -129,6 +129,7 @@ pub(super) async fn maybe_start_next_pending_turn(
         outcome_status: Some("received"),
         attachments: &pending.attachments,
     })?;
+    let progress_variant_seed = progress_variant_seed(&pending.id);
     *active_turn = Some(ActiveOwnerTurn {
         pending,
         running,
@@ -139,14 +140,16 @@ pub(super) async fn maybe_start_next_pending_turn(
             last_event_at: Instant::now(),
             last_visible_update_at: Instant::now()
                 - Duration::from_millis(config.values.channel.telegram.progress.edit_interval_ms),
+            initial_progress_due_at: Instant::now() + initial_progress_delay(),
+            initial_progress_sent: false,
             last_sent_text: None,
+            semantic_update_count: 0,
+            idle_update_count: 0,
             update_count: 0,
             edit_interval_ms: config.values.channel.telegram.progress.edit_interval_ms,
+            variant_seed: progress_variant_seed,
         },
     });
-    if let Some(turn) = active_turn.as_mut() {
-        send_initial_progress_message(client, token, config, state, turn).await?;
-    }
     Ok(())
 }
 

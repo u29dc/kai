@@ -40,9 +40,14 @@ pub(super) struct ActiveOwnerTurn {
 pub(super) struct TurnProgressState {
     pub(super) last_event_at: Instant,
     pub(super) last_visible_update_at: Instant,
+    pub(super) initial_progress_due_at: Instant,
+    pub(super) initial_progress_sent: bool,
     pub(super) last_sent_text: Option<String>,
+    pub(super) semantic_update_count: u32,
+    pub(super) idle_update_count: u32,
     pub(super) update_count: u32,
     pub(super) edit_interval_ms: u64,
+    pub(super) variant_seed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
