@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
+use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
 
 use crate::config::LoadedConfig;
@@ -23,7 +25,7 @@ use self::input::build_turn_input;
 use self::policy::{approval_policy, sandbox_policy};
 use self::protocol::{
     ItemCompletedParams, ItemInfo, ItemStartedParams, ServerNotification, ThreadResumeParams,
-    ThreadStartParams, TurnCompletedParams, TurnInterruptParams, TurnStartParams,
+    ThreadStartParams, TurnCompletedParams, TurnInterruptParams, TurnStartParams, WebSearchAction,
 };
 
 pub(super) fn parse_notification(method: &str, params: serde_json::Value) -> ServerNotification {
@@ -48,7 +50,11 @@ pub(super) fn parse_notification(method: &str, params: serde_json::Value) -> Ser
             params,
             ServerNotification::ReasoningSummaryTextDelta,
         ),
-        "item/commandExecution/outputDelta" => ServerNotification::CommandExecutionOutputDelta,
+        "item/commandExecution/outputDelta" => deserialize_notification(
+            method,
+            params,
+            ServerNotification::CommandExecutionOutputDelta,
+        ),
         _ => ServerNotification::Unknown {
             method: method.to_string(),
         },
@@ -288,7 +294,15 @@ fn apply_notification(
                 snapshot.map(|text| CodexProgressEvent::ReasoningSummary { text }),
             )
         }
-        ServerNotification::CommandExecutionOutputDelta => None,
+        ServerNotification::CommandExecutionOutputDelta(params) => {
+            let _ = (
+                matches_turn(turn, &params.thread_id, &params.turn_id),
+                &params.item_id,
+                &params.stream,
+                &params.delta,
+            );
+            None
+        }
         ServerNotification::TurnCompleted(params) => map_turn_completed(turn, params),
         ServerNotification::ServerExited { message } => Some(RunningCodexTurnEvent::Completed(
             Err(KaiError::new(ErrorCode::RuntimeError, message)),
@@ -312,6 +326,43 @@ fn map_item_started(
     match params.item {
         ItemInfo::CommandExecution { command, .. } => Some(RunningCodexTurnEvent::Progress(
             CodexProgressEvent::CommandStarted { command },
+        )),
+        ItemInfo::WebSearch { query, action, .. } => Some(RunningCodexTurnEvent::Progress(
+            CodexProgressEvent::StructuredActivity {
+                text: describe_web_search(query, action),
+            },
+        )),
+        ItemInfo::McpToolCall {
+            server,
+            tool,
+            arguments,
+            ..
+        } => Some(RunningCodexTurnEvent::Progress(
+            CodexProgressEvent::StructuredActivity {
+                text: describe_tool_call(&format!("{server}.{tool}"), arguments),
+            },
+        )),
+        ItemInfo::DynamicToolCall {
+            tool, arguments, ..
+        } => Some(RunningCodexTurnEvent::Progress(
+            CodexProgressEvent::StructuredActivity {
+                text: describe_tool_call(&tool, arguments),
+            },
+        )),
+        ItemInfo::FileChange { changes, .. } => Some(RunningCodexTurnEvent::Progress(
+            CodexProgressEvent::StructuredActivity {
+                text: describe_file_change(&changes),
+            },
+        )),
+        ItemInfo::ImageView { path, .. } => Some(RunningCodexTurnEvent::Progress(
+            CodexProgressEvent::StructuredActivity {
+                text: describe_image_view(&path),
+            },
+        )),
+        ItemInfo::ContextCompaction { .. } => Some(RunningCodexTurnEvent::Progress(
+            CodexProgressEvent::StructuredActivity {
+                text: "Compacting context.".to_string(),
+            },
         )),
         _ => None,
     }
@@ -356,6 +407,14 @@ fn map_item_completed(
             }
         }
         ItemInfo::CommandExecution { id, .. } => {
+            let _ = id;
+        }
+        ItemInfo::FileChange { id, .. }
+        | ItemInfo::McpToolCall { id, .. }
+        | ItemInfo::DynamicToolCall { id, .. }
+        | ItemInfo::WebSearch { id, .. }
+        | ItemInfo::ImageView { id, .. }
+        | ItemInfo::ContextCompaction { id } => {
             let _ = id;
         }
         ItemInfo::Unknown => {}
@@ -489,4 +548,202 @@ fn append_progress_delta(
 
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn describe_web_search(query: Option<String>, action: Option<WebSearchAction>) -> String {
+    match action {
+        Some(WebSearchAction::Search { query, queries }) => {
+            let query = query.or_else(|| queries.and_then(|queries| queries.into_iter().next()));
+            format_search_query(query.as_deref())
+                .unwrap_or_else(|| "Searching the web.".to_string())
+        }
+        Some(WebSearchAction::OpenPage { url }) => {
+            if let Some(host) = url.as_deref().and_then(short_url_host) {
+                format!("Opening {host}.")
+            } else {
+                "Opening a page.".to_string()
+            }
+        }
+        Some(WebSearchAction::FindInPage { url, pattern }) => {
+            let pattern = format_detail(pattern.as_deref());
+            match (url.as_deref().and_then(short_url_host), pattern) {
+                (Some(host), Some(pattern)) => {
+                    format!("Searching within {host} for \"{pattern}\".")
+                }
+                (Some(host), None) => format!("Searching within {host}."),
+                (None, Some(pattern)) => format!("Searching a page for \"{pattern}\"."),
+                (None, None) => "Searching within a page.".to_string(),
+            }
+        }
+        Some(WebSearchAction::Unknown) | None => format_search_query(query.as_deref())
+            .unwrap_or_else(|| "Searching the web.".to_string()),
+    }
+}
+
+fn describe_tool_call(title: &str, arguments: Option<JsonValue>) -> String {
+    let title = collapse_whitespace(title);
+    let detail = arguments.as_ref().and_then(summarize_json_hint);
+    match detail {
+        Some(detail) => format!("Calling {title} for \"{detail}\"."),
+        None => format!("Calling {title}."),
+    }
+}
+
+fn describe_file_change(changes: &[self::protocol::FileChange]) -> String {
+    let mut files = changes
+        .iter()
+        .filter_map(|change| short_path_label(&change.path))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+
+    match files.as_slice() {
+        [] => "Preparing a patch.".to_string(),
+        [file] => format!("Preparing a patch for {file}."),
+        [first, second, ..] => format!("Preparing patches for {first} and {second}."),
+    }
+}
+
+fn describe_image_view(path: &str) -> String {
+    short_path_label(path)
+        .map(|label| format!("Inspecting {label}."))
+        .unwrap_or_else(|| "Inspecting an image.".to_string())
+}
+
+fn format_search_query(query: Option<&str>) -> Option<String> {
+    let query = format_detail(query)?;
+    Some(format!("Searching the web for \"{query}\"."))
+}
+
+fn summarize_json_hint(value: &JsonValue) -> Option<String> {
+    const PRIORITY_KEYS: &[&str] = &[
+        "query", "q", "pattern", "path", "file", "url", "name", "command", "title",
+    ];
+
+    match value {
+        JsonValue::String(text) => format_detail(Some(text)),
+        JsonValue::Array(items) => items.iter().find_map(summarize_json_hint),
+        JsonValue::Object(map) => {
+            for key in PRIORITY_KEYS {
+                if let Some(value) = map.get(*key).and_then(summarize_json_hint) {
+                    return Some(value);
+                }
+            }
+            map.values().find_map(summarize_json_hint)
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => None,
+    }
+}
+
+fn short_url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(host.to_string())
+}
+
+fn short_path_label(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+        .or_else(|| Some(trimmed.to_string()))
+}
+
+fn format_detail(input: Option<&str>) -> Option<String> {
+    let text = input.map(collapse_whitespace)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let max_chars = 80;
+    let mut output = String::new();
+    for (index, ch) in trimmed.chars().enumerate() {
+        if index >= max_chars {
+            break;
+        }
+        output.push(ch);
+    }
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+
+    if trimmed.chars().count() > max_chars {
+        Some(format!("{output}..."))
+    } else {
+        Some(output.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_notification_deserializes_command_output_delta_payload() {
+        let notification = parse_notification(
+            "item/commandExecution/outputDelta",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "stream": "stdout",
+                "delta": "Compiling kai"
+            }),
+        );
+
+        match notification {
+            ServerNotification::CommandExecutionOutputDelta(params) => {
+                assert_eq!(params.thread_id, "thread-1");
+                assert_eq!(params.turn_id, "turn-1");
+                assert_eq!(params.item_id, "item-1");
+                assert_eq!(params.delta.as_deref(), Some("Compiling kai"));
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_activity_descriptions_are_human_readable() {
+        assert_eq!(
+            describe_web_search(Some("codex app server".to_string()), None),
+            "Searching the web for \"codex app server\"."
+        );
+        assert_eq!(
+            describe_tool_call(
+                "github.search_issues",
+                Some(json!({ "query": "progress updates" }))
+            ),
+            "Calling github.search_issues for \"progress updates\"."
+        );
+        assert_eq!(
+            describe_file_change(&[self::protocol::FileChange {
+                path: "/tmp/progress.rs".to_string(),
+            }]),
+            "Preparing a patch for progress.rs."
+        );
+        assert_eq!(
+            describe_image_view("/tmp/screenshot.png"),
+            "Inspecting screenshot.png."
+        );
+    }
 }

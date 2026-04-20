@@ -72,6 +72,7 @@ pub enum CodexProgressEvent {
     Plan { text: String },
     CommandStarted { command: String },
     ReasoningSummary { text: String },
+    StructuredActivity { text: String },
 }
 
 #[derive(Debug)]

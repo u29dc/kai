@@ -1,4 +1,5 @@
 use super::*;
+use crate::redaction::redact_text;
 use crate::runtime::agent::AgentProgressEvent;
 use crate::state::ActiveTurnState;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -36,32 +37,25 @@ const REASONING_PROGRESS_PREFIXES: &[&str] = &[
     "Working theory:",
     "Current read:",
 ];
-const CHECKS_PROGRESS_VARIANTS: &[&str] = &[
-    "Running checks.",
-    "Kicking the tires.",
-    "Putting it through checks.",
-    "Running the boring but useful bits.",
-];
-const INSPECTING_PATTERNS: &[&str] = &[
-    "Inspecting {subject}.",
-    "Looking through {subject}.",
-    "Reading {subject}.",
-    "Poking at {subject}.",
-    "Tracing {subject}.",
-];
 const DONE_PROGRESS_TEXT: &str = "Done.";
 const CANCELED_PROGRESS_TEXT: &str = "Canceled.";
 const FAILED_PROGRESS_TEXT: &str = "Failed.";
 const RESTARTING_PROGRESS_TEXT: &str = "Interrupted. Restarting.";
-const MAX_PROGRESS_UPDATES_PER_TURN: u32 = 20;
+const MAX_PROGRESS_UPDATES_PER_TURN: u32 = 32;
 const MAX_PROGRESS_TEXT_CHARS: usize = 220;
 const PROGRESS_UPDATE_PREFIXES: &[&str] = &[
     "check",
     "checking",
     "compare",
     "comparing",
+    "confirm",
+    "confirming",
     "dig",
     "digging",
+    "do",
+    "doing",
+    "double-check",
+    "double-checking",
     "follow",
     "following",
     "gather",
@@ -81,6 +75,8 @@ const PROGRESS_UPDATE_PREFIXES: &[&str] = &[
     "running",
     "search",
     "searching",
+    "summarize",
+    "summarizing",
     "think",
     "thinking",
     "figure out",
@@ -101,11 +97,24 @@ const PROGRESS_UPDATE_PREFIXES: &[&str] = &[
     "validating",
     "work through",
     "working through",
+    "wrap up",
+    "wrapping up",
     "write",
     "writing",
 ];
-const PROGRESS_UPDATE_LEAD_INS: &[&str] =
-    &["i'm ", "i am ", "i need to ", "need to ", "let me ", "now "];
+const PROGRESS_UPDATE_LEAD_INS: &[&str] = &[
+    "i'm ",
+    "i am ",
+    "i've ",
+    "i have ",
+    "i need to ",
+    "need to ",
+    "let me ",
+    "now ",
+    "so ",
+    "then ",
+    "but ",
+];
 
 pub(super) fn progress_enabled(config: &LoadedConfig) -> bool {
     config.values.channel.telegram.progress.enabled
@@ -445,6 +454,9 @@ fn progress_text_for_event(event: &AgentProgressEvent) -> Option<String> {
         AgentProgressEvent::Plan { text } => progress_text_from_plan(text),
         AgentProgressEvent::CommandStarted { command } => command_progress_text(command),
         AgentProgressEvent::ReasoningSummary { text } => progress_text_from_reasoning_summary(text),
+        AgentProgressEvent::StructuredActivity { text } => {
+            progress_text_from_structured_activity(text)
+        }
     }
 }
 
@@ -465,19 +477,35 @@ fn progress_text_from_reasoning_summary(text: &str) -> Option<String> {
     Some(format!("{prefix} {summary}"))
 }
 
+fn progress_text_from_structured_activity(text: &str) -> Option<String> {
+    let normalized = collapse_whitespace(text);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let redacted = redact_text(&normalized);
+    let trimmed = redacted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(truncate_progress_text(trimmed))
+}
+
 fn progress_text_from_agent_message(text: &str) -> Option<String> {
     let plain = markdown_to_plain_text(text);
     let normalized = collapse_whitespace(&plain);
-    if normalized.is_empty() || !looks_like_progress_update(&normalized) {
+    if normalized.is_empty() {
         return None;
     }
 
-    let sentence_count = normalized.matches(['.', '!', '?']).count();
-    if normalized.chars().count() > MAX_PROGRESS_TEXT_CHARS || sentence_count > 2 {
+    let candidate = extract_latest_progress_clause(&normalized)?;
+    let candidate = truncate_progress_text(&candidate);
+    if candidate.is_empty() {
         return None;
     }
 
-    Some(normalized)
+    Some(candidate)
 }
 
 fn markdown_to_plain_text(input: &str) -> String {
@@ -517,10 +545,9 @@ fn markdown_to_plain_text(input: &str) -> String {
 fn looks_like_progress_update(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     has_progress_prefix(&lower)
-        || PROGRESS_UPDATE_LEAD_INS
-            .iter()
-            .filter_map(|prefix| lower.strip_prefix(prefix))
-            .any(has_progress_prefix)
+        || strip_progress_lead_ins(&lower)
+            .map(has_progress_prefix)
+            .unwrap_or(false)
 }
 
 fn has_progress_prefix(text: &str) -> bool {
@@ -529,44 +556,164 @@ fn has_progress_prefix(text: &str) -> bool {
         .any(|prefix| text.starts_with(prefix))
 }
 
-fn command_progress_text(command: &str) -> Option<String> {
-    let lower = command.to_ascii_lowercase();
-    if lower.contains("cargo test")
-        || lower.contains("cargo check")
-        || lower.contains("cargo clippy")
-        || lower.contains("cargo build")
-        || lower.contains("bun run util:")
-        || lower.contains("bun run build")
-    {
-        return Some(
-            select_text_variant(CHECKS_PROGRESS_VARIANTS, command, "checks", 0).to_string(),
-        );
+fn strip_progress_lead_ins(text: &str) -> Option<&str> {
+    let mut current = text.trim_start();
+    let mut stripped = false;
+
+    loop {
+        let Some(next) = PROGRESS_UPDATE_LEAD_INS
+            .iter()
+            .find_map(|prefix| current.strip_prefix(prefix))
+        else {
+            break;
+        };
+        current = next.trim_start();
+        stripped = true;
     }
 
-    let is_file_inspection = [
-        "rg ", "sed ", "cat ", "bat ", "fd ", "find ", "ls ", "git show", "git diff",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    if !is_file_inspection {
+    stripped.then_some(current)
+}
+
+fn extract_latest_progress_clause(text: &str) -> Option<String> {
+    let normalized = collapse_whitespace(text);
+    if normalized.is_empty() {
         return None;
     }
 
-    let files = extract_command_files(command);
-    match files.as_slice() {
-        [] => Some(apply_subject_pattern(
-            select_text_variant(INSPECTING_PATTERNS, command, "inspect", 0),
-            "files",
-        )),
-        [file] => Some(apply_subject_pattern(
-            select_text_variant(INSPECTING_PATTERNS, file, "inspect", 0),
-            file,
-        )),
-        [first, second, ..] => Some(apply_subject_pattern(
-            select_text_variant(INSPECTING_PATTERNS, command, "inspect", 1),
-            &format!("{first} and {second}"),
-        )),
+    let candidates = progress_candidates(&normalized);
+    for candidate in candidates.iter().rev() {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if looks_like_progress_update(trimmed) {
+            return Some(display_progress_clause(trimmed));
+        }
     }
+
+    if looks_like_progress_update(&normalized) {
+        return Some(display_progress_clause(&normalized));
+    }
+
+    None
+}
+
+fn progress_candidates(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let sentence_splitters = ['.', '!', '?', ';'];
+    for part in text.split(sentence_splitters) {
+        let part = collapse_whitespace(part);
+        if !part.is_empty() {
+            candidates.push(part);
+        }
+    }
+
+    let clause_markers = [
+        ", but ",
+        ", now ",
+        ", so ",
+        ", then ",
+        " and now ",
+        " and then ",
+    ];
+    let existing = candidates.clone();
+    for candidate in existing {
+        for marker in clause_markers {
+            for part in candidate.split(marker) {
+                let part = collapse_whitespace(part);
+                if !part.is_empty() {
+                    candidates.push(part);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn ensure_terminal_period(text: &str) -> String {
+    let trimmed = text.trim().trim_matches(|ch: char| ch == '"' || ch == '\'');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with(['.', '!', '?']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+fn display_progress_clause(text: &str) -> String {
+    let normalized = ensure_terminal_period(text);
+    capitalize_first_char(&normalized)
+}
+
+fn capitalize_first_char(text: &str) -> String {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut output = first.to_uppercase().collect::<String>();
+    output.push_str(chars.as_str());
+    output
+}
+
+fn command_progress_text(command: &str) -> Option<String> {
+    let preview = normalized_command_preview(command);
+    if preview.is_empty() {
+        return None;
+    }
+
+    let lower = preview.to_ascii_lowercase();
+    if lower.starts_with("git diff") {
+        return Some("Running git diff.".to_string());
+    }
+    if lower.starts_with("git show") {
+        return Some("Running git show.".to_string());
+    }
+    if lower.starts_with("cargo ")
+        || lower.starts_with("bun run ")
+        || lower.starts_with("bunx ")
+        || lower.starts_with("git ")
+    {
+        return Some(format!("Running {}.", truncate_command_preview(&preview)));
+    }
+    if lower.starts_with("sed ")
+        || lower.starts_with("cat ")
+        || lower.starts_with("bat ")
+        || lower.starts_with("head ")
+        || lower.starts_with("tail ")
+    {
+        let files = extract_command_files(&preview);
+        return match files.as_slice() {
+            [] => Some("Reading files.".to_string()),
+            [file] => Some(format!("Reading {file}.")),
+            [first, second, ..] => Some(format!("Reading {first} and {second}.")),
+        };
+    }
+    if lower.starts_with("rg ") {
+        return Some("Searching files.".to_string());
+    }
+    if lower.starts_with("fd ")
+        || lower.starts_with("find ")
+        || lower.starts_with("ls ")
+        || lower.starts_with("eza ")
+    {
+        return Some("Listing files.".to_string());
+    }
+
+    Some(format!("Running {}.", truncate_command_preview(&preview)))
+}
+
+fn normalized_command_preview(command: &str) -> String {
+    let collapsed = collapse_whitespace(command);
+    if collapsed.is_empty() {
+        return String::new();
+    }
+
+    extract_shell_wrapped_command(&collapsed)
+        .map(collapse_whitespace)
+        .unwrap_or(collapsed)
 }
 
 fn extract_command_files(command: &str) -> Vec<String> {
@@ -602,10 +749,38 @@ fn extract_command_files(command: &str) -> Vec<String> {
     files
 }
 
+fn extract_shell_wrapped_command(command: &str) -> Option<&str> {
+    const MARKERS: &[&str] = &[" -lc ", " -c "];
+
+    for marker in MARKERS {
+        let Some(start) = command.find(marker) else {
+            continue;
+        };
+        let rest = command.get(start + marker.len()..)?.trim_start();
+        let quote = rest.chars().next()?;
+        if !matches!(quote, '"' | '\'') {
+            continue;
+        }
+        let body = rest.get(1..)?;
+        let end = body.rfind(quote)?;
+        return body.get(..end);
+    }
+
+    None
+}
+
+fn truncate_command_preview(command: &str) -> String {
+    truncate_with_limit(command, 120)
+}
+
 fn truncate_progress_text(text: &str) -> String {
+    truncate_with_limit(text, MAX_PROGRESS_TEXT_CHARS)
+}
+
+fn truncate_with_limit(text: &str, limit: usize) -> String {
     let mut output = String::new();
     for (index, ch) in text.chars().enumerate() {
-        if index >= MAX_PROGRESS_TEXT_CHARS {
+        if index >= limit {
             break;
         }
         output.push(ch);
@@ -660,10 +835,6 @@ fn select_text_variant<'a>(variants: &'a [&'a str], text: &str, lane: &str, cycl
     variants[index % variants.len()]
 }
 
-fn apply_subject_pattern(pattern: &str, subject: &str) -> String {
-    pattern.replace("{subject}", subject)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +846,18 @@ mod tests {
         );
         assert!(progress_text_from_agent_message("I need to read AGENTS.md first.").is_some());
         assert!(progress_text_from_agent_message("Let me check the runtime path.").is_some());
+        assert!(
+            progress_text_from_agent_message(
+                "I've got the fresh research pass; now I'm checking the git history."
+            )
+            .is_some()
+        );
+        assert!(
+            progress_text_from_agent_message(
+                "I've got enough to summarize, but I'm doing one last clean diff check."
+            )
+            .is_some()
+        );
         assert!(progress_text_from_agent_message("Here is the final answer.").is_none());
         assert!(progress_text_from_agent_message("I think the issue is in recovery.").is_none());
     }
@@ -683,9 +866,14 @@ mod tests {
     fn command_progress_extracts_file_names() {
         let file_progress = command_progress_text("/bin/zsh -lc \"sed -n '1,10p' AGENTS.md\"")
             .expect("file progress");
-        assert!(file_progress.contains("AGENTS.md"));
-        assert!(
-            command_progress_text("/bin/zsh -lc \"cargo test --workspace --release\"").is_some()
+        assert_eq!(file_progress, "Reading AGENTS.md.");
+        assert_eq!(
+            command_progress_text("/bin/zsh -lc \"cargo test --workspace --release\""),
+            Some("Running cargo test --workspace --release.".to_string())
+        );
+        assert_eq!(
+            command_progress_text("/bin/zsh -lc \"git diff --stat\""),
+            Some("Running git diff.".to_string())
         );
     }
 
@@ -738,5 +926,36 @@ mod tests {
         let rotated = select_variant(INITIAL_PROGRESS_VARIANTS, 123, "initial", 1);
         assert_eq!(first, second);
         assert_ne!(first, rotated);
+    }
+
+    #[test]
+    fn structured_activity_progress_is_passthrough_but_redacted() {
+        let text = progress_text_from_structured_activity(
+            "Searching the web for \"codex\" with token=abc123",
+        )
+        .expect("structured activity");
+        assert!(text.contains("Searching the web"));
+        assert!(text.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn agent_message_progress_prefers_latest_progress_clause_from_accumulated_text() {
+        let text = progress_text_from_agent_message(
+            "I'm checking two things in parallel. I've got the fresh research pass; now I'm checking the git history around the notebook work.",
+        )
+        .expect("agent progress");
+        assert_eq!(
+            text,
+            "Now I'm checking the git history around the notebook work."
+        );
+
+        let text = progress_text_from_agent_message(
+            "I'm checking two things in parallel. I've got enough to summarize, but I'm doing one last clean diff check so I can distinguish committed change from local state.",
+        )
+        .expect("agent progress");
+        assert_eq!(
+            text,
+            "I'm doing one last clean diff check so I can distinguish committed change from local state."
+        );
     }
 }

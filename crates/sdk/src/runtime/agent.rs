@@ -48,6 +48,7 @@ pub enum AgentProgressEvent {
     Plan { text: String },
     CommandStarted { command: String },
     ReasoningSummary { text: String },
+    StructuredActivity { text: String },
 }
 
 #[derive(Debug)]
@@ -203,6 +204,9 @@ fn map_progress_event(event: codex::CodexProgressEvent) -> AgentProgressEvent {
         }
         codex::CodexProgressEvent::ReasoningSummary { text } => {
             AgentProgressEvent::ReasoningSummary { text }
+        }
+        codex::CodexProgressEvent::StructuredActivity { text } => {
+            AgentProgressEvent::StructuredActivity { text }
         }
     }
 }
