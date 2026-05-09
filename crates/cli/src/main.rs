@@ -86,22 +86,29 @@ enum SetupCommand {
 #[derive(Debug, Subcommand)]
 enum ContextCommand {
     Show,
+    #[command(hide = true)]
     Check,
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     Show,
-    Set { session_id: String },
+    Set {
+        session_id: String,
+    },
     New,
+    #[command(hide = true)]
     Reset,
 }
 
 #[derive(Debug, Subcommand)]
 enum WorkspaceCommand {
+    #[command(hide = true)]
     List,
     Show,
-    Select { workspace_id: String },
+    Select {
+        workspace_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -186,4 +193,82 @@ where
     handle.write_all(b"\n")?;
     handle.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn help_text_for(command_path: &[&str]) -> String {
+        let mut command = Cli::command();
+        for name in command_path {
+            command = command
+                .find_subcommand_mut(name)
+                .expect("subcommand")
+                .clone();
+        }
+        command.render_help().to_string()
+    }
+
+    #[test]
+    fn context_help_hides_check_alias() {
+        let help = help_text_for(&["context"]);
+        assert!(help.contains("show"));
+        assert!(!help.contains("check"));
+    }
+
+    #[test]
+    fn session_help_hides_reset_alias() {
+        let help = help_text_for(&["session"]);
+        assert!(help.contains("new"));
+        assert!(!help.contains("reset"));
+    }
+
+    #[test]
+    fn workspace_help_hides_list_alias() {
+        let help = help_text_for(&["workspace"]);
+        assert!(help.contains("show"));
+        assert!(help.contains("select"));
+        assert!(!help.contains("list"));
+    }
+
+    #[test]
+    fn tool_catalog_matches_public_cli_surface() {
+        let mut names = tool_catalog()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        names.sort();
+
+        let mut expected = vec![
+            "config.get",
+            "config.migrate",
+            "config.set",
+            "config.show",
+            "config.unset",
+            "context.show",
+            "health",
+            "run",
+            "service.logs",
+            "service.restart",
+            "service.start",
+            "service.status",
+            "service.stop",
+            "service.uninstall",
+            "session.new",
+            "session.set",
+            "session.show",
+            "setup",
+            "setup.codex",
+            "setup.telegram",
+            "tools",
+            "workspace.select",
+            "workspace.show",
+        ];
+        expected.sort();
+
+        assert_eq!(names, expected);
+    }
 }

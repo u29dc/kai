@@ -208,6 +208,20 @@ pub struct PendingTurnView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SideQueryView {
+    pub id: String,
+    pub started_at: String,
+    pub provider: String,
+    pub workspace_id: String,
+    pub working_dir: String,
+    pub chat_id: i64,
+    pub sender_id: i64,
+    pub text_excerpt: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionView {
     pub owner_user_id: Option<i64>,
     pub owner_chat_id: Option<i64>,
@@ -224,6 +238,7 @@ pub struct SessionView {
     pub queued_turns: usize,
     pub queued_preview: Vec<PendingTurnView>,
     pub active_turn: Option<PendingTurnView>,
+    pub active_side_query: Option<SideQueryView>,
     pub pending_reply_deliveries: usize,
 }
 

@@ -1,5 +1,7 @@
 use std::env;
 use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::config::{CodexTransport, LoadedConfig, RunnerProvider};
 use crate::context::context_report;
@@ -11,6 +13,8 @@ use crate::runtime_fs::{octal_mode, read_unix_mode};
 use crate::secrets::{groq_api_key_status, telegram_token_status};
 use crate::state::{StateStore, state_paths};
 
+const APP_SERVER_HEALTH_TIMEOUT: Duration = Duration::from_secs(12);
+
 pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
     let mut checks = Vec::new();
 
@@ -21,13 +25,13 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
         detail: match config.values.runner.provider {
             RunnerProvider::Codex => "selected provider `codex` is available".to_string(),
             RunnerProvider::Claude => {
-                "selected provider `claude` is configured but not available yet".to_string()
+                "selected provider `claude` is reserved but not implemented".to_string()
             }
         },
         fix: if provider_ok {
             None
         } else {
-            Some("set `runner.provider` to `codex` until the Claude adapter lands".to_string())
+            Some("set `runner.provider` to `codex`; Codex is the only active runner".to_string())
         },
     });
 
@@ -57,7 +61,7 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
     });
 
     if matches!(transport, CodexTransport::AppServer) {
-        let handshake_result = app_server_health_check(config);
+        let handshake_result = app_server_health_check_with_timeout(config);
         checks.push(HealthCheck {
             name: "codex.app_server".to_string(),
             ok: handshake_result.is_ok(),
@@ -371,6 +375,26 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
         status: status.to_string(),
         checks,
     })
+}
+
+fn app_server_health_check_with_timeout(config: &LoadedConfig) -> KaiResult<()> {
+    let config = config.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(app_server_health_check(&config));
+    });
+
+    receiver
+        .recv_timeout(APP_SERVER_HEALTH_TIMEOUT)
+        .map_err(|_| {
+            KaiError::new(
+                ErrorCode::RuntimeError,
+                format!(
+                    "Codex App Server health check timed out after {} seconds",
+                    APP_SERVER_HEALTH_TIMEOUT.as_secs()
+                ),
+            )
+        })?
 }
 
 fn overall_health_status(checks: &[HealthCheck]) -> &'static str {

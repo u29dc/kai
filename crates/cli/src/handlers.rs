@@ -37,7 +37,7 @@ pub(super) async fn dispatch(cli: Cli) -> KaiResult<Flow> {
 
             let tool = match command {
                 ContextCommand::Show => "kai.context.show",
-                ContextCommand::Check => "kai.context.check",
+                ContextCommand::Check => "kai.context.show",
             };
 
             Ok(Flow::Immediate {
@@ -273,7 +273,7 @@ fn handle_session_command(command: SessionCommand) -> KaiResult<Flow> {
         SessionCommand::Show => "kai.session.show",
         SessionCommand::Set { .. } => "kai.session.set",
         SessionCommand::New => "kai.session.new",
-        SessionCommand::Reset => "kai.session.reset",
+        SessionCommand::Reset => "kai.session.new",
     };
 
     match command {
@@ -323,7 +323,7 @@ fn handle_workspace_command(command: WorkspaceCommand) -> KaiResult<Flow> {
     let payload = serde_json::to_value(state.workspace_status_output(&config)?)
         .map_err(serialize_error("serialize workspace status output"))?;
     let tool = match command {
-        WorkspaceCommand::List => "kai.workspace.list",
+        WorkspaceCommand::List => "kai.workspace.show",
         WorkspaceCommand::Show => "kai.workspace.show",
         WorkspaceCommand::Select { .. } => "kai.workspace.select",
     };

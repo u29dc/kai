@@ -50,13 +50,14 @@
 - [`crates/sdk/src/lib.rs`](crates/sdk/src/lib.rs) owns path defaults, JSON envelope types, health output, and tool metadata
 - [`crates/cli/src/main.rs`](crates/cli/src/main.rs) parses subcommands and emits one JSON object to stdout
 - [`crates/sdk/src/workspace.rs`](crates/sdk/src/workspace.rs) resolves configured workspaces, current selection, and the execution target `{ workspace_id, working_dir, provider }`
-- [`crates/sdk/src/channel/telegram/`](crates/sdk/src/channel/telegram/) owns Telegram long-polling, owner filtering, typing status, native command-menu sync, queued follow-ups, fragment/media buffering, media intake, `/dir`, `/new`, `/send`, and outbound delivery
+- [`crates/sdk/src/channel/telegram/`](crates/sdk/src/channel/telegram/) owns Telegram long-polling, owner filtering, typing status, native command-menu sync, queued follow-ups, one active side query via `/ask`, fragment/media buffering, media intake, `/dir`, `/new`, `/send`, and outbound delivery
 - [`crates/sdk/src/runtime/agent.rs`](crates/sdk/src/runtime/agent.rs) is the provider seam; it currently accepts `codex` and blocks `claude` until the adapter lands
 - [`crates/sdk/src/runtime/codex/`](crates/sdk/src/runtime/codex/) owns the Codex transport layer: App Server JSON-RPC over stdio by default, `exec` / `exec resume` fallback support, replay fallback, prompt shaping, and event parsing for the selected workspace target
 - [`crates/sdk/src/state/`](crates/sdk/src/state/) owns SQLite state, target-scoped queue persistence, in-flight recovery, per-workspace session and replay bindings, processed-update caching, cleanup, and audit logging
 - [`crates/sdk/src/service/`](crates/sdk/src/service/) owns macOS LaunchAgent lifecycle, Keychain-backed secret seeding, and runtime log inspection
 - [`crates/sdk/src/media/`](crates/sdk/src/media/) owns attachment policy, transcription, and derived-media enrichment
 - Queued turns snapshot their execution target when enqueued; do not reintroduce late-bound global workspace lookup
+- `/ask <prompt>` is a full-capability trusted-owner side query. It inherits the normal configured Codex policy, does not enter the main durable queue, does not overwrite the main session binding, and only one side query runs at a time.
 - Outbound local file sending is explicit via `/send`; do not reintroduce assistant-text path scraping as an implicit delivery trigger
 - Keep default output JSON-first; if text mode is added later, make it explicit and keep the default machine-readable contract stable
 - Update [`AGENTS.md`](AGENTS.md) when command surface, workspace model, or architecture intent changes
@@ -72,7 +73,8 @@
 - In App Server mode, persisted `session_id` values are Codex thread ids bound per `{ provider, workspace_id }`
 - Relative `/send` paths resolve against the selected workspace root or `root_app`
 - Telegram owner filtering, recovery pairing, Codex session continuity, durable queueing, media staging, and background service management are implemented in the current codebase
-- `runner.provider = "claude"` is config-valid but intentionally blocked in `run` and `health` until the Claude adapter lands
+- `runner.provider = "claude"` is config-valid but reserved and intentionally blocked in `run` and `health`; Codex is the only active runner
+- `approval_policy = "never"` and network-capable Codex settings are intentional high-capability owner-portal defaults when configured through Codex override settings
 - Treat future local runtime files under `~/.tools/kai` as operator state; never commit them
 
 ## 7. Constraints
@@ -89,3 +91,4 @@
 - Rust regression gate: `cargo test --workspace --release`
 - Rust smoke check: `cargo run -p kai-cli -- config show`, `cargo run -p kai-cli -- config migrate`, `cargo run -p kai-cli -- health`, `cargo run -p kai-cli -- workspace show`, `cargo run -p kai-cli -- session show`, `cargo run -p kai-cli -- tools`
 - Installed-binary smoke check: `~/.tools/kai/kai health`, `~/.tools/kai/kai workspace show`, `~/.tools/kai/kai service status`
+- Telegram smoke check after runtime changes: `/help`, `/status`, a normal queued message during an active turn, `/ask <prompt>` during an active turn, `/cancel`, optional `/cancel ask`, and `/send <path>`

@@ -188,6 +188,18 @@ impl StateStore {
         self.set_json_value(&format!("telegram.command_menu_hash.{chat_id}"), &hash)
     }
 
+    pub fn get_active_side_query(&self) -> KaiResult<Option<SideQueryState>> {
+        self.get_json_value("telegram.active_side_query")
+    }
+
+    pub fn set_active_side_query(&self, query: &SideQueryState) -> KaiResult<()> {
+        self.set_json_value("telegram.active_side_query", query)
+    }
+
+    pub fn clear_active_side_query(&self) -> KaiResult<()> {
+        self.delete_value("telegram.active_side_query")
+    }
+
     fn get_json_value<T>(&self, key: &str) -> KaiResult<Option<T>>
     where
         T: serde::de::DeserializeOwned,

@@ -66,7 +66,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     parameter("key", "string", true, "Dotted config key path."),
                     parameter("value", "string", true, "Literal value to store."),
                 ])
-                .with_output_fields(["configPath"])
+                .with_output_fields(["configPath", "key", "value"])
                 .with_input_schema("keyValue")
                 .with_idempotent(false),
             ),
@@ -85,7 +85,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     true,
                     "Dotted config key path.",
                 )])
-                .with_output_fields(["configPath"])
+                .with_output_fields(["configPath", "key"])
                 .with_input_schema("keyOnly")
                 .with_idempotent(false),
             ),
@@ -177,34 +177,6 @@ pub fn tool_catalog() -> ToolCatalog {
             ),
             tool(
                 ToolSeed::new(
-                    "context.check",
-                    "kai context check",
-                    "context",
-                    "Validate configured context file access.",
-                    "contextReport",
-                    "kai context check",
-                )
-                .with_output_fields(["entries"]),
-            ),
-            tool(
-                ToolSeed::new(
-                    "workspace.list",
-                    "kai workspace list",
-                    "workspace",
-                    "List configured workspaces and current selection.",
-                    "workspaceStatusOutput",
-                    "kai workspace list",
-                )
-                .with_output_fields([
-                    "provider",
-                    "defaultWorkspaceId",
-                    "selectedWorkspaceId",
-                    "selectedWorkspacePath",
-                    "workspaces",
-                ]),
-            ),
-            tool(
-                ToolSeed::new(
                     "workspace.show",
                     "kai workspace show",
                     "workspace",
@@ -269,6 +241,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "queuedTurns",
                     "queuedPreview",
                     "activeTurn",
+                    "activeSideQuery",
                     "pendingReplyDeliveries",
                 ]),
             ),
@@ -291,6 +264,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "ownerUserId",
                     "ownerChatId",
                     "provider",
+                    "transport",
                     "defaultWorkspaceId",
                     "selectedWorkspaceId",
                     "selectedWorkspacePath",
@@ -302,6 +276,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "queuedTurns",
                     "queuedPreview",
                     "activeTurn",
+                    "activeSideQuery",
                     "pendingReplyDeliveries",
                 ])
                 .with_idempotent(false),
@@ -319,6 +294,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "ownerUserId",
                     "ownerChatId",
                     "provider",
+                    "transport",
                     "defaultWorkspaceId",
                     "selectedWorkspaceId",
                     "selectedWorkspacePath",
@@ -330,34 +306,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "queuedTurns",
                     "queuedPreview",
                     "activeTurn",
-                    "pendingReplyDeliveries",
-                ])
-                .with_idempotent(false),
-            ),
-            tool(
-                ToolSeed::new(
-                    "session.reset",
-                    "kai session reset",
-                    "session",
-                    "Alias for `session new`.",
-                    "sessionView",
-                    "kai session reset",
-                )
-                .with_output_fields([
-                    "ownerUserId",
-                    "ownerChatId",
-                    "provider",
-                    "defaultWorkspaceId",
-                    "selectedWorkspaceId",
-                    "selectedWorkspacePath",
-                    "workspaces",
-                    "activeSessionId",
-                    "pendingPairing",
-                    "updateOffset",
-                    "queueLimit",
-                    "queuedTurns",
-                    "queuedPreview",
-                    "activeTurn",
+                    "activeSideQuery",
                     "pendingReplyDeliveries",
                 ])
                 .with_idempotent(false),

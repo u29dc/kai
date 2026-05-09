@@ -90,8 +90,8 @@ pub fn mobile_help_text() -> String {
         "/dir - show the current workspace and available workspaces",
         "/dir <workspace> - switch the next turns to a configured workspace",
         "/new - clear the current workspace session so the next message starts fresh",
-        "/reset - same as /new",
         "/cancel - stop the current running Codex turn",
+        "/ask <prompt> - run one parallel side question with the normal agent config",
         "/send <path> - send a local file from the current workspace or root_app",
         "/pair <code> - recovery-only owner pairing when locally enabled",
     ]
@@ -141,6 +141,12 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
 
     if let Some(active_turn) = session.active_turn {
         lines.push(format!("active_turn: {}", active_turn.id));
+    }
+    if let Some(side_query) = session.active_side_query {
+        lines.push(format!(
+            "side_query: {} ({}, {})",
+            side_query.id, side_query.status, side_query.workspace_id
+        ));
     }
 
     if let Some(pairing) = session.pending_pairing {
@@ -257,5 +263,15 @@ mod tests {
 
         assert!(matches!(error.code, ErrorCode::BlockedPrerequisite));
         assert_eq!(state.recent_turns(10).expect("recent turns").len(), 0);
+    }
+
+    #[test]
+    fn mobile_help_shows_canonical_commands_only() {
+        let help = mobile_help_text();
+        assert!(help.contains("/ask <prompt>"));
+        assert!(help.contains("/new -"));
+        assert!(!help.contains("/reset"));
+        assert!(!help.contains("/interrupt"));
+        assert!(!help.contains("/switchdir"));
     }
 }

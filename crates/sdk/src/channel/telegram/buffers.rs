@@ -75,7 +75,7 @@ pub(super) async fn flush_ready_text_fragments(
     config: &LoadedConfig,
     state: &StateStore,
     buffers: &mut HashMap<String, BufferedTextFragments>,
-    active_turn: &mut Option<ActiveOwnerTurn>,
+    active: &mut ActiveTelegramTurns,
     current_update_id: Option<i64>,
 ) -> KaiResult<()> {
     let now = Instant::now();
@@ -95,9 +95,7 @@ pub(super) async fn flush_ready_text_fragments(
             continue;
         };
         persist_text_fragments(state, buffers)?;
-        match process_buffered_text_fragments(client, token, config, state, active_turn, &entry)
-            .await
-        {
+        match process_buffered_text_fragments(client, token, config, state, active, &entry).await {
             Ok(()) => {
                 if let Some(last_update_id) = entry.update_ids.last().copied() {
                     state.clear_update_failure(last_update_id)?;
@@ -139,7 +137,7 @@ pub(super) async fn process_buffered_text_fragments(
     token: &str,
     config: &LoadedConfig,
     state: &StateStore,
-    active_turn: &mut Option<ActiveOwnerTurn>,
+    active: &mut ActiveTelegramTurns,
     entry: &BufferedTextFragments,
 ) -> KaiResult<()> {
     let first_message = entry
@@ -160,11 +158,16 @@ pub(super) async fn process_buffered_text_fragments(
         .collect::<Vec<_>>()
         .join("\n");
 
+    if let Some(command) = parse_mobile_command(&text) {
+        handle_mobile_command(client, token, config, state, active, &validated, command).await?;
+        return Ok(());
+    }
+
     enqueue_owner_turn(
         client,
         token,
         state,
-        active_turn,
+        &mut active.main,
         PendingTurn {
             id: stable_pending_turn_id(
                 "telegram",
@@ -223,7 +226,7 @@ pub(super) async fn flush_ready_media_groups(
     config: &LoadedConfig,
     state: &StateStore,
     media_groups: &mut HashMap<String, BufferedMediaGroup>,
-    active_turn: &mut Option<ActiveOwnerTurn>,
+    active: &mut ActiveTelegramTurns,
     current_update_id: Option<i64>,
 ) -> KaiResult<()> {
     let now = Instant::now();
@@ -244,8 +247,7 @@ pub(super) async fn flush_ready_media_groups(
         };
         persist_media_groups(state, media_groups)?;
 
-        match process_buffered_media_group(client, token, config, state, active_turn, &entry).await
-        {
+        match process_buffered_media_group(client, token, config, state, active, &entry).await {
             Ok(()) => {
                 state.clear_update_failure(entry.last_update_id)?;
             }
@@ -279,7 +281,7 @@ async fn process_buffered_media_group(
     token: &str,
     config: &LoadedConfig,
     state: &StateStore,
-    active_turn: &mut Option<ActiveOwnerTurn>,
+    active: &mut ActiveTelegramTurns,
     entry: &BufferedMediaGroup,
 ) -> KaiResult<()> {
     let first_message = entry.messages.first().ok_or_else(|| {
@@ -313,6 +315,11 @@ async fn process_buffered_media_group(
     }
 
     let text = merge_media_group_text(&entry.messages, &validated.text);
+    if let Some(command) = parse_mobile_command(&text) {
+        handle_mobile_command(client, token, config, state, active, &validated, command).await?;
+        return Ok(());
+    }
+
     let mut attachments = Vec::new();
     for message in &entry.messages {
         attachments
@@ -329,7 +336,7 @@ async fn process_buffered_media_group(
         client,
         token,
         state,
-        active_turn,
+        &mut active.main,
         PendingTurn {
             id: stable_pending_turn_id(
                 "telegram",

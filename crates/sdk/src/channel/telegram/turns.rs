@@ -2,6 +2,7 @@ use super::*;
 use tokio::task::JoinSet;
 
 const ATTACHMENT_ENRICH_CONCURRENCY: usize = 3;
+const SIDE_QUERY_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 
 pub(super) fn stable_pending_turn_id(
     channel: &str,
@@ -215,6 +216,177 @@ pub(super) async fn finish_active_turn(
             Ok(())
         }
     }
+}
+
+pub(super) async fn start_side_query(
+    client: &Client,
+    token: &str,
+    config: &LoadedConfig,
+    state: &StateStore,
+    active_side_query: &mut Option<ActiveSideQuery>,
+    validated: &ValidatedInbound,
+    prompt: String,
+) -> KaiResult<ProcessedUpdateOutcome> {
+    if let Some(query) = active_side_query.as_ref() {
+        let text = format!(
+            "A side query is already running in {}. Wait for it to finish or use /cancel ask.",
+            query.state.target.workspace_id
+        );
+        send_message(client, token, validated.chat_id, &text).await?;
+        return Ok(ProcessedUpdateOutcome::TextReply { text });
+    }
+
+    let target = crate::workspace::execution_target(config, state)?;
+    let query_state = SideQueryState {
+        id: Uuid::new_v4().to_string(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        target,
+        chat_id: validated.chat_id,
+        sender_id: validated.sender_id,
+        text: prompt.clone(),
+        status: "working".to_string(),
+    };
+    state.set_active_side_query(&query_state)?;
+
+    let prepared = prepare_agent_side_turn(
+        config,
+        state,
+        &query_state.target,
+        "telegram.side",
+        validated.sender_id,
+        &prompt,
+        &[],
+    )
+    .inspect_err(|_| {
+        let _ = state.clear_active_side_query();
+    })?;
+    let running = match start_agent_turn(config.clone(), prepared).await {
+        Ok(running) => running,
+        Err(error) => {
+            let _ = state.clear_active_side_query();
+            return Err(error);
+        }
+    };
+
+    state.append_audit_json(&serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "event": "telegram.side_query_started",
+        "sideQueryId": query_state.id,
+        "provider": query_state.target.provider.as_key(),
+        "workspaceId": query_state.target.workspace_id,
+        "workingDir": query_state.target.working_dir,
+        "chatId": query_state.chat_id,
+        "senderId": query_state.sender_id,
+    }))?;
+
+    *active_side_query = Some(ActiveSideQuery {
+        state: query_state.clone(),
+        running,
+        cancel_requested: false,
+        started_at_instant: Instant::now(),
+        next_typing_at: Instant::now(),
+    });
+
+    let text = format!(
+        "Side query started in {}. It will run alongside the main queue.",
+        query_state.target.workspace_id
+    );
+    send_message(client, token, validated.chat_id, &text).await?;
+    Ok(ProcessedUpdateOutcome::TextReply { text })
+}
+
+pub(super) async fn finish_active_side_query(
+    client: &Client,
+    token: &str,
+    _config: &LoadedConfig,
+    state: &StateStore,
+    query: &ActiveSideQuery,
+    result: KaiResult<AsyncAgentTurnResult>,
+) -> KaiResult<()> {
+    state.clear_active_side_query()?;
+    match result {
+        Ok(async_result) => {
+            let result = async_result.result;
+            state.append_audit_json(&serde_json::json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "event": "telegram.side_query_completed",
+                "sideQueryId": query.state.id,
+                "provider": query.state.target.provider.as_key(),
+                "workspaceId": query.state.target.workspace_id,
+                "workingDir": query.state.target.working_dir,
+                "chatId": query.state.chat_id,
+                "senderId": query.state.sender_id,
+                "codexSessionId": result.session_id,
+                "resumed": result.resumed,
+            }))?;
+            send_message_with_retry(
+                client,
+                token,
+                query.state.chat_id,
+                &format!(
+                    "Side query result ({})\n\n{}",
+                    query.state.target.workspace_id, result.response_text
+                ),
+            )
+            .await
+        }
+        Err(error) if query.cancel_requested => {
+            state.append_audit_json(&serde_json::json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "event": "telegram.side_query_cancelled",
+                "sideQueryId": query.state.id,
+                "message": error.message,
+                "hint": error.hint,
+            }))?;
+            send_message(client, token, query.state.chat_id, "Side query canceled.").await
+        }
+        Err(error) => {
+            record_runtime_error(
+                state,
+                "telegram.side_query_failed",
+                None,
+                Some(query.state.chat_id),
+                &error,
+            )?;
+            send_message_with_retry(
+                client,
+                token,
+                query.state.chat_id,
+                &format!("Side query failed: {}", error.message),
+            )
+            .await
+        }
+    }
+}
+
+pub(super) async fn maybe_timeout_side_query(
+    client: &Client,
+    token: &str,
+    state: &StateStore,
+    query: &mut ActiveSideQuery,
+) -> KaiResult<bool> {
+    if query.started_at_instant.elapsed() < SIDE_QUERY_TIMEOUT {
+        return Ok(false);
+    }
+
+    query.cancel_requested = true;
+    let _ = cancel_agent_turn(&query.running);
+    state.clear_active_side_query()?;
+    state.append_audit_json(&serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "event": "telegram.side_query_timeout",
+        "sideQueryId": query.state.id,
+        "chatId": query.state.chat_id,
+        "workspaceId": query.state.target.workspace_id,
+    }))?;
+    send_message(
+        client,
+        token,
+        query.state.chat_id,
+        "Side query timed out and was canceled.",
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn finalize_successful_turn(

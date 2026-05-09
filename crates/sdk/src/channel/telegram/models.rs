@@ -36,6 +36,19 @@ pub(super) struct ActiveOwnerTurn {
     pub(super) progress: TurnProgressState,
 }
 
+pub(super) struct ActiveTelegramTurns {
+    pub(super) main: Option<ActiveOwnerTurn>,
+    pub(super) side_query: Option<ActiveSideQuery>,
+}
+
+pub(super) struct ActiveSideQuery {
+    pub(super) state: SideQueryState,
+    pub(super) running: RunningAgentTurn,
+    pub(super) cancel_requested: bool,
+    pub(super) started_at_instant: Instant,
+    pub(super) next_typing_at: Instant,
+}
+
 #[derive(Debug)]
 pub(super) struct TurnProgressState {
     pub(super) last_event_at: Instant,
@@ -76,7 +89,8 @@ pub(super) enum MobileCommand {
     Status,
     Dir { workspace_id: Option<String> },
     Reset,
-    Cancel,
+    Cancel { side_query: bool },
+    Ask { prompt: String },
     Send { path: String },
 }
 

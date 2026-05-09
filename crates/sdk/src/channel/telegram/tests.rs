@@ -1,6 +1,7 @@
 use super::{
-    TELEGRAM_TEXT_LIMIT, failure_notice_text, format_telegram_html, should_retry_telegram_send,
-    should_skip_failed_update, split_response_text, stable_pending_turn_id,
+    MobileCommand, TELEGRAM_TEXT_LIMIT, failure_notice_text, format_telegram_html,
+    parse_mobile_command, should_retry_telegram_send, should_skip_failed_update,
+    split_response_text, stable_pending_turn_id,
 };
 use crate::error::{ErrorCode, KaiError};
 
@@ -88,6 +89,21 @@ fn stable_pending_turn_id_is_deterministic_and_order_sensitive() {
 
     assert_eq!(first, second);
     assert_ne!(first, reordered);
+}
+
+#[test]
+fn parse_mobile_command_recognizes_side_query_and_cancel_alias() {
+    match parse_mobile_command("/ask check current Rust release notes") {
+        Some(MobileCommand::Ask { prompt }) => {
+            assert_eq!(prompt, "check current Rust release notes");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    assert!(matches!(
+        parse_mobile_command("/cancel ask"),
+        Some(MobileCommand::Cancel { side_query: true })
+    ));
 }
 
 #[test]

@@ -1,4 +1,8 @@
 use super::*;
+use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use toml_edit::{Item, Table, value};
 
 pub(super) fn load_or_create_document(path: &Path) -> KaiResult<DocumentMut> {
@@ -33,12 +37,70 @@ pub(super) fn write_document(path: &Path, document: &mut DocumentMut) -> KaiResu
         })?;
     }
 
-    fs::write(path, document.to_string()).map_err(|error| {
+    write_document_atomically(path, document.to_string().as_bytes())?;
+
+    Ok(())
+}
+
+fn write_document_atomically(path: &Path, contents: &[u8]) -> KaiResult<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("config"),
+        Uuid::new_v4().simple()
+    ));
+
+    #[cfg(unix)]
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::IoError,
+                format!("failed to open temporary config file: {error}"),
+            )
+        })?;
+
+    #[cfg(not(unix))]
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .map_err(|error| {
+            KaiError::new(
+                ErrorCode::IoError,
+                format!("failed to open temporary config file: {error}"),
+            )
+        })?;
+
+    use std::io::Write;
+    file.write_all(contents).map_err(|error| {
         KaiError::new(
             ErrorCode::IoError,
-            format!("failed to write config file: {error}"),
+            format!("failed to write temporary config file: {error}"),
         )
     })?;
+    file.sync_all().map_err(|error| {
+        KaiError::new(
+            ErrorCode::IoError,
+            format!("failed to sync temporary config file: {error}"),
+        )
+    })?;
+    drop(file);
+
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(KaiError::new(
+            ErrorCode::IoError,
+            format!("failed to replace config file atomically: {error}"),
+        ));
+    }
+
+    crate::runtime_fs::harden_private_file(path)?;
 
     Ok(())
 }

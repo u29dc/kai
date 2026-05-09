@@ -21,13 +21,13 @@ use crate::media::{
 };
 use crate::runtime::agent::{
     AgentResumeFailure, AsyncAgentTurnResult, RunningAgentTurn, RunningAgentTurnEvent,
-    cancel_agent_turn, create_replay_package, drain_running_agent_turn_events, prepare_agent_turn,
-    selected_provider, start_agent_turn,
+    cancel_agent_turn, create_replay_package, drain_running_agent_turn_events,
+    prepare_agent_side_turn, prepare_agent_turn, selected_provider, start_agent_turn,
 };
 use crate::secrets::resolve_telegram_token;
 use crate::state::{
     ActiveTurnState, AttachmentInfo, NewTurn, PendingReplyDelivery, PendingTurn, ProcessedUpdate,
-    ProcessedUpdateOutcome, StateStore,
+    ProcessedUpdateOutcome, SideQueryState, StateStore,
 };
 
 mod api;
@@ -101,12 +101,25 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
     let mut next_cleanup_at = Instant::now();
     let mut media_groups = load_buffered_media_groups(state)?;
     let mut text_fragments = load_buffered_text_fragments(state)?;
-    let mut active_turn: Option<ActiveOwnerTurn> = None;
+    let mut active = ActiveTelegramTurns {
+        main: None,
+        side_query: None,
+    };
     let mut synced_menu_chat_id: Option<i64> = None;
 
     let recovered_active_turn = recover_active_turn(state)?;
     if let Some(active_turn) = recovered_active_turn.as_ref() {
         mark_recovered_turn_restarting(&client, &token, config, state, active_turn).await?;
+    }
+    if let Some(side_query) = state.get_active_side_query()? {
+        state.clear_active_side_query()?;
+        let _ = send_message(
+            &client,
+            &token,
+            side_query.chat_id,
+            "Previous side query was interrupted by a restart. Send /ask again if you still need it.",
+        )
+        .await;
     }
 
     loop {
@@ -154,7 +167,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             }
         }
 
-        if let Some(turn) = active_turn.as_mut() {
+        if let Some(turn) = active.main.as_mut() {
             if now >= turn.next_typing_at {
                 let _ = send_typing_indicator(&client, &token, turn.pending.chat_id).await;
                 turn.next_typing_at = Instant::now() + TELEGRAM_TYPING_REFRESH;
@@ -188,10 +201,32 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
 
             if let Some(result) = completed {
                 finish_active_turn(&client, &token, config, state, turn, result).await?;
-                active_turn = None;
+                active.main = None;
             } else {
                 maybe_send_initial_progress(&client, &token, config, state, turn, now).await?;
                 maybe_send_idle_progress(&client, &token, config, state, turn, now).await?;
+            }
+        }
+
+        if let Some(query) = active.side_query.as_mut() {
+            if now >= query.next_typing_at {
+                let _ = send_typing_indicator(&client, &token, query.state.chat_id).await;
+                query.next_typing_at = Instant::now() + TELEGRAM_TYPING_REFRESH;
+            }
+
+            if maybe_timeout_side_query(&client, &token, state, query).await? {
+                active.side_query = None;
+            } else {
+                let mut completed = None;
+                for event in drain_running_agent_turn_events(&mut query.running) {
+                    if let RunningAgentTurnEvent::Completed(result) = event {
+                        completed = Some(result);
+                    }
+                }
+                if let Some(result) = completed {
+                    finish_active_side_query(&client, &token, config, state, query, result).await?;
+                    active.side_query = None;
+                }
             }
         }
 
@@ -201,7 +236,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             config,
             state,
             &mut text_fragments,
-            &mut active_turn,
+            &mut active,
             None,
         )
         .await?;
@@ -211,17 +246,18 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
             config,
             state,
             &mut media_groups,
-            &mut active_turn,
+            &mut active,
             None,
         )
         .await?;
 
-        if active_turn.is_none() {
-            maybe_start_next_pending_turn(&client, &token, config, state, &mut active_turn).await?;
+        if active.main.is_none() {
+            maybe_start_next_pending_turn(&client, &token, config, state, &mut active.main).await?;
         }
 
         let has_pending_queue = state.pending_turn_queue_len()? > 0;
-        let poll_timeout_seconds = if active_turn.is_some()
+        let poll_timeout_seconds = if active.main.is_some()
+            || active.side_query.is_some()
             || has_pending_queue
             || !media_groups.is_empty()
             || !text_fragments.is_empty()
@@ -277,7 +313,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                             &token,
                             config,
                             state,
-                            &mut active_turn,
+                            &mut active,
                             &flushed,
                         )
                         .await
@@ -322,7 +358,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                         &token,
                         config,
                         state,
-                        &mut active_turn,
+                        &mut active,
                         update.update_id,
                         message,
                     )
@@ -338,7 +374,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                     config,
                     state,
                     &mut text_fragments,
-                    &mut active_turn,
+                    &mut active,
                     Some(update.update_id),
                 )
                 .await?;
@@ -348,7 +384,7 @@ pub async fn run_telegram_loop(config: &LoadedConfig, state: &StateStore) -> Kai
                     config,
                     state,
                     &mut media_groups,
-                    &mut active_turn,
+                    &mut active,
                     Some(update.update_id),
                 )
                 .await?;

@@ -439,16 +439,20 @@ pub fn config_value_at_key(config: &LoadedConfig, key: &str) -> KaiResult<JsonVa
 
 pub fn set_config_value(key: &str, raw_value: &str) -> KaiResult<PathBuf> {
     let config_path = discover_config_path();
+    ensure_config_key_allowed(key)?;
     let mut document = load_or_create_document(&config_path)?;
     set_document_value(&mut document, key, raw_value)?;
+    validate_document_config(&document, &config_path)?;
     write_document(&config_path, &mut document)?;
     Ok(config_path)
 }
 
 pub fn unset_config_value(key: &str) -> KaiResult<PathBuf> {
     let config_path = discover_config_path();
+    ensure_config_key_allowed(key)?;
     let mut document = load_or_create_document(&config_path)?;
     remove_document_value(&mut document, key)?;
+    validate_document_config(&document, &config_path)?;
     write_document(&config_path, &mut document)?;
     Ok(config_path)
 }
@@ -772,6 +776,82 @@ fn validate_config(config: &Config) -> KaiResult<()> {
         }
     }
     Ok(())
+}
+
+fn validate_document_config(document: &DocumentMut, config_path: &Path) -> KaiResult<()> {
+    let raw = document.to_string();
+    let legacy_keys = legacy_config_keys(&raw)?;
+    if !legacy_keys.is_empty() {
+        return Err(KaiError::blocked_prerequisite(
+            "legacy kai config format is no longer supported",
+        )
+        .with_hint(format!(
+            "run `kai config migrate` to rewrite {}",
+            config_path.display()
+        )));
+    }
+
+    let partial = toml::from_str::<PartialConfig>(&raw).map_err(|error| {
+        KaiError::new(
+            ErrorCode::ConfigError,
+            format!("failed to parse updated config file: {error}"),
+        )
+    })?;
+    let mut config = default_config(default_root_app());
+    apply_partial_config(&mut config, partial);
+    expand_config_paths(&mut config);
+    validate_config(&config)
+}
+
+fn ensure_config_key_allowed(key: &str) -> KaiResult<()> {
+    if key.trim().is_empty() || key.split('.').any(|segment| segment.trim().is_empty()) {
+        return Err(KaiError::invalid_argument("config key cannot be empty"));
+    }
+
+    if is_static_config_key(key) || is_workspace_config_key(key) {
+        return Ok(());
+    }
+
+    Err(
+        KaiError::invalid_argument(format!("unknown or unsupported config key: {key}"))
+            .with_hint("use `kai config show` to inspect available keys"),
+    )
+}
+
+fn is_static_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "agent.timezone"
+            | "channel.telegram.enabled"
+            | "channel.telegram.bot_token_env"
+            | "channel.telegram.owner_user_id"
+            | "channel.telegram.progress.enabled"
+            | "channel.telegram.progress.edit_interval_ms"
+            | "channel.telegram.progress.idle_update_secs"
+            | "media.transcription.provider"
+            | "media.transcription.groq_api_key_env"
+            | "media.transcription.groq_model"
+            | "media.transcription.command"
+            | "paths.root_app"
+            | "runner.provider"
+            | "runner.codex.binary"
+            | "runner.codex.transport"
+            | "runner.codex.service_name"
+            | "runner.codex.override.approval_policy"
+            | "runner.codex.override.sandbox_mode"
+            | "context_files.soul"
+            | "context_files.memory"
+            | "workspaces.default"
+    )
+}
+
+fn is_workspace_config_key(key: &str) -> bool {
+    let segments = key.split('.').collect::<Vec<_>>();
+    if segments.len() != 3 || segments[0] != "workspaces" {
+        return false;
+    }
+    let workspace_id = segments[1];
+    !matches!(workspace_id, "" | "default") && matches!(segments[2], "label" | "path")
 }
 
 fn legacy_config_keys(raw: &str) -> KaiResult<Vec<String>> {

@@ -66,6 +66,7 @@ fn telegram_menu_commands() -> Vec<TelegramMenuCommand> {
         TelegramMenuCommand::new("dir", "Show or switch configured workspaces"),
         TelegramMenuCommand::new("new", "Start the next turn with a fresh session"),
         TelegramMenuCommand::new("cancel", "Cancel the current running turn"),
+        TelegramMenuCommand::new("ask", "Run a parallel side question"),
         TelegramMenuCommand::new("send", "Send a local file back to this chat"),
         TelegramMenuCommand::new("help", "Show the available mobile commands"),
     ]

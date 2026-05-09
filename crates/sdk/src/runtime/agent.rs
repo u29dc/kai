@@ -66,9 +66,9 @@ pub fn selected_provider(config: &LoadedConfig) -> KaiResult<RunnerProvider> {
     match config.values.runner.provider {
         RunnerProvider::Codex => Ok(RunnerProvider::Codex),
         RunnerProvider::Claude => Err(KaiError::blocked_prerequisite(
-            "runner.provider `claude` is not available yet",
+            "runner.provider `claude` is reserved but not implemented",
         )
-        .with_hint("keep `runner.provider = \"codex\"` until the Claude adapter lands")),
+        .with_hint("use `runner.provider = \"codex\"`; Codex is the only active runner")),
     }
 }
 
@@ -122,6 +122,32 @@ pub fn prepare_agent_turn(
         }),
         RunnerProvider::Claude => unreachable!("unsupported provider filtered above"),
     }
+}
+
+pub fn prepare_agent_side_turn(
+    config: &LoadedConfig,
+    state: &StateStore,
+    target: &ExecutionTarget,
+    channel: &str,
+    sender_id: i64,
+    user_text: &str,
+    attachments: &[AttachmentInfo],
+) -> KaiResult<PreparedAgentTurn> {
+    let mut prepared = prepare_agent_turn(
+        config,
+        state,
+        target,
+        channel,
+        sender_id,
+        user_text,
+        attachments,
+    )?;
+    match &mut prepared.inner {
+        PreparedAgentTurnInner::Codex(turn) => {
+            turn.requested_session_id = None;
+        }
+    }
+    Ok(prepared)
 }
 
 pub async fn start_agent_turn(
@@ -219,6 +245,67 @@ mod tests {
         RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig, WorkspaceConfig,
         WorkspacesConfig,
     };
+    use crate::state::StateStore;
+    use crate::workspace::ExecutionTarget;
+    use tempfile::tempdir;
+
+    fn codex_test_config(root_app: &std::path::Path, root_work: &std::path::Path) -> LoadedConfig {
+        LoadedConfig {
+            config_path: root_app.join("config.toml"),
+            values: Config {
+                agent: AgentConfig {
+                    timezone: "Europe/London".to_string(),
+                },
+                channel: ChannelConfig {
+                    telegram: TelegramConfig {
+                        enabled: true,
+                        bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
+                        owner_user_id: None,
+                        progress: TelegramProgressConfig {
+                            enabled: true,
+                            edit_interval_ms: 2500,
+                            idle_update_secs: 8,
+                        },
+                    },
+                },
+                media: MediaConfig {
+                    transcription: TranscriptionConfig {
+                        provider: "groq".to_string(),
+                        groq_api_key_env: "GROQ_API_KEY".to_string(),
+                        groq_model: "whisper-large-v3-turbo".to_string(),
+                        command: None,
+                    },
+                },
+                paths: PathsConfig {
+                    root_app: root_app.display().to_string(),
+                },
+                runner: RunnerConfig {
+                    provider: RunnerProvider::Codex,
+                    codex: crate::config::CodexConfig {
+                        binary: "codex".to_string(),
+                        transport: crate::config::CodexTransport::Exec,
+                        service_name: Some("kai".to_string()),
+                        override_config: None,
+                    },
+                },
+                context_files: ContextFilesConfig {
+                    soul: root_app.join("SOUL.md").display().to_string(),
+                    memory: root_app.join("MEMORY.md").display().to_string(),
+                },
+                workspaces: WorkspacesConfig {
+                    default_workspace: "main".to_string(),
+                    entries: std::collections::BTreeMap::from([(
+                        "main".to_string(),
+                        WorkspaceConfig {
+                            label: Some("Main".to_string()),
+                            path: root_work.display().to_string(),
+                        },
+                    )]),
+                },
+            },
+            config_exists: false,
+        }
+    }
 
     #[test]
     fn selected_provider_blocks_unimplemented_claude() {
@@ -284,5 +371,39 @@ mod tests {
             crate::error::ErrorCode::BlockedPrerequisite
         ));
         assert!(error.message.contains("claude"));
+    }
+
+    #[test]
+    fn side_turn_inherits_config_without_resuming_main_session() {
+        let tempdir = tempdir().expect("tempdir");
+        let root_app = tempdir.path().join("kai-home");
+        let root_work = tempdir.path().join("work");
+        let config = codex_test_config(&root_app, &root_work);
+        let state = StateStore::open(&config).expect("state store");
+        let target = ExecutionTarget {
+            workspace_id: "main".to_string(),
+            working_dir: root_work.display().to_string(),
+            provider: RunnerProvider::Codex,
+        };
+        state
+            .set_session_binding(&target, "main-session")
+            .expect("session binding");
+
+        let normal = prepare_agent_turn(&config, &state, &target, "telegram", 1, "main", &[])
+            .expect("normal turn");
+        let side =
+            prepare_agent_side_turn(&config, &state, &target, "telegram.side", 1, "side", &[])
+                .expect("side turn");
+
+        match normal.inner {
+            PreparedAgentTurnInner::Codex(turn) => {
+                assert_eq!(turn.requested_session_id.as_deref(), Some("main-session"));
+            }
+        }
+        match side.inner {
+            PreparedAgentTurnInner::Codex(turn) => {
+                assert_eq!(turn.requested_session_id, None);
+            }
+        }
     }
 }

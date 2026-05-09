@@ -144,6 +144,34 @@ fn processed_update_round_trips() {
 }
 
 #[test]
+fn session_view_includes_active_side_query() {
+    let tempdir = tempdir().expect("tempdir");
+    let root_app = tempdir.path().join("kai-home");
+    let root_work = tempdir.path().join("work");
+    let config = test_config(&root_app, &root_work);
+    let store = StateStore::open(&config).expect("state store");
+    let target = test_target(&config);
+
+    store
+        .set_active_side_query(&SideQueryState {
+            id: "side-1".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            target,
+            chat_id: 10,
+            sender_id: TEST_TELEGRAM_OWNER_ID,
+            text: "look this up while the main turn continues".to_string(),
+            status: "working".to_string(),
+        })
+        .expect("set side query");
+
+    let view = store.session_view(&config).expect("session view");
+    let side_query = view.active_side_query.expect("active side query");
+    assert_eq!(side_query.id, "side-1");
+    assert_eq!(side_query.status, "working");
+    assert_eq!(side_query.workspace_id, "main");
+}
+
+#[test]
 fn processed_send_update_round_trips_paths() {
     let tempdir = tempdir().expect("tempdir");
     let root_app = tempdir.path().join("kai-home");

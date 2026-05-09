@@ -6,7 +6,7 @@ pub(super) async fn handle_message(
     token: &str,
     config: &LoadedConfig,
     state: &StateStore,
-    active_turn: &mut Option<ActiveOwnerTurn>,
+    active: &mut ActiveTelegramTurns,
     update_id: i64,
     message: TelegramMessage,
 ) -> KaiResult<()> {
@@ -20,16 +20,9 @@ pub(super) async fn handle_message(
     };
 
     if let Some(command) = parse_mobile_command(&validated.text) {
-        let outcome = handle_mobile_command(
-            client,
-            token,
-            config,
-            state,
-            active_turn,
-            &validated,
-            command,
-        )
-        .await?;
+        let outcome =
+            handle_mobile_command(client, token, config, state, active, &validated, command)
+                .await?;
         state.set_processed_update(update_id, &outcome, None)?;
         return Ok(());
     }
@@ -39,7 +32,7 @@ pub(super) async fn handle_message(
         client,
         token,
         state,
-        active_turn,
+        &mut active.main,
         PendingTurn {
             id: stable_pending_turn_id(
                 "telegram",
@@ -155,14 +148,15 @@ pub(super) fn should_ignore_message_before_buffering(
     Ok(false)
 }
 
-fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
+pub(super) fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
     let trimmed = text.trim();
     match trimmed {
         "/help" | "help" => Some(MobileCommand::Help),
         "/status" => Some(MobileCommand::Status),
         "/dir" | "/switchdir" | "dir" => Some(MobileCommand::Dir { workspace_id: None }),
         "/new" | "/reset" => Some(MobileCommand::Reset),
-        "/cancel" | "/interrupt" => Some(MobileCommand::Cancel),
+        "/cancel" | "/interrupt" => Some(MobileCommand::Cancel { side_query: false }),
+        "/cancel ask" => Some(MobileCommand::Cancel { side_query: true }),
         _ => trimmed
             .strip_prefix("/dir ")
             .or_else(|| trimmed.strip_prefix("/switchdir "))
@@ -171,6 +165,15 @@ fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
             .filter(|workspace_id| !workspace_id.is_empty())
             .map(|workspace_id| MobileCommand::Dir {
                 workspace_id: Some(workspace_id.to_string()),
+            })
+            .or_else(|| {
+                trimmed
+                    .strip_prefix("/ask ")
+                    .map(str::trim)
+                    .filter(|prompt| !prompt.is_empty())
+                    .map(|prompt| MobileCommand::Ask {
+                        prompt: prompt.to_string(),
+                    })
             })
             .or_else(|| {
                 trimmed
@@ -184,12 +187,12 @@ fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
     }
 }
 
-async fn handle_mobile_command(
+pub(super) async fn handle_mobile_command(
     client: &Client,
     token: &str,
     config: &LoadedConfig,
     state: &StateStore,
-    active_turn: &mut Option<ActiveOwnerTurn>,
+    active: &mut ActiveTelegramTurns,
     validated: &ValidatedInbound,
     command: MobileCommand,
 ) -> KaiResult<ProcessedUpdateOutcome> {
@@ -202,9 +205,17 @@ async fn handle_mobile_command(
         MobileCommand::Status => {
             let mut status = mobile_status_text(config, state)?;
             status.push_str(&format!(
-                "\nbusy: {}\nqueued_turns: {}",
-                if active_turn.is_some() { "yes" } else { "no" },
-                state.pending_turn_queue_len()?
+                "\nmain: {}\nqueue: {} pending\nside: {}",
+                if active.main.is_some() { "yes" } else { "no" },
+                state.pending_turn_queue_len()?,
+                active
+                    .side_query
+                    .as_ref()
+                    .map(|query| format!(
+                        "working {} ({})",
+                        query.state.id, query.state.target.workspace_id
+                    ))
+                    .unwrap_or_else(|| "idle".to_string())
             ));
             send_message(client, token, validated.chat_id, &status).await?;
             Ok(ProcessedUpdateOutcome::TextReply { text: status })
@@ -253,7 +264,7 @@ async fn handle_mobile_command(
             Ok(ProcessedUpdateOutcome::TextReply { text })
         }
         MobileCommand::Reset => {
-            if let Some(turn) = active_turn.as_mut() {
+            if let Some(turn) = active.main.as_mut() {
                 turn.cancel_requested = true;
                 let _ = cancel_agent_turn(&turn.running);
             }
@@ -266,8 +277,20 @@ async fn handle_mobile_command(
             send_message(client, token, validated.chat_id, &text).await?;
             Ok(ProcessedUpdateOutcome::TextReply { text })
         }
-        MobileCommand::Cancel => {
-            let Some(turn) = active_turn.as_mut() else {
+        MobileCommand::Cancel { side_query: true } => {
+            let Some(query) = active.side_query.as_mut() else {
+                let text = "No active side query to cancel.".to_string();
+                send_message(client, token, validated.chat_id, &text).await?;
+                return Ok(ProcessedUpdateOutcome::TextReply { text });
+            };
+            query.cancel_requested = true;
+            cancel_agent_turn(&query.running)?;
+            let text = "Cancel requested for the active side query.".to_string();
+            send_message(client, token, validated.chat_id, &text).await?;
+            Ok(ProcessedUpdateOutcome::TextReply { text })
+        }
+        MobileCommand::Cancel { side_query: false } => {
+            let Some(turn) = active.main.as_mut() else {
                 let text = "No active run to cancel.".to_string();
                 send_message(client, token, validated.chat_id, &text).await?;
                 return Ok(ProcessedUpdateOutcome::TextReply { text });
@@ -277,6 +300,18 @@ async fn handle_mobile_command(
             let text = "Cancel requested. I will stop the current run.".to_string();
             send_message(client, token, validated.chat_id, &text).await?;
             Ok(ProcessedUpdateOutcome::TextReply { text })
+        }
+        MobileCommand::Ask { prompt } => {
+            start_side_query(
+                client,
+                token,
+                config,
+                state,
+                &mut active.side_query,
+                validated,
+                prompt,
+            )
+            .await
         }
         MobileCommand::Send { path } => {
             let resolved = resolve_requested_path(config, state, &path)?;

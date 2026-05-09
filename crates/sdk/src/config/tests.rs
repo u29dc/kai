@@ -42,6 +42,48 @@ owner_user_id = 123
 }
 
 #[test]
+fn config_mutation_rejects_unknown_keys() {
+    let error = ensure_config_key_allowed("runner.codex.unknown")
+        .expect_err("unknown keys should be rejected");
+    assert!(error.message.contains("unknown or unsupported config key"));
+}
+
+#[test]
+fn config_mutation_allows_high_capability_codex_override_keys() {
+    ensure_config_key_allowed("runner.codex.override.approval_policy")
+        .expect("approval policy override should be configurable");
+    ensure_config_key_allowed("runner.codex.override.sandbox_mode")
+        .expect("sandbox mode override should be configurable");
+}
+
+#[test]
+fn config_document_validation_rejects_invalid_result_before_write() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let config_path = tempdir.path().join("config.toml");
+    let mut document = DocumentMut::from_str(&build_default_config_file()).expect("document");
+    set_document_value(&mut document, "workspaces.default", "missing").expect("set invalid");
+
+    let error = validate_document_config(&document, &config_path)
+        .expect_err("invalid workspace default should be rejected");
+
+    assert!(error.message.contains("workspaces.default"));
+    assert!(!config_path.exists());
+}
+
+#[test]
+fn write_document_uses_private_file_permissions() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let config_path = tempdir.path().join("config.toml");
+    let mut document = DocumentMut::from_str("[runner]\nprovider = \"codex\"\n").expect("document");
+
+    write_document(&config_path, &mut document).expect("write document");
+
+    let mode = crate::runtime_fs::read_unix_mode(&config_path).expect("mode");
+    #[cfg(unix)]
+    assert_eq!(mode, Some(0o600));
+}
+
+#[test]
 fn migrate_config_to_workspaces_rewrites_legacy_keys() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let root_app = tempdir.path().join("kai-home");

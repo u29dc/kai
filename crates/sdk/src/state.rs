@@ -11,7 +11,8 @@ use serde_json::Value as JsonValue;
 use crate::config::{LoadedConfig, RunnerProvider};
 use crate::context::ContextSnapshot;
 use crate::contract::{
-    PendingPairingView, PendingTurnView, SessionView, WorkspaceStatusOutput, WorkspaceView,
+    PendingPairingView, PendingTurnView, SessionView, SideQueryView, WorkspaceStatusOutput,
+    WorkspaceView,
 };
 use crate::error::{ErrorCode, KaiError, KaiResult};
 use crate::redaction::{redact_json_value, redact_text};
@@ -172,6 +173,18 @@ pub struct ActiveTurnState {
     pub pending: PendingTurn,
     #[serde(default)]
     pub status_message_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SideQueryState {
+    pub id: String,
+    pub started_at: String,
+    pub target: ExecutionTarget,
+    pub chat_id: i64,
+    pub sender_id: i64,
+    pub text: String,
+    pub status: String,
 }
 
 impl From<PendingTurn> for ActiveTurnState {
@@ -460,6 +473,9 @@ impl StateStore {
             active_turn: self
                 .get_active_pending_turn()?
                 .map(|turn| pending_turn_view(&turn)),
+            active_side_query: self
+                .get_active_side_query()?
+                .map(|query| side_query_view(&query)),
             pending_reply_deliveries: self.pending_reply_delivery_count()?,
         })
     }
@@ -520,6 +536,20 @@ fn pending_turn_view(turn: &PendingTurn) -> PendingTurnView {
         update_count: turn.update_ids.len(),
         attachment_count: turn.attachments.len(),
         text_excerpt: truncate_turn_text(&turn.text),
+    }
+}
+
+fn side_query_view(query: &SideQueryState) -> SideQueryView {
+    SideQueryView {
+        id: query.id.clone(),
+        started_at: query.started_at.clone(),
+        provider: query.target.provider.as_key().to_string(),
+        workspace_id: query.target.workspace_id.clone(),
+        working_dir: query.target.working_dir.clone(),
+        chat_id: query.chat_id,
+        sender_id: query.sender_id,
+        text_excerpt: truncate_turn_text(&query.text),
+        status: query.status.clone(),
     }
 }
 
