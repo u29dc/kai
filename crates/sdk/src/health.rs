@@ -3,8 +3,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::config::{CodexTransport, LoadedConfig, RunnerProvider};
-use crate::context::context_report;
+use crate::config::LoadedConfig;
 use crate::contract::{HealthCheck, HealthReport};
 use crate::error::{ErrorCode, KaiError, KaiResult};
 use crate::media::transcription_provider_status;
@@ -17,23 +16,6 @@ const APP_SERVER_HEALTH_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
     let mut checks = Vec::new();
-
-    let provider_ok = matches!(config.values.runner.provider, RunnerProvider::Codex);
-    checks.push(HealthCheck {
-        name: "runner.provider".to_string(),
-        ok: provider_ok,
-        detail: match config.values.runner.provider {
-            RunnerProvider::Codex => "selected provider `codex` is available".to_string(),
-            RunnerProvider::Claude => {
-                "selected provider `claude` is reserved but not implemented".to_string()
-            }
-        },
-        fix: if provider_ok {
-            None
-        } else {
-            Some("set `runner.provider` to `codex`; Codex is the only active runner".to_string())
-        },
-    });
 
     let codex_binary = &config.values.runner.codex.binary;
     let codex_ok = find_binary(codex_binary).is_some();
@@ -52,31 +34,21 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
         },
     });
 
-    let transport = config.values.runner.codex.transport;
+    let handshake_result = app_server_health_check_with_timeout(config);
     checks.push(HealthCheck {
-        name: "codex.transport".to_string(),
-        ok: true,
-        detail: format!("selected transport `{}`", transport.as_key()),
-        fix: None,
+        name: "codex.app_server".to_string(),
+        ok: handshake_result.is_ok(),
+        detail: match handshake_result {
+            Ok(()) => "Codex App Server initialized successfully".to_string(),
+            Err(ref error) => format!("Codex App Server handshake failed: {}", error.message),
+        },
+        fix: match handshake_result {
+            Ok(()) => None,
+            Err(_) => Some(
+                "check `runner.codex.binary`, local Codex auth, and whether `codex app-server` runs successfully".to_string(),
+            ),
+        },
     });
-
-    if matches!(transport, CodexTransport::AppServer) {
-        let handshake_result = app_server_health_check_with_timeout(config);
-        checks.push(HealthCheck {
-            name: "codex.app_server".to_string(),
-            ok: handshake_result.is_ok(),
-            detail: match handshake_result {
-                Ok(()) => "Codex App Server initialized successfully".to_string(),
-                Err(ref error) => format!("Codex App Server handshake failed: {}", error.message),
-            },
-            fix: match handshake_result {
-                Ok(()) => None,
-                Err(_) => Some(
-                    "check `runner.codex.binary`, local Codex auth, and whether `codex app-server` runs successfully".to_string(),
-                ),
-            },
-        });
-    }
 
     let token_status = telegram_token_status(config)?;
     let token_ok = token_status.env_available || token_status.keychain_available;
@@ -145,7 +117,8 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
                 if provider == "command" =>
             {
                 Some(
-                    "set `media.transcription.command` or switch providers in config".to_string(),
+                    "set `media.transcription.command.executable` or switch providers in config"
+                        .to_string(),
                 )
             }
             crate::media::TranscriptionProviderStatus::Misconfigured { .. } => {
@@ -349,26 +322,6 @@ pub fn health_report(config: &LoadedConfig) -> KaiResult<HealthReport> {
         },
     });
 
-    for entry in context_report(config).entries {
-        checks.push(HealthCheck {
-            name: format!("context.{}", entry.role),
-            ok: entry.exists && entry.readable,
-            detail: if entry.exists && entry.readable {
-                format!("loaded {}", entry.path)
-            } else {
-                format!("optional file missing at {}", entry.path)
-            },
-            fix: if entry.exists && entry.readable {
-                None
-            } else {
-                Some(
-                    "run `kai setup` to create placeholder context files or point them elsewhere"
-                        .to_string(),
-                )
-            },
-        });
-    }
-
     let status = overall_health_status(&checks);
 
     Ok(HealthReport {
@@ -402,7 +355,7 @@ fn overall_health_status(checks: &[HealthCheck]) -> &'static str {
         !check.ok
             && matches!(
                 check.name.as_str(),
-                "runner.provider" | "codex.binary" | "telegram.token"
+                "codex.binary" | "codex.app_server" | "telegram.token"
             )
     }) {
         "blocked"
@@ -490,14 +443,20 @@ mod tests {
     }
 
     #[test]
-    fn overall_health_status_blocks_when_provider_is_unavailable() {
-        let checks = vec![check("runner.provider", false), check("codex.binary", true)];
+    fn overall_health_status_blocks_when_codex_is_unavailable() {
+        let checks = vec![
+            check("codex.app_server", false),
+            check("codex.binary", true),
+        ];
         assert_eq!(overall_health_status(&checks), "blocked");
     }
 
     #[test]
     fn overall_health_status_degrades_for_non_blocking_checks() {
-        let checks = vec![check("context.soul", false), check("codex.binary", true)];
+        let checks = vec![
+            check("security.file_permissions", false),
+            check("codex.binary", true),
+        ];
         assert_eq!(overall_health_status(&checks), "degraded");
     }
 }

@@ -51,8 +51,8 @@
 - [`crates/cli/src/main.rs`](crates/cli/src/main.rs) parses subcommands and emits one JSON object to stdout
 - [`crates/sdk/src/workspace.rs`](crates/sdk/src/workspace.rs) resolves configured workspaces, current selection, and the execution target `{ workspace_id, working_dir, provider }`
 - [`crates/sdk/src/channel/telegram/`](crates/sdk/src/channel/telegram/) owns Telegram long-polling, owner filtering, typing status, native command-menu sync, queued follow-ups, one active side query via `/ask`, fragment/media buffering, media intake, `/dir`, `/new`, `/send`, and outbound delivery
-- [`crates/sdk/src/runtime/agent.rs`](crates/sdk/src/runtime/agent.rs) is the provider seam; it currently accepts `codex` and blocks `claude` until the adapter lands
-- [`crates/sdk/src/runtime/codex/`](crates/sdk/src/runtime/codex/) owns the Codex transport layer: App Server JSON-RPC over stdio by default, `exec` / `exec resume` fallback support, replay fallback, prompt shaping, and event parsing for the selected workspace target
+- [`crates/sdk/src/runtime/agent.rs`](crates/sdk/src/runtime/agent.rs) is the internal provider seam; Codex is the only public runner until another adapter is implemented end to end
+- [`crates/sdk/src/runtime/codex/`](crates/sdk/src/runtime/codex/) owns the Codex App Server JSON-RPC path, replay fallback, prompt shaping, and event parsing for the selected workspace target
 - [`crates/sdk/src/state/`](crates/sdk/src/state/) owns SQLite state, target-scoped queue persistence, in-flight recovery, per-workspace session and replay bindings, processed-update caching, cleanup, and audit logging
 - [`crates/sdk/src/service/`](crates/sdk/src/service/) owns macOS LaunchAgent lifecycle, Keychain-backed secret seeding, and runtime log inspection
 - [`crates/sdk/src/media/`](crates/sdk/src/media/) owns attachment policy, transcription, and derived-media enrichment
@@ -67,13 +67,13 @@
 - Operator home defaults to `~/.tools/kai`
 - Config lives at `~/.tools/kai/config.toml` unless `KAI_CONFIG_PATH` is set; `paths.root_app` controls runtime state root
 - Runtime state lives under `~/.tools/kai/{state,logs,attachments}` by default unless `root_app` is overridden
-- Named workspaces are mandatory config. Legacy configs with `paths.root_work` or `context_files.todo` must be rewritten with `kai config migrate`
-- Global core context files are `context_files.soul` and `context_files.memory`; `TODO.md` is no longer a configured special file
+- Named workspaces are mandatory config. Legacy configs with `paths.root_work`, `context_files.*`, `runner.provider`, or `runner.codex.transport` must be rewritten with `kai config migrate`
+- SOUL, MEMORY, and other operator notes are ordinary files. Ask the agent to read or edit them when needed; Kai does not hardcode or inject them as configured context files.
 - Selected workspace is runtime state. Session continuity and replay bindings are scoped per `{ provider, workspace_id }`, not one global session id
 - In App Server mode, persisted `session_id` values are Codex thread ids bound per `{ provider, workspace_id }`
 - Relative `/send` paths resolve against the selected workspace root or `root_app`
 - Telegram owner filtering, recovery pairing, Codex session continuity, durable queueing, media staging, and background service management are implemented in the current codebase
-- `runner.provider = "claude"` is config-valid but reserved and intentionally blocked in `run` and `health`; Codex is the only active runner
+- `runner.provider`, `runner.codex.transport`, and `context_files.*` are obsolete public config keys; Codex App Server is the only active runner path
 - `approval_policy = "never"` and network-capable Codex settings are intentional high-capability owner-portal defaults when configured through Codex override settings
 - Treat future local runtime files under `~/.tools/kai` as operator state; never commit them
 
@@ -82,7 +82,7 @@
 - Keep the workspace split to `sdk` and `cli` until a real boundary justifies more crates
 - Keep CLI contracts aligned with [`AGENTS.md`](AGENTS.md)
 - Keep workspace-aware behavior centered on [`crates/sdk/src/workspace.rs`](crates/sdk/src/workspace.rs) and target-scoped state; do not reintroduce global `root_work` or global session singletons
-- Keep global configured context limited to `SOUL` and `MEMORY` unless a new context model is intentionally designed
+- Do not reintroduce hardcoded context-file injection; keep operator notes as normal workspace/runtime files unless a new context model is intentionally designed
 - Treat [`.tmp/`](.tmp/), `target/`, and `node_modules/` as generated
 
 ## 8. Validation

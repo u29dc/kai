@@ -170,10 +170,8 @@ fn decode_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
     let attachments_json: String = row.get(11)?;
     let attachments =
         serde_json::from_str::<Vec<AttachmentInfo>>(&attachments_json).unwrap_or_default();
-    let provider = match row.get::<_, String>(2)?.as_str() {
-        "claude" => crate::config::RunnerProvider::Claude,
-        _ => crate::config::RunnerProvider::Codex,
-    };
+    let _stored_provider: String = row.get(2)?;
+    let provider = crate::config::RunnerProvider::Codex;
 
     Ok(TurnRecord {
         id: row.get(0)?,

@@ -153,14 +153,12 @@ pub(super) fn parse_mobile_command(text: &str) -> Option<MobileCommand> {
     match trimmed {
         "/help" | "help" => Some(MobileCommand::Help),
         "/status" => Some(MobileCommand::Status),
-        "/dir" | "/switchdir" | "dir" => Some(MobileCommand::Dir { workspace_id: None }),
-        "/new" | "/reset" => Some(MobileCommand::Reset),
-        "/cancel" | "/interrupt" => Some(MobileCommand::Cancel { side_query: false }),
+        "/dir" => Some(MobileCommand::Dir { workspace_id: None }),
+        "/new" => Some(MobileCommand::Reset),
+        "/cancel" => Some(MobileCommand::Cancel { side_query: false }),
         "/cancel ask" => Some(MobileCommand::Cancel { side_query: true }),
         _ => trimmed
             .strip_prefix("/dir ")
-            .or_else(|| trimmed.strip_prefix("/switchdir "))
-            .or_else(|| trimmed.strip_prefix("dir "))
             .map(str::trim)
             .filter(|workspace_id| !workspace_id.is_empty())
             .map(|workspace_id| MobileCommand::Dir {

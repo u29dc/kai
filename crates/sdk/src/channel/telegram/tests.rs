@@ -92,7 +92,7 @@ fn stable_pending_turn_id_is_deterministic_and_order_sensitive() {
 }
 
 #[test]
-fn parse_mobile_command_recognizes_side_query_and_cancel_alias() {
+fn parse_mobile_command_recognizes_side_query_cancel() {
     match parse_mobile_command("/ask check current Rust release notes") {
         Some(MobileCommand::Ask { prompt }) => {
             assert_eq!(prompt, "check current Rust release notes");

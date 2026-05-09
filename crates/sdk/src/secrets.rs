@@ -1,5 +1,8 @@
 use std::env;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -8,6 +11,8 @@ use crate::error::{ErrorCode, KaiError, KaiResult};
 
 const TELEGRAM_TOKEN_KEYCHAIN_SERVICE: &str = "ai.kai.telegram.bot-token";
 const GROQ_API_KEY_KEYCHAIN_SERVICE: &str = "ai.kai.groq.api-key";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,21 +167,28 @@ fn sync_secret_to_keychain(
         .map_err(|_| missing_required_secret_error(&format!("{label} env"), env_key))?;
     let account = current_username()?;
 
-    let output = Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-a",
-            account.as_str(),
-            "-s",
-            keychain_service,
-            "-T",
-            "/usr/bin/security",
-            "-w",
-            value.as_str(),
-        ])
-        .output()
-        .map_err(io_error("sync secret to macOS Keychain"))?;
+    if read_keychain_secret(keychain_service)?.as_deref() == Some(value.as_str()) {
+        return Ok(keychain_service.to_string());
+    }
+
+    let mut command = Command::new("/usr/bin/security");
+    command.args([
+        "add-generic-password",
+        "-U",
+        "-a",
+        account.as_str(),
+        "-s",
+        keychain_service,
+        "-T",
+        "/usr/bin/security",
+        "-w",
+    ]);
+    let output = command_output_with_timeout(
+        command,
+        KEYCHAIN_COMMAND_TIMEOUT,
+        "sync secret to macOS Keychain",
+        Some(&value),
+    )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -195,17 +207,21 @@ fn sync_secret_to_keychain(
 #[cfg(target_os = "macos")]
 fn read_keychain_secret(keychain_service: &str) -> KaiResult<Option<String>> {
     let account = current_username()?;
-    let output = Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-w",
-            "-a",
-            account.as_str(),
-            "-s",
-            keychain_service,
-        ])
-        .output()
-        .map_err(io_error("read secret from macOS Keychain"))?;
+    let mut command = Command::new("/usr/bin/security");
+    command.args([
+        "find-generic-password",
+        "-w",
+        "-a",
+        account.as_str(),
+        "-s",
+        keychain_service,
+    ]);
+    let output = command_output_with_timeout(
+        command,
+        KEYCHAIN_COMMAND_TIMEOUT,
+        "read secret from macOS Keychain",
+        None,
+    )?;
 
     if !output.status.success() {
         return Ok(None);
@@ -227,10 +243,10 @@ fn current_username() -> KaiResult<String> {
         return Ok(user);
     }
 
-    let output = Command::new("id")
-        .arg("-un")
-        .output()
-        .map_err(io_error("run `id -un`"))?;
+    let mut command = Command::new("id");
+    command.arg("-un");
+    let output =
+        command_output_with_timeout(command, Duration::from_secs(5), "run `id -un`", None)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(KaiError::new(
@@ -240,6 +256,46 @@ fn current_username() -> KaiResult<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout_duration: Duration,
+    action: &'static str,
+    stdin: Option<&str>,
+) -> KaiResult<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    let mut child = command.spawn().map_err(io_error(action))?;
+    if let Some(input) = stdin
+        && let Some(mut child_stdin) = child.stdin.take()
+    {
+        child_stdin
+            .write_all(input.as_bytes())
+            .and_then(|_| child_stdin.write_all(b"\n"))
+            .map_err(io_error(action))?;
+    }
+    let started = Instant::now();
+
+    loop {
+        if child.try_wait().map_err(io_error(action))?.is_some() {
+            return child.wait_with_output().map_err(io_error(action));
+        }
+        if started.elapsed() >= timeout_duration {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(KaiError::new(
+                ErrorCode::RuntimeError,
+                format!("timed out while trying to {action}"),
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn missing_required_secret_error(label: &str, env_key: &str) -> KaiError {

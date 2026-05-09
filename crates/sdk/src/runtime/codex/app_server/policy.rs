@@ -34,7 +34,7 @@ pub fn sandbox_policy(
         .and_then(|override_config| override_config.sandbox_mode.clone());
 
     let writable_roots = writable_roots(config, target);
-    let readable_roots = readable_roots(config, attachments, &writable_roots);
+    let readable_roots = readable_roots(attachments, &writable_roots);
     let read_only_access = if readable_roots.is_empty() {
         ReadOnlyAccess::FullAccess
     } else {
@@ -70,16 +70,10 @@ fn writable_roots(config: &LoadedConfig, target: &ExecutionTarget) -> Vec<String
     roots.into_iter().collect()
 }
 
-fn readable_roots(
-    config: &LoadedConfig,
-    attachments: &[AttachmentInfo],
-    writable_roots: &[String],
-) -> Vec<String> {
+fn readable_roots(attachments: &[AttachmentInfo], writable_roots: &[String]) -> Vec<String> {
     let writable_roots = writable_roots.iter().collect::<BTreeSet<_>>();
     let mut roots = BTreeSet::new();
 
-    push_parent(&mut roots, &config.values.context_files.soul);
-    push_parent(&mut roots, &config.values.context_files.memory);
     for attachment in attachments {
         push_parent(&mut roots, &attachment.path);
         for artifact in &attachment.artifacts {
@@ -112,9 +106,9 @@ fn normalize_mode(input: &str) -> &str {
 mod tests {
     use super::*;
     use crate::config::{
-        AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, MediaConfig,
-        PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-        TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
+        AgentConfig, ChannelConfig, CodexConfig, Config, MediaConfig, PathsConfig, RunnerConfig,
+        RunnerProvider, TelegramConfig, TelegramProgressConfig, TranscriptionConfig,
+        WorkspaceConfig, WorkspacesConfig,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -151,17 +145,11 @@ mod tests {
                     root_app: "/tmp/kai".to_string(),
                 },
                 runner: RunnerConfig {
-                    provider: RunnerProvider::Codex,
                     codex: CodexConfig {
                         binary: "codex".to_string(),
-                        transport: crate::config::CodexTransport::AppServer,
                         service_name: Some("kai".to_string()),
                         override_config: None,
                     },
-                },
-                context_files: ContextFilesConfig {
-                    soul: "/tmp/kai/SOUL.md".to_string(),
-                    memory: "/tmp/kai/MEMORY.md".to_string(),
                 },
                 workspaces: WorkspacesConfig {
                     default_workspace: "main".to_string(),

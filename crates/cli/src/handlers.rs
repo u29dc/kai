@@ -30,21 +30,6 @@ pub(super) async fn dispatch(cli: Cli) -> KaiResult<Flow> {
         Command::Config { command } => handle_config_command(command),
         Command::Workspace { command } => handle_workspace_command(command),
         Command::Setup { command } => handle_setup_command(command).await,
-        Command::Context { command } => {
-            let config = load_config()?;
-            let payload = serde_json::to_value(context_report(&config))
-                .map_err(serialize_error("serialize context report"))?;
-
-            let tool = match command {
-                ContextCommand::Show => "kai.context.show",
-                ContextCommand::Check => "kai.context.show",
-            };
-
-            Ok(Flow::Immediate {
-                tool: tool.to_string(),
-                payload,
-            })
-        }
         Command::Session { command } => handle_session_command(command),
         Command::Service { command } => handle_service_command(command),
         Command::Run => {
@@ -170,7 +155,6 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
             let state = StateStore::open(&config)?;
 
             let created_paths = create_runtime_dirs(&config, &state)?;
-            create_context_placeholders(&config)?;
 
             let payload = serde_json::to_value(SetupOutput {
                 config_path: config.config_path.display().to_string(),
@@ -191,7 +175,6 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
             let config = load_config()?;
             let state = StateStore::open(&config)?;
             let created_paths = create_runtime_dirs(&config, &state)?;
-            create_context_placeholders(&config)?;
 
             if config.values.channel.telegram.owner_user_id.is_some() && !recovery {
                 state.clear_pending_pairing()?;
@@ -229,19 +212,6 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
         Some(SetupCommand::Codex) => {
             let config = load_config()?;
             let binary = config.values.runner.codex.binary.clone();
-            let exec_available = ProcessCommand::new(&binary)
-                .arg("exec")
-                .arg("--help")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false);
-            let resume_available = ProcessCommand::new(&binary)
-                .arg("exec")
-                .arg("resume")
-                .arg("--help")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false);
             let app_server_available = ProcessCommand::new(&binary)
                 .arg("app-server")
                 .arg("--help")
@@ -251,8 +221,6 @@ async fn handle_setup_command(command: Option<SetupCommand>) -> KaiResult<Flow> 
 
             let payload = serde_json::to_value(SetupCodexOutput {
                 binary,
-                exec_available,
-                resume_available,
                 app_server_available,
             })
             .map_err(serialize_error("serialize setup codex output"))?;
@@ -273,7 +241,6 @@ fn handle_session_command(command: SessionCommand) -> KaiResult<Flow> {
         SessionCommand::Show => "kai.session.show",
         SessionCommand::Set { .. } => "kai.session.set",
         SessionCommand::New => "kai.session.new",
-        SessionCommand::Reset => "kai.session.new",
     };
 
     match command {
@@ -285,7 +252,7 @@ fn handle_session_command(command: SessionCommand) -> KaiResult<Flow> {
             state.set_session_binding(&target, session_id.trim())?;
             state.clear_target_replay_package(&target)?;
         }
-        SessionCommand::New | SessionCommand::Reset => {
+        SessionCommand::New => {
             state.clear_session_binding(&target)?;
             state.clear_target_replay_package(&target)?;
         }
@@ -323,7 +290,6 @@ fn handle_workspace_command(command: WorkspaceCommand) -> KaiResult<Flow> {
     let payload = serde_json::to_value(state.workspace_status_output(&config)?)
         .map_err(serialize_error("serialize workspace status output"))?;
     let tool = match command {
-        WorkspaceCommand::List => "kai.workspace.show",
         WorkspaceCommand::Show => "kai.workspace.show",
         WorkspaceCommand::Select { .. } => "kai.workspace.select",
     };
@@ -361,31 +327,6 @@ fn create_runtime_dirs(
     created.sort();
     created.dedup();
     Ok(created)
-}
-
-fn create_context_placeholders(config: &kai_sdk::LoadedConfig) -> KaiResult<()> {
-    for (path, title) in [
-        (config.values.context_files.soul.as_str(), "SOUL"),
-        (config.values.context_files.memory.as_str(), "MEMORY"),
-    ] {
-        let file_path = Path::new(path);
-        if file_path.is_file() {
-            continue;
-        }
-
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).map_err(io_error("create context directory"))?;
-        }
-
-        if file_path.starts_with(Path::new(&config.values.paths.root_app)) {
-            write_private_file(file_path, format!("# {title}\n\n").as_bytes())?;
-        } else {
-            fs::write(file_path, format!("# {title}\n\n"))
-                .map_err(io_error("write context placeholder"))?;
-        }
-    }
-
-    Ok(())
 }
 
 fn handle_service_command(command: ServiceCommand) -> KaiResult<Flow> {
@@ -453,14 +394,14 @@ mod tests {
     use kai_sdk::{
         ErrorCode, LoadedConfig,
         config::{
-            AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, MediaConfig,
-            PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-            TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
+            AgentConfig, ChannelConfig, CodexConfig, Config, MediaConfig, PathsConfig,
+            RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig,
+            WorkspaceConfig, WorkspacesConfig,
         },
     };
     use std::path::PathBuf;
 
-    fn test_config(provider: RunnerProvider) -> LoadedConfig {
+    fn test_config() -> LoadedConfig {
         LoadedConfig {
             config_path: PathBuf::from("/tmp/kai.toml"),
             config_exists: false,
@@ -492,17 +433,11 @@ mod tests {
                     root_app: "/tmp/kai".to_string(),
                 },
                 runner: RunnerConfig {
-                    provider,
                     codex: CodexConfig {
                         binary: "codex".to_string(),
-                        transport: kai_sdk::CodexTransport::AppServer,
                         service_name: Some("kai".to_string()),
                         override_config: None,
                     },
-                },
-                context_files: ContextFilesConfig {
-                    soul: "/tmp/kai/SOUL.md".to_string(),
-                    memory: "/tmp/kai/MEMORY.md".to_string(),
                 },
                 workspaces: WorkspacesConfig {
                     default_workspace: "main".to_string(),
@@ -519,11 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_run_prerequisites_blocks_unsupported_provider_before_token_lookup() {
-        let error = validate_run_prerequisites(&test_config(RunnerProvider::Claude))
-            .expect_err("unsupported provider should be blocked");
+    fn validate_run_prerequisites_blocks_disabled_telegram_before_token_lookup() {
+        let mut config = test_config();
+        config.values.channel.telegram.enabled = false;
+        let error = validate_run_prerequisites(&config).expect_err("telegram should be blocked");
 
         assert!(matches!(error.code, ErrorCode::BlockedPrerequisite));
-        assert!(error.message.contains("claude"));
+        assert!(error.message.contains("telegram is disabled"));
     }
 }

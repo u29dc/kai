@@ -27,7 +27,7 @@ fn session_catalog_includes_side_query_state() {
 }
 
 #[test]
-fn catalog_hides_deprecated_alias_commands() {
+fn catalog_omits_removed_alias_and_context_commands() {
     let catalog = tool_catalog();
     let names = catalog
         .tools
@@ -35,6 +35,7 @@ fn catalog_hides_deprecated_alias_commands() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
 
+    assert!(!names.contains(&"context.show"));
     assert!(!names.contains(&"context.check"));
     assert!(!names.contains(&"session.reset"));
     assert!(!names.contains(&"workspace.list"));

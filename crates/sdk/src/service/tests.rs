@@ -2,9 +2,9 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::config::{
-    AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
-    PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-    TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
+    AgentConfig, ChannelConfig, CodexConfig, Config, LoadedConfig, MediaConfig, PathsConfig,
+    RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig, WorkspaceConfig,
+    WorkspacesConfig,
 };
 
 fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
@@ -39,17 +39,11 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
                 root_app: root_app.display().to_string(),
             },
             runner: RunnerConfig {
-                provider: RunnerProvider::Codex,
                 codex: CodexConfig {
                     binary: "codex".to_string(),
-                    transport: crate::config::CodexTransport::AppServer,
                     service_name: Some("kai".to_string()),
                     override_config: None,
                 },
-            },
-            context_files: ContextFilesConfig {
-                soul: root_app.join("SOUL.md").display().to_string(),
-                memory: root_app.join("MEMORY.md").display().to_string(),
             },
             workspaces: WorkspacesConfig {
                 default_workspace: "main".to_string(),
@@ -84,21 +78,6 @@ fn run_lock_status_reports_stale_after_release() {
     assert!(!status.locked);
     assert!(status.pid.is_none());
     assert!(!status.stale);
-}
-
-#[test]
-fn validate_service_runtime_prerequisites_blocks_unsupported_provider() {
-    let tempdir = tempdir().expect("tempdir");
-    let root_app = tempdir.path().join("kai-home");
-    let root_work = tempdir.path().join("work");
-    let mut config = test_config(&root_app, &root_work);
-    config.values.runner.provider = RunnerProvider::Claude;
-
-    let error = validate_service_runtime_prerequisites(&config)
-        .expect_err("unsupported provider should be blocked");
-
-    assert!(matches!(error.code, ErrorCode::BlockedPrerequisite));
-    assert!(error.message.contains("claude"));
 }
 
 #[cfg(target_os = "macos")]

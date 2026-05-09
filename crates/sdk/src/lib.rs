@@ -1,7 +1,6 @@
 pub mod app;
 pub mod channel;
 pub mod config;
-pub mod context;
 pub mod contract;
 pub mod error;
 pub mod health;
@@ -17,14 +16,11 @@ pub mod workspace;
 pub use app::{handle_owner_prompt, mobile_help_text, mobile_status_text};
 pub use channel::telegram::run_telegram_loop;
 pub use config::{
-    CodexTransport, ConfigMigrationResult, ContextFilesConfig, LoadedConfig, MediaConfig,
-    RunnerProvider, TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
-    build_default_config_file, config_value_at_key, default_root_app, ensure_config_file,
-    expand_home, load_config, migrate_config_to_workspaces, migrate_config_to_workspaces_at,
-    set_config_value, unset_config_value,
-};
-pub use context::{
-    ContextEntry, ContextReport, ContextSnapshot, context_report, context_snapshots,
+    ConfigMigrationResult, LoadedConfig, MediaConfig, RunnerProvider, TranscriptionCommandConfig,
+    TranscriptionConfig, WorkspaceConfig, WorkspacesConfig, build_default_config_file,
+    config_value_at_key, default_root_app, ensure_config_file, expand_home, load_config,
+    migrate_config_to_workspaces, migrate_config_to_workspaces_at, set_config_value,
+    unset_config_value,
 };
 pub use contract::{
     ConfigGetOutput, ConfigMigrationOutput, ConfigShowOutput, GlobalFlag, HealthCheck,

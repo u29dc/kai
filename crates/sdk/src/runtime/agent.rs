@@ -1,5 +1,4 @@
 use crate::config::{LoadedConfig, RunnerProvider};
-use crate::context::ContextSnapshot;
 use crate::error::{KaiError, KaiResult};
 use crate::state::{AttachmentInfo, StateStore};
 use crate::workspace::ExecutionTarget;
@@ -14,7 +13,6 @@ pub struct AgentTurnResult {
     pub session_id: String,
     pub response_text: String,
     pub resumed: bool,
-    pub context_snapshots: Vec<ContextSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,13 +61,8 @@ pub enum RunningAgentTurn {
 }
 
 pub fn selected_provider(config: &LoadedConfig) -> KaiResult<RunnerProvider> {
-    match config.values.runner.provider {
-        RunnerProvider::Codex => Ok(RunnerProvider::Codex),
-        RunnerProvider::Claude => Err(KaiError::blocked_prerequisite(
-            "runner.provider `claude` is reserved but not implemented",
-        )
-        .with_hint("use `runner.provider = \"codex\"`; Codex is the only active runner")),
-    }
+    let _ = config;
+    Ok(RunnerProvider::Codex)
 }
 
 pub fn run_agent_turn(
@@ -94,7 +87,6 @@ pub fn run_agent_turn(
                 attachments,
             )?,
         )),
-        RunnerProvider::Claude => unreachable!("unsupported provider filtered above"),
     }
 }
 
@@ -120,7 +112,6 @@ pub fn prepare_agent_turn(
                 attachments,
             )?),
         }),
-        RunnerProvider::Claude => unreachable!("unsupported provider filtered above"),
     }
 }
 
@@ -203,7 +194,6 @@ fn map_turn_result(provider: RunnerProvider, result: codex::CodexTurnResult) -> 
         session_id: result.session_id,
         response_text: result.response_text,
         resumed: result.resumed,
-        context_snapshots: result.context_snapshots,
     }
 }
 
@@ -241,8 +231,8 @@ fn map_progress_event(event: codex::CodexProgressEvent) -> AgentProgressEvent {
 mod tests {
     use super::*;
     use crate::config::{
-        AgentConfig, ChannelConfig, Config, ContextFilesConfig, MediaConfig, PathsConfig,
-        RunnerConfig, TelegramConfig, TelegramProgressConfig, TranscriptionConfig, WorkspaceConfig,
+        AgentConfig, ChannelConfig, CodexConfig, Config, MediaConfig, PathsConfig, RunnerConfig,
+        TelegramConfig, TelegramProgressConfig, TranscriptionConfig, WorkspaceConfig,
         WorkspacesConfig,
     };
     use crate::state::StateStore;
@@ -280,17 +270,11 @@ mod tests {
                     root_app: root_app.display().to_string(),
                 },
                 runner: RunnerConfig {
-                    provider: RunnerProvider::Codex,
-                    codex: crate::config::CodexConfig {
+                    codex: CodexConfig {
                         binary: "codex".to_string(),
-                        transport: crate::config::CodexTransport::Exec,
                         service_name: Some("kai".to_string()),
                         override_config: None,
                     },
-                },
-                context_files: ContextFilesConfig {
-                    soul: root_app.join("SOUL.md").display().to_string(),
-                    memory: root_app.join("MEMORY.md").display().to_string(),
                 },
                 workspaces: WorkspacesConfig {
                     default_workspace: "main".to_string(),
@@ -305,72 +289,6 @@ mod tests {
             },
             config_exists: false,
         }
-    }
-
-    #[test]
-    fn selected_provider_blocks_unimplemented_claude() {
-        let config = LoadedConfig {
-            config_path: "/tmp/kai.toml".into(),
-            values: Config {
-                agent: AgentConfig {
-                    timezone: "Europe/London".to_string(),
-                },
-                channel: ChannelConfig {
-                    telegram: TelegramConfig {
-                        enabled: true,
-                        bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
-                        owner_user_id: None,
-                        progress: TelegramProgressConfig {
-                            enabled: true,
-                            edit_interval_ms: 2500,
-                            idle_update_secs: 8,
-                        },
-                    },
-                },
-                media: MediaConfig {
-                    transcription: TranscriptionConfig {
-                        provider: "groq".to_string(),
-                        groq_api_key_env: "GROQ_API_KEY".to_string(),
-                        groq_model: "whisper-large-v3-turbo".to_string(),
-                        command: None,
-                    },
-                },
-                paths: PathsConfig {
-                    root_app: "/tmp/kai".to_string(),
-                },
-                runner: RunnerConfig {
-                    provider: RunnerProvider::Claude,
-                    codex: crate::config::CodexConfig {
-                        binary: "codex".to_string(),
-                        transport: crate::config::CodexTransport::AppServer,
-                        service_name: Some("kai".to_string()),
-                        override_config: None,
-                    },
-                },
-                context_files: ContextFilesConfig {
-                    soul: "/tmp/kai/SOUL.md".to_string(),
-                    memory: "/tmp/kai/MEMORY.md".to_string(),
-                },
-                workspaces: WorkspacesConfig {
-                    default_workspace: "main".to_string(),
-                    entries: std::collections::BTreeMap::from([(
-                        "main".to_string(),
-                        WorkspaceConfig {
-                            label: Some("Main".to_string()),
-                            path: "/tmp/work".to_string(),
-                        },
-                    )]),
-                },
-            },
-            config_exists: false,
-        };
-
-        let error = selected_provider(&config).expect_err("claude should be blocked in phase 1");
-        assert!(matches!(
-            error.code,
-            crate::error::ErrorCode::BlockedPrerequisite
-        ));
-        assert!(error.message.contains("claude"));
     }
 
     #[test]

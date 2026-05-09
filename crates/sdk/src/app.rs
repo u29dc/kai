@@ -3,7 +3,6 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::config::LoadedConfig;
-use crate::context::context_report;
 use crate::error::KaiResult;
 use crate::runtime::agent::{create_replay_package, run_agent_turn, selected_provider};
 use crate::state::{AttachmentInfo, NewTurn, StateStore};
@@ -59,10 +58,7 @@ pub fn handle_owner_prompt(
         attachments: &[],
     })?;
 
-    let replay_package = create_replay_package(
-        &result.context_snapshots,
-        &state.recent_turns_for_target(&target, 24)?,
-    );
+    let replay_package = create_replay_package(&state.recent_turns_for_target(&target, 24)?);
     state.set_target_replay_package(&target, &replay_package)?;
 
     state.append_audit_json(&json!({
@@ -103,8 +99,6 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
     if session.owner_user_id.is_none() {
         session.owner_user_id = config.values.channel.telegram.owner_user_id;
     }
-    let context = context_report(config);
-
     let mut lines = vec![
         format!(
             "owner: {}",
@@ -120,7 +114,6 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
                 .unwrap_or_else(|| "none".to_string())
         ),
         format!("provider: {}", session.provider),
-        format!("transport: {}", session.transport),
         format!("workspace: {}", session.selected_workspace_id),
         format!("workspace_path: {}", session.selected_workspace_path),
         format!(
@@ -172,98 +165,12 @@ pub fn mobile_status_text(config: &LoadedConfig, state: &StateStore) -> KaiResul
         .join(", ");
     lines.push(format!("workspaces: {}", workspace_summary));
 
-    for entry in context.entries {
-        let status = if entry.exists { "ok" } else { "missing" };
-        lines.push(format!("context {}: {}", entry.role, status));
-    }
-
     Ok(lines.join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, MediaConfig,
-        PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-        TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
-    };
-    use crate::error::ErrorCode;
-    use std::path::Path;
-    use tempfile::tempdir;
-
-    fn test_config(root_app: &Path, root_work: &Path, provider: RunnerProvider) -> LoadedConfig {
-        LoadedConfig {
-            config_path: root_app.join("config.toml"),
-            config_exists: false,
-            values: Config {
-                agent: AgentConfig {
-                    timezone: "Europe/London".to_string(),
-                },
-                channel: ChannelConfig {
-                    telegram: TelegramConfig {
-                        enabled: true,
-                        bot_token_env: "KAI_TELEGRAM_BOT_TOKEN".to_string(),
-                        owner_user_id: None,
-                        progress: TelegramProgressConfig {
-                            enabled: true,
-                            edit_interval_ms: 2500,
-                            idle_update_secs: 8,
-                        },
-                    },
-                },
-                media: MediaConfig {
-                    transcription: TranscriptionConfig {
-                        provider: "groq".to_string(),
-                        groq_api_key_env: "GROQ_API_KEY".to_string(),
-                        groq_model: "whisper-large-v3-turbo".to_string(),
-                        command: None,
-                    },
-                },
-                paths: PathsConfig {
-                    root_app: root_app.display().to_string(),
-                },
-                runner: RunnerConfig {
-                    provider,
-                    codex: CodexConfig {
-                        binary: "codex".to_string(),
-                        transport: crate::config::CodexTransport::AppServer,
-                        service_name: Some("kai".to_string()),
-                        override_config: None,
-                    },
-                },
-                context_files: ContextFilesConfig {
-                    soul: root_app.join("SOUL.md").display().to_string(),
-                    memory: root_app.join("MEMORY.md").display().to_string(),
-                },
-                workspaces: WorkspacesConfig {
-                    default_workspace: "main".to_string(),
-                    entries: std::collections::BTreeMap::from([(
-                        "main".to_string(),
-                        WorkspaceConfig {
-                            label: Some("Main".to_string()),
-                            path: root_work.display().to_string(),
-                        },
-                    )]),
-                },
-            },
-        }
-    }
-
-    #[test]
-    fn handle_owner_prompt_blocks_unsupported_provider_before_recording_turn() {
-        let tempdir = tempdir().expect("tempdir");
-        let root_app = tempdir.path().join("kai-home");
-        let root_work = tempdir.path().join("work");
-        let config = test_config(&root_app, &root_work, RunnerProvider::Claude);
-        let state = StateStore::open(&config).expect("state store");
-
-        let error = handle_owner_prompt(&config, &state, "telegram", 42, "hello", &[])
-            .expect_err("unsupported provider should be blocked");
-
-        assert!(matches!(error.code, ErrorCode::BlockedPrerequisite));
-        assert_eq!(state.recent_turns(10).expect("recent turns").len(), 0);
-    }
 
     #[test]
     fn mobile_help_shows_canonical_commands_only() {

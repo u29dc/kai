@@ -54,7 +54,7 @@ pub fn workspace_by_id(config: &LoadedConfig, workspace_id: &str) -> KaiResult<W
         .get(workspace_id)
         .ok_or_else(|| {
             KaiError::invalid_argument(format!("unknown workspace `{workspace_id}`"))
-                .with_hint("use `kai workspace list` to inspect configured workspaces")
+                .with_hint("use `kai workspace show` to inspect configured workspaces")
         })?;
 
     Ok(WorkspaceSpec {

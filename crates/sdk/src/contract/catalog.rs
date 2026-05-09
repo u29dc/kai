@@ -112,7 +112,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "setup",
                     "kai setup",
                     "setup",
-                    "Create app directories, config, and placeholder context files.",
+                    "Create app directories and config.",
                     "setupOutput",
                     "kai setup",
                 )
@@ -157,23 +157,7 @@ pub fn tool_catalog() -> ToolCatalog {
                     "setupCodexOutput",
                     "kai setup codex",
                 )
-                .with_output_fields([
-                    "binary",
-                    "execAvailable",
-                    "resumeAvailable",
-                    "appServerAvailable",
-                ]),
-            ),
-            tool(
-                ToolSeed::new(
-                    "context.show",
-                    "kai context show",
-                    "context",
-                    "Show configured context file status.",
-                    "contextReport",
-                    "kai context show",
-                )
-                .with_output_fields(["entries"]),
+                .with_output_fields(["binary", "appServerAvailable"]),
             ),
             tool(
                 ToolSeed::new(
@@ -229,7 +213,6 @@ pub fn tool_catalog() -> ToolCatalog {
                     "ownerUserId",
                     "ownerChatId",
                     "provider",
-                    "transport",
                     "defaultWorkspaceId",
                     "selectedWorkspaceId",
                     "selectedWorkspacePath",
@@ -264,7 +247,6 @@ pub fn tool_catalog() -> ToolCatalog {
                     "ownerUserId",
                     "ownerChatId",
                     "provider",
-                    "transport",
                     "defaultWorkspaceId",
                     "selectedWorkspaceId",
                     "selectedWorkspacePath",
@@ -294,7 +276,6 @@ pub fn tool_catalog() -> ToolCatalog {
                     "ownerUserId",
                     "ownerChatId",
                     "provider",
-                    "transport",
                     "defaultWorkspaceId",
                     "selectedWorkspaceId",
                     "selectedWorkspacePath",

@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn seed_secrets(config: &LoadedConfig) -> KaiResult<()> {
     let token_status = telegram_token_status(config)?;
     if token_status.env_available {
-        let _ = sync_telegram_token_to_keychain(config)?;
+        sync_telegram_token_to_keychain(config)?;
     } else if !token_status.keychain_available {
         return Err(KaiError::blocked_prerequisite(format!(
             "telegram bot token env `{}` is not set and no macOS Keychain secret is available",
@@ -23,7 +23,7 @@ pub(super) fn seed_secrets(config: &LoadedConfig) -> KaiResult<()> {
     {
         let groq_status = groq_api_key_status(config)?;
         if groq_status.env_available {
-            let _ = sync_groq_api_key_to_keychain(config)?;
+            sync_groq_api_key_to_keychain(config)?;
         }
     }
 

@@ -431,10 +431,8 @@ async fn finalize_successful_turn(
         attachments: &[],
     })?;
 
-    let replay_package = create_replay_package(
-        &result.context_snapshots,
-        &state.recent_turns_for_target(&active_turn.pending.target, 24)?,
-    );
+    let replay_package =
+        create_replay_package(&state.recent_turns_for_target(&active_turn.pending.target, 24)?);
     state.set_target_replay_package(&active_turn.pending.target, &replay_package)?;
 
     state.append_audit_json(&serde_json::json!({

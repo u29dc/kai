@@ -4,9 +4,9 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::config::{
-    AgentConfig, ChannelConfig, CodexConfig, Config, ContextFilesConfig, LoadedConfig, MediaConfig,
-    PathsConfig, RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig,
-    TranscriptionConfig, WorkspaceConfig, WorkspacesConfig,
+    AgentConfig, ChannelConfig, CodexConfig, Config, LoadedConfig, MediaConfig, PathsConfig,
+    RunnerConfig, RunnerProvider, TelegramConfig, TelegramProgressConfig, TranscriptionConfig,
+    WorkspaceConfig, WorkspacesConfig,
 };
 use crate::workspace::ExecutionTarget;
 
@@ -48,17 +48,11 @@ fn test_config(root_app: &Path, root_work: &Path) -> LoadedConfig {
                 root_app: root_app.display().to_string(),
             },
             runner: RunnerConfig {
-                provider: RunnerProvider::Codex,
                 codex: CodexConfig {
                     binary: "codex".to_string(),
-                    transport: crate::config::CodexTransport::AppServer,
                     service_name: Some("kai".to_string()),
                     override_config: None,
                 },
-            },
-            context_files: ContextFilesConfig {
-                soul: root_app.join("SOUL.md").display().to_string(),
-                memory: root_app.join("MEMORY.md").display().to_string(),
             },
             workspaces: WorkspacesConfig {
                 default_workspace: "main".to_string(),

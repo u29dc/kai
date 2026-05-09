@@ -1,4 +1,5 @@
 use super::*;
+use crate::redaction::redact_text;
 
 pub(super) fn telegram_token(config: &LoadedConfig) -> KaiResult<String> {
     resolve_telegram_token(config)
@@ -45,7 +46,7 @@ pub(super) fn http_error(action: &'static str) -> impl Fn(reqwest::Error) -> Kai
     move |error| {
         KaiError::new(
             ErrorCode::RuntimeError,
-            format!("failed to {action}: {error}"),
+            format!("failed to {action}: {}", redact_text(&error.to_string())),
         )
     }
 }

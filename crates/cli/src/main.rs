@@ -7,11 +7,10 @@ use clap::{Parser, Subcommand};
 use kai_sdk::{
     ConfigGetOutput, ConfigMigrationOutput, ConfigShowOutput, KaiError, KaiResult, SessionView,
     SetupCodexOutput, SetupOutput, StateStore, acquire_run_guard, config_value_at_key,
-    context_report, ensure_config_file, ensure_private_dir, error_envelope, health_report,
-    load_config, mobile_help_text, ok_envelope, resolve_telegram_token, run_telegram_loop,
-    selected_provider, service_logs, service_restart, service_start, service_status, service_stop,
-    service_uninstall, set_config_value, tool_catalog, tool_spec, unset_config_value,
-    write_private_file,
+    ensure_config_file, ensure_private_dir, error_envelope, health_report, load_config,
+    mobile_help_text, ok_envelope, resolve_telegram_token, run_telegram_loop, selected_provider,
+    service_logs, service_restart, service_start, service_status, service_stop, service_uninstall,
+    set_config_value, tool_catalog, tool_spec, unset_config_value,
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
@@ -50,10 +49,6 @@ enum Command {
         #[command(subcommand)]
         command: Option<SetupCommand>,
     },
-    Context {
-        #[command(subcommand)]
-        command: ContextCommand,
-    },
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -84,31 +79,16 @@ enum SetupCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum ContextCommand {
-    Show,
-    #[command(hide = true)]
-    Check,
-}
-
-#[derive(Debug, Subcommand)]
 enum SessionCommand {
     Show,
-    Set {
-        session_id: String,
-    },
+    Set { session_id: String },
     New,
-    #[command(hide = true)]
-    Reset,
 }
 
 #[derive(Debug, Subcommand)]
 enum WorkspaceCommand {
-    #[command(hide = true)]
-    List,
     Show,
-    Select {
-        workspace_id: String,
-    },
+    Select { workspace_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -212,25 +192,25 @@ mod tests {
     }
 
     #[test]
-    fn context_help_hides_check_alias() {
-        let help = help_text_for(&["context"]);
-        assert!(help.contains("show"));
-        assert!(!help.contains("check"));
-    }
-
-    #[test]
-    fn session_help_hides_reset_alias() {
+    fn session_help_exposes_canonical_commands_only() {
         let help = help_text_for(&["session"]);
         assert!(help.contains("new"));
         assert!(!help.contains("reset"));
     }
 
     #[test]
-    fn workspace_help_hides_list_alias() {
+    fn workspace_help_exposes_canonical_commands_only() {
         let help = help_text_for(&["workspace"]);
         assert!(help.contains("show"));
         assert!(help.contains("select"));
         assert!(!help.contains("list"));
+    }
+
+    #[test]
+    fn removed_aliases_are_rejected() {
+        assert!(Cli::try_parse_from(["kai", "context", "check"]).is_err());
+        assert!(Cli::try_parse_from(["kai", "session", "reset"]).is_err());
+        assert!(Cli::try_parse_from(["kai", "workspace", "list"]).is_err());
     }
 
     #[test]
@@ -248,7 +228,6 @@ mod tests {
             "config.set",
             "config.show",
             "config.unset",
-            "context.show",
             "health",
             "run",
             "service.logs",

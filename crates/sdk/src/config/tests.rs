@@ -7,13 +7,13 @@ fn build_default_config_contains_expected_sections() {
     assert!(config.contains("[channel.telegram]"));
     assert!(config.contains("[channel.telegram.progress]"));
     assert!(config.contains("[paths]"));
-    assert!(config.contains("[context_files]"));
-    assert!(config.contains("[runner]"));
-    assert!(config.contains("provider = \"codex\""));
     assert!(config.contains("[runner.codex]"));
     assert!(config.contains("[workspaces]"));
     assert!(config.contains("[workspaces.main]"));
     assert!(!config.contains("root_work"));
+    assert!(!config.contains("context_files"));
+    assert!(!config.contains("transport ="));
+    assert!(!config.contains("provider = \"codex\""));
     assert!(!config.contains("todo ="));
 }
 
@@ -57,6 +57,48 @@ fn config_mutation_allows_high_capability_codex_override_keys() {
 }
 
 #[test]
+fn default_toml_matches_typed_defaults() {
+    let partial = toml::from_str::<PartialConfig>(&build_default_config_file())
+        .expect("default toml should parse as partial config");
+    let root_app = expand_home("~/.tools/kai");
+    let mut from_document = default_config(PathBuf::from("/tmp/placeholder-root"));
+    apply_partial_config(&mut from_document, partial);
+    expand_config_paths(&mut from_document);
+
+    let mut typed = default_config(root_app);
+    expand_config_paths(&mut typed);
+
+    assert_eq!(
+        serde_json::to_value(from_document).expect("document config json"),
+        serde_json::to_value(typed).expect("typed config json")
+    );
+}
+
+#[test]
+fn editable_config_key_registry_covers_supported_static_keys() {
+    for key in EDITABLE_CONFIG_KEYS {
+        ensure_config_key_allowed(key).expect("editable key should be accepted");
+    }
+    ensure_config_key_allowed("runner.provider").expect_err("provider is not user configurable");
+    ensure_config_key_allowed("runner.codex.transport")
+        .expect_err("transport is not user configurable");
+    ensure_config_key_allowed("context_files.memory")
+        .expect_err("context files are not user configurable");
+}
+
+#[test]
+fn runner_provider_deserializes_legacy_strings_as_codex() {
+    assert_eq!(
+        serde_json::from_str::<RunnerProvider>("\"claude\"").expect("legacy provider"),
+        RunnerProvider::Codex
+    );
+    assert_eq!(
+        serde_json::to_string(&RunnerProvider::Codex).expect("provider json"),
+        "\"codex\""
+    );
+}
+
+#[test]
 fn config_document_validation_rejects_invalid_result_before_write() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let config_path = tempdir.path().join("config.toml");
@@ -74,7 +116,8 @@ fn config_document_validation_rejects_invalid_result_before_write() {
 fn write_document_uses_private_file_permissions() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let config_path = tempdir.path().join("config.toml");
-    let mut document = DocumentMut::from_str("[runner]\nprovider = \"codex\"\n").expect("document");
+    let mut document =
+        DocumentMut::from_str("[runner.codex]\nbinary = \"codex\"\n").expect("document");
 
     write_document(&config_path, &mut document).expect("write document");
 
@@ -101,6 +144,12 @@ root_work = "{}"
 soul = "{}/SOUL.md"
 memory = "{}/MEMORY.md"
 todo = "{}/TODO.md"
+
+[runner]
+provider = "claude"
+
+[runner.codex]
+transport = "exec"
 "#,
             root_app.display(),
             legacy_root_work.display(),
@@ -121,5 +170,8 @@ todo = "{}/TODO.md"
     assert!(rendered.contains("[workspaces.vault]"));
     assert!(rendered.contains(&format!("path = \"{}\"", legacy_root_work.display())));
     assert!(!rendered.contains("root_work"));
+    assert!(!rendered.contains("context_files"));
+    assert!(!rendered.contains("provider ="));
+    assert!(!rendered.contains("transport ="));
     assert!(!rendered.contains("todo ="));
 }

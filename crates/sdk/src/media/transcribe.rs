@@ -5,12 +5,13 @@ use std::time::Duration;
 use reqwest::{Client, multipart};
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
-use tokio::process::Command;
 use tokio_util::io::ReaderStream;
 
 use crate::config::LoadedConfig;
 use crate::error::{ErrorCode, KaiError, KaiResult};
 use crate::secrets::resolve_groq_api_key;
+
+mod command;
 
 static GROQ_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 
@@ -68,23 +69,18 @@ pub fn transcription_provider_status(
     }
 
     if provider.eq_ignore_ascii_case("command") {
-        return if config
-            .values
-            .media
-            .transcription
-            .command
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            Ok(TranscriptionProviderStatus::Ready {
+        let command = config.values.media.transcription.command.as_ref();
+        return match command {
+            Some(command) if !command.executable.trim().is_empty() => {
+                Ok(TranscriptionProviderStatus::Ready {
+                    provider: "command".to_string(),
+                })
+            }
+            _ => Ok(TranscriptionProviderStatus::Misconfigured {
                 provider: "command".to_string(),
-            })
-        } else {
-            Ok(TranscriptionProviderStatus::Misconfigured {
-                provider: "command".to_string(),
-                detail: "command transcription is selected but no command template is configured"
+                detail: "command transcription is selected but no executable is configured"
                     .to_string(),
-            })
+            }),
         };
     }
 
@@ -110,18 +106,18 @@ pub async fn transcribe_file(
             Ok(Some(result))
         }
         TranscriptionProviderStatus::Ready { provider } if provider == "command" => {
-            let template = config
+            let command = config
                 .values
                 .media
                 .transcription
                 .command
-                .as_deref()
+                .as_ref()
                 .ok_or_else(|| {
                     KaiError::blocked_prerequisite(
                         "command transcription is selected but no command is configured",
                     )
                 })?;
-            let result = transcribe_with_command(template, file_path).await?;
+            let result = command::transcribe(command, file_path).await?;
             Ok(Some(result))
         }
         TranscriptionProviderStatus::Ready { provider } => Err(KaiError::new(
@@ -236,55 +232,6 @@ async fn transcribe_with_groq(
     })
 }
 
-async fn transcribe_with_command(
-    template: &str,
-    file_path: &Path,
-) -> KaiResult<TranscriptionResult> {
-    let file = shell_quote(&file_path.display().to_string());
-    let command = if template.contains("{file}") {
-        template.replace("{file}", &file)
-    } else {
-        format!("{template} {file}")
-    };
-
-    let output = Command::new("/bin/zsh")
-        .arg("-lc")
-        .arg(&command)
-        .output()
-        .await
-        .map_err(|error| {
-            KaiError::new(
-                ErrorCode::RuntimeError,
-                format!("failed to run transcription command: {error}"),
-            )
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(KaiError::new(
-            ErrorCode::RuntimeError,
-            format!(
-                "transcription command failed with status {}: {stderr}",
-                output.status
-            ),
-        ));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        return Err(KaiError::new(
-            ErrorCode::RuntimeError,
-            "transcription command returned empty output",
-        ));
-    }
-
-    Ok(TranscriptionResult {
-        provider: "command".to_string(),
-        text,
-        segments: Vec::new(),
-    })
-}
-
 fn groq_client() -> KaiResult<&'static Client> {
     match GROQ_CLIENT.get_or_init(|| {
         Client::builder()
@@ -295,10 +242,6 @@ fn groq_client() -> KaiResult<&'static Client> {
         Ok(client) => Ok(client),
         Err(message) => Err(KaiError::new(ErrorCode::RuntimeError, message.clone())),
     }
-}
-
-fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\\''"))
 }
 
 #[derive(Debug, Deserialize)]

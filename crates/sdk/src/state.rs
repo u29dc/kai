@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::{LoadedConfig, RunnerProvider};
-use crate::context::ContextSnapshot;
 use crate::contract::{
     PendingPairingView, PendingTurnView, SessionView, SideQueryView, WorkspaceStatusOutput,
     WorkspaceView,
@@ -147,7 +146,6 @@ pub struct ReplayAttachmentRef {
 pub struct ReplayPackage {
     pub updated_at: String,
     pub summary: String,
-    pub context: Vec<ContextSnapshot>,
     pub recent_turns: Vec<ReplayTurn>,
     pub attachment_refs: Vec<ReplayAttachmentRef>,
 }
@@ -457,7 +455,6 @@ impl StateStore {
             owner_user_id: self.get_owner_user_id()?,
             owner_chat_id: self.get_owner_chat_id()?,
             provider: target.provider.as_key().to_string(),
-            transport: config.values.runner.codex.transport.as_key().to_string(),
             default_workspace_id: workspace_status.default_workspace_id.clone(),
             selected_workspace_id: workspace_status.selected_workspace_id.clone(),
             selected_workspace_path: workspace_status.selected_workspace_path.clone(),

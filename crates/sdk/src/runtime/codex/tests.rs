@@ -2,21 +2,6 @@ use super::*;
 use crate::config::RunnerProvider;
 
 #[test]
-fn stale_resume_detection_matches_missing_rollout_errors() {
-    let error = KaiError::new(ErrorCode::RuntimeError, "Codex CLI exited with status 1").with_hint(
-        "Error: thread/resume: thread/resume failed: no rollout found for thread id 123",
-    );
-    assert!(is_stale_resume_error(&error));
-}
-
-#[test]
-fn stale_resume_detection_does_not_match_generic_backend_errors() {
-    let error = KaiError::new(ErrorCode::RuntimeError, "Codex CLI exited with status 1")
-        .with_hint("temporary auth failure");
-    assert!(!is_stale_resume_error(&error));
-}
-
-#[test]
 fn replay_package_includes_attachment_refs() {
     let turns = vec![
         TurnRecord {
@@ -64,7 +49,7 @@ fn replay_package_includes_attachment_refs() {
         },
     ];
 
-    let replay = create_replay_package(&[], &turns);
+    let replay = create_replay_package(&turns);
     assert_eq!(replay.attachment_refs.len(), 1);
     assert_eq!(replay.attachment_refs[0].path, "/tmp/report.pdf");
     assert!(replay.summary.contains("Recent attachment refs: 1"));
